@@ -180,6 +180,10 @@ Try asking your agent: *"Make my ClipBubble mascot a tiny pixel-art fox"* or *"W
 - `Sources/MCP.swift` is a small JSON-RPC server over stdio, with no SDK.
 - `Sources/Mascot.swift` draws the mascots with plain SwiftUI shapes. When nobody is interacting, the only thing that animates is a blink every few seconds.
 
+## Engineering specs
+
+- [New-Mac SSH sync onboarding and diagnostics](docs/specs/MIGRATION-RELIABILITY-2026-11-12.md)
+
 ## License
 
 [MIT](LICENSE). Made by [KRNL](https://krnl.studio).

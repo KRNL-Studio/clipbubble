@@ -392,7 +392,7 @@ final class SyncEngine {
         if d.kind == "image" { db.received(hash: d.hash, file: d.paths.first, text: nil) }
         else { db.received(hash: d.hash, file: nil, text: d.paths.joined(separator: "\n")) }
         // Still the newest item once the bytes are here: put it on the clipboard.
-        if d.apply, let c = db.clip(hash: d.hash), db.clips(limit: 1).first?.hash == d.hash { applyNow(c, to: s) }
+        if d.apply, !d.bounced, let c = db.clip(hash: d.hash), db.clips(limit: 1).first?.hash == d.hash { applyNow(c, to: s) }
         notifyUI()
     }
 
@@ -795,6 +795,8 @@ final class Download {
     private(set) var index = 0
     private(set) var received: Int64 = 0
     private(set) var paths: [String] = []
+    /// A file was already here from a moment ago, so this is the same file coming back: it doesn't go on the clipboard.
+    private(set) var bounced = false
     private var handle: FileHandle?
     private var temp: URL { Paths.dir.appendingPathComponent("incoming/\(sha(hash))-\(index)") }
 
@@ -850,7 +852,17 @@ final class Download {
         }
         let dir = receivedFolder(from)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let dest = uniqueURL(in: dir, name: safeFileName(names[index]))
+        let name = safeFileName(names[index])
+        // The same bytes under the same name are already here: keep that one copy instead of saving another.
+        if let same = sameFile(as: temp.path, named: name, in: dir) {
+            try? FileManager.default.removeItem(at: temp)
+            // Saved moments ago, it's bouncing back: two Macs on one Apple ID pass every clipboard write on through
+            // Universal Clipboard, so putting it on the clipboard again would send it round once more.
+            let saved = (try? FileManager.default.attributesOfItem(atPath: same.path))?[.modificationDate] as? Date
+            if let saved, Date().timeIntervalSince(saved) < 60 { bounced = true }
+            return same.path
+        }
+        let dest = uniqueURL(in: dir, name: name)
         guard (try? FileManager.default.moveItem(at: temp, to: dest)) != nil else { return nil }
         return dest.path
     }
@@ -887,19 +899,66 @@ func safeFileName(_ raw: String) -> String {
     var s = raw.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "\\", with: "_")
         .replacingOccurrences(of: ":", with: "_").filter { !$0.isNewline && $0 != "\0" }
     while s.hasPrefix(".") { s.removeFirst() }
-    s = String(s.prefix(200)).trimmingCharacters(in: .whitespaces)
+    s = s.trimmingCharacters(in: .whitespaces)
+    // A long name is cut before its extension, so the file still opens with the right app.
+    if s.count > 200 {
+        let ext = numbered(s).ext
+        let tail = ext.isEmpty ? "" : "." + ext
+        s = String(s.prefix(200 - tail.count)).trimmingCharacters(in: .whitespaces) + tail
+    }
     return s.isEmpty ? "file" : s
 }
 
+/// A name split for numbering: "shot (3).png" is "shot", 3, "png". Extensions are short and have no spaces.
+func numbered(_ name: String) -> (base: String, n: Int, ext: String) {
+    var ext = (name as NSString).pathExtension
+    if ext.count > 10 { ext = "" }
+    var base = ext.isEmpty ? name : (name as NSString).deletingPathExtension
+    guard let r = base.range(of: #" \([0-9]{1,6}\)$"#, options: .regularExpression), r.lowerBound > base.startIndex,
+          let n = Int(base[r].dropFirst(2).dropLast()) else { return (base, 1, ext) }
+    base.removeSubrange(r)
+    return (base, n, ext)
+}
+
+/// A free name in `dir`. A clash gets " (2)", " (3)" and so on, counting on from a number the name already has
+/// rather than stacking another one on.
 func uniqueURL(in dir: URL, name: String) -> URL {
     var url = dir.appendingPathComponent(name)
-    let base = (name as NSString).deletingPathExtension, ext = (name as NSString).pathExtension
-    var n = 2
+    let (base, start, ext) = numbered(name)
+    var n = max(2, start + 1)
     while FileManager.default.fileExists(atPath: url.path) {
         url = dir.appendingPathComponent(ext.isEmpty ? "\(base) (\(n))" : "\(base) (\(n)).\(ext)")
         n += 1
     }
     return url
+}
+
+/// A file in `dir` with the same name, give or take a " (n)", and the same bytes as `file`.
+func sameFile(as file: String, named name: String, in dir: URL) -> URL? {
+    let key = numbered(name)
+    let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+    for other in names {
+        let k = numbered(other)
+        guard k.base == key.base, k.ext == key.ext else { continue }
+        let url = dir.appendingPathComponent(other)
+        if sameBytes(url.path, file) { return url }
+    }
+    return nil
+}
+
+/// Whether two regular files hold the same bytes, compared a megabyte at a time.
+func sameBytes(_ a: String, _ b: String) -> Bool {
+    let fm = FileManager.default
+    guard let x = try? fm.attributesOfItem(atPath: a), let y = try? fm.attributesOfItem(atPath: b),
+          x[.type] as? FileAttributeType == .typeRegular, y[.type] as? FileAttributeType == .typeRegular,
+          (x[.size] as? NSNumber)?.int64Value == (y[.size] as? NSNumber)?.int64Value,
+          let ha = FileHandle(forReadingAtPath: a), let hb = FileHandle(forReadingAtPath: b) else { return false }
+    defer { try? ha.close(); try? hb.close() }
+    while true {
+        let ca = (try? ha.read(upToCount: 1 << 20)) ?? Data(), cb = (try? hb.read(upToCount: 1 << 20)) ?? Data()
+        if ca != cb { return false }
+        if ca.isEmpty { return true }
+    }
 }
 
 extension Array {

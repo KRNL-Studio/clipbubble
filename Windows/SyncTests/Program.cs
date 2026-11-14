@@ -227,6 +227,36 @@ static class Program
             Check(Engine.SafeFileName("CON.txt") == "_CON.txt", "device names");
             Check(Engine.SafeFileName("...") == "file", "nothing left");
             Check(Engine.SafeFileName("ok name.pdf") == "ok name.pdf", "normal names stay");
+            var longName = string.Concat(Enumerable.Repeat("shot (2) ", 30)) + "end.png";
+            Check(Engine.SafeFileName(longName) is { Length: 200 } cut && cut.EndsWith(".png"), "a long name is cut before its extension");
+        }),
+
+        // One screenshot once landed on a Mac 68 times: Universal Clipboard bounced each received copy back as a new item.
+        ("a file arriving again keeps one copy", () =>
+        {
+            var dir = Path.Combine(Home, "unique");
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "shot.png"), "a");
+            Check(Path.GetFileName(Engine.UniquePath(dir, "shot.png")) == "shot (2).png", "a clash gets (2)");
+            File.WriteAllText(Path.Combine(dir, "shot (2).png"), "b");
+            Check(Path.GetFileName(Engine.UniquePath(dir, "shot (2).png")) == "shot (3).png", "a numbered name counts on instead of stacking (2)");
+            Check(Engine.Numbered("at 11.40.14 PM (4)") == ("at 11.40.14 PM", 4, ""), "an extension has no spaces");
+
+            var data = Enumerable.Range(0, 3000).Select(i => (byte)(i * 13)).ToArray();
+            Download Receive(string name, byte[] body)
+            {
+                var d = new Download("f:" + Guid.NewGuid(), "file", new() { name }, new() { "" }, new() { body.Length }, "Bouncer", true);
+                Check(d.Write(body, body.Length) == Step.Done, name + " arrives");
+                return d;
+            }
+            var first = Receive("Screenshot.png", data);
+            Check(!first.Bounced, "the first copy is new");
+            var (again, echoed) = (Receive("Screenshot.png", data), Receive("Screenshot (2).png", data));
+            Check(again.Paths.SequenceEqual(first.Paths) && echoed.Paths.SequenceEqual(first.Paths), "the same bytes again keep the one file");
+            Check(again.Bounced && echoed.Bounced, "a copy saved moments ago is a bounce");
+            var other = Receive("Screenshot.png", Enumerable.Reverse(data).ToArray());
+            Check(Path.GetFileName(other.Paths[0]) == "Screenshot (2).png" && !other.Bounced, "different bytes get their own file");
+            Check(Directory.GetFiles(Engine.ReceivedFolder("Bouncer")).Length == 2, "nothing else was saved");
         }),
 
         ("a live session with the Mac engine", SwiftPeer),

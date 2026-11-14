@@ -54,6 +54,7 @@ final class Capture {
             ? "iPhone" : (NSWorkspace.shared.frontmostApplication?.localizedName ?? "Mac")
         let category = source == "iPhone" ? "iphone" : (["image": "images", "file": "files"][clip.kind] ?? "text")
         guard Prefs.on(category) else { return }
+        if source == "iPhone", clip.kind == "file", Self.isEcho(clip.text.components(separatedBy: "\n"), db: db) { return }
 
         // The previous contents came straight back, so what we just saw was a paste-through: drop it,
         // and don't bump the restored item.
@@ -70,6 +71,14 @@ final class Capture {
         previousHash = last?.hash
         last = (clip.hash, now, inserted)
         onChange()
+    }
+
+    /// Universal Clipboard hands over a file under a new path each time, so it would be a new item with a new hash.
+    /// When its bytes match a recent item's file, it's that item coming back (often ClipBubble's own write on the
+    /// other Mac); recording it would sync it back there as new, and round again.
+    static func isEcho(_ paths: [String], db: DB) -> Bool {
+        let recent = db.clips(limit: 200, kind: "file", sinceHours: 1).filter { !$0.remote }.flatMap(\.paths)
+        return !paths.isEmpty && paths.allSatisfy { p in recent.contains { $0 != p && sameBytes($0, p) } }
     }
 
     private func read(_ pb: NSPasteboard) -> (kind: String, text: String, file: String?, hash: String)? {

@@ -1,8 +1,13 @@
 import json
+import os
 import random
+import threading
+import time
 import unittest
+import uuid
 from pathlib import Path
 
+from clipbubble import engine as eng
 from clipbubble import sync
 from clipbubble.sync import Blob, Entry, Hello, Stamp
 
@@ -102,3 +107,61 @@ class Merge(unittest.TestCase):
         mine = [Stamp("a", 5, False), Stamp("b", 5, False), Stamp("c", 5, True)]
         theirs = [Stamp("a", 6, False), Stamp("b", 5, False)]
         self.assertEqual(sync.reconcile(mine, theirs), [Stamp("c", 5, True)])
+
+
+class ReceivedFiles(unittest.TestCase):
+    """One screenshot once landed on a Mac 68 times: Universal Clipboard bounced each received copy back as a new item."""
+
+    def test_names(self):
+        folder = Path(os.environ["CLIPBUBBLE_HOME"]) / "unique"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "shot.png").write_bytes(b"a")
+        self.assertEqual(eng.unique_path(folder, "shot.png").name, "shot (2).png")
+        (folder / "shot (2).png").write_bytes(b"b")
+        self.assertEqual(eng.unique_path(folder, "shot (2).png").name, "shot (3).png", "counts on instead of stacking (2)")
+        self.assertEqual(eng.unique_path(folder, "notes").name, "notes")
+        self.assertEqual(eng.numbered("at 11.40.14 PM (4)"), ("at 11.40.14 PM", 4, ""), "an extension has no spaces")
+        long = "shot (2) " * 30 + "end.png"
+        self.assertEqual(len(eng.safe_file_name(long)), 200)
+        self.assertTrue(eng.safe_file_name(long).endswith(".png"), "a long name is cut before its extension")
+
+    def test_same_bytes_keep_one_copy(self):
+        data = bytes((i * 13) & 0xFF for i in range(3000))
+
+        def receive(name, body):
+            d = eng.Download("f:" + uuid.uuid4().hex, "file", [name], [""], [len(body)], "Bouncer", True)
+            self.assertEqual(d.write(body, len(body)), "done")
+            return d
+
+        first = receive("Screenshot.png", data)
+        self.assertFalse(first.bounced)
+        again, echoed = receive("Screenshot.png", data), receive("Screenshot (2).png", data)
+        self.assertEqual(again.paths, first.paths)
+        self.assertEqual(echoed.paths, first.paths, "the same bytes again keep the one file")
+        self.assertTrue(again.bounced and echoed.bounced, "a copy saved moments ago is a bounce")
+        other = receive("Screenshot.png", data[::-1])
+        self.assertTrue(other.paths[0].endswith("/Screenshot (2).png") and not other.bounced, "different bytes get their own file")
+        self.assertEqual(len(os.listdir(eng.received_folder("Bouncer"))), 2, "nothing else was saved")
+
+        # A bounced file isn't put on the clipboard, where it would go round again.
+        e = eng.Engine()
+        applied = []
+        e.apply = applied.append
+
+        class Peer:
+            offered = {}
+
+            def send(self, frame):
+                pass
+
+        bounced = receive("Screenshot.png", data)
+        done = threading.Event()
+
+        def finish():
+            e.db.insert(Entry(bounced.hash, time.time() + 60, "file", "Screenshot.png", "iPhone", "mac",
+                              (Blob("Screenshot.png", len(data), ""),)), "mac")
+            e.finished(bounced, Peer())
+            done.set()
+        e.post(finish)
+        self.assertTrue(done.wait(5))
+        self.assertEqual(applied, [], "a bounced file stays off the clipboard")

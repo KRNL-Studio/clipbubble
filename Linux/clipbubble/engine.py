@@ -3,8 +3,10 @@
 Engine state is touched only on the engine thread, which runs posted callables in order, like the Mac's serial
 queue. Each session has a reader thread and a writer thread; writes put control frames ahead of file chunks."""
 import collections
+import filecmp
 import os
 import queue
+import re
 import shutil
 import socket
 import subprocess
@@ -51,20 +53,58 @@ def safe_file_name(raw):
     """A name from another machine can't climb out of its folder or hide itself."""
     s = raw.replace("/", "_").replace("\\", "_").replace(":", "_")
     s = "".join(ch for ch in s if ch not in "\r\n\0")
-    s = s.lstrip(".")[:200].strip()
+    s = s.lstrip(".").strip()
+    # A long name is cut before its extension, so the file still opens with the right app.
+    if len(s) > 200:
+        ext = numbered(s)[2]
+        tail = "." + ext if ext else ""
+        s = s[:200 - len(tail)].strip() + tail
     return s or "file"
 
 
-def unique_path(folder, name):
-    p = folder / name
+def numbered(name):
+    """A name split for numbering: "shot (3).png" is "shot", 3, "png". Extensions are short and have no spaces."""
     base, dot, ext = name.rpartition(".")
-    if not dot:
+    if not dot or not base or not ext or len(ext) > 10 or " " in ext:
         base, ext = name, ""
-    n = 2
+    m = re.search(r"(?<=.) \(([0-9]{1,6})\)$", base)
+    if not m:
+        return base, 1, ext
+    return base[:m.start()], int(m.group(1)), ext
+
+
+def unique_path(folder, name):
+    """A free name in `folder`. A clash gets " (2)", " (3)" and so on, counting on from a number the name already
+    has rather than stacking another one on."""
+    p = folder / name
+    base, start, ext = numbered(name)
+    n = max(2, start + 1)
     while p.exists():
         p = folder / (f"{base} ({n}).{ext}" if ext else f"{base} ({n})")
         n += 1
     return p
+
+
+def same_file(path, name, folder):
+    """A file in `folder` with the same name, give or take a " (n)", and the same bytes as `path`."""
+    base, _, ext = numbered(name)
+    try:
+        others = os.listdir(folder)
+    except OSError:
+        return None
+    for other in others:
+        b, _, e = numbered(other)
+        if b == base and e == ext and same_bytes(folder / other, path):
+            return folder / other
+    return None
+
+
+def same_bytes(a, b):
+    """Whether two regular files hold the same bytes."""
+    try:
+        return os.path.isfile(a) and os.path.isfile(b) and filecmp.cmp(a, b, shallow=False)
+    except OSError:
+        return False
 
 
 class Engine:
@@ -460,7 +500,7 @@ class Engine:
         else:
             self.db.received(d.hash, text="\n".join(d.paths))
         newest = self.db.clips(limit=1)
-        if d.apply and newest and newest[0].hash == d.hash:
+        if d.apply and not d.bounced and newest and newest[0].hash == d.hash:
             self.apply_now(newest[0], s)
         self.on_received()
 
@@ -837,6 +877,8 @@ class Download:
         self.index = 0
         self.received = 0
         self.paths = []
+        # A file was already here from a moment ago, so this is the same file coming back: it doesn't go on the clipboard.
+        self.bounced = False
         self.f = None
         # A partial first file from a link that dropped: carry on from its end.
         try:
@@ -893,7 +935,20 @@ class Download:
             return str(dest)
         folder = received_folder(self.source)
         folder.mkdir(parents=True, exist_ok=True)
-        dest = unique_path(folder, safe_file_name(self.names[self.index]))
+        name = safe_file_name(self.names[self.index])
+        # The same bytes under the same name are already here: keep that one copy instead of saving another.
+        same = same_file(self.temp, name, folder)
+        if same:
+            self.temp.unlink(missing_ok=True)
+            # Saved moments ago, it's bouncing back (two Macs pass each clipboard write on through Universal Clipboard),
+            # so putting it on the clipboard again would send it round once more.
+            try:
+                if time.time() - same.stat().st_mtime < 60:
+                    self.bounced = True
+            except OSError:
+                pass
+            return str(same)
+        dest = unique_path(folder, name)
         shutil.move(str(self.temp), dest)
         return str(dest)
 

@@ -63,4 +63,6 @@ Each frame is a 4-byte big-endian length, then that many bytes, a 1-byte type an
 
 ## Received files
 
-Files land in `Downloads/ClipBubble/<device name>/`. Names lose path separators and leading dots, and a clash gets ` (2)`, ` (3)` and so on. A transfer resumes with `fetch` at the received length after a drop.
+Files land in `Downloads/ClipBubble/<device name>/`. Names lose path separators and leading dots, and a name over 200 characters is cut before its extension. A clash gets ` (2)`, ` (3)` and so on, counting on from a number the name already ends in rather than adding another. A transfer resumes with `fetch` at the received length after a drop.
+
+A file whose name (give or take that number) and bytes match one already in the folder isn't saved again: the item points at the file that's there. If that file was saved in the last minute, the item is the same file coming back and doesn't go on the clipboard. Two Macs on one Apple ID pass each clipboard write on through Universal Clipboard, which hands a file over under a new path, so a Mac doesn't record a Universal Clipboard file whose bytes match a recent item's file either. Without both, one copy went round the two Macs as a new item every few seconds.

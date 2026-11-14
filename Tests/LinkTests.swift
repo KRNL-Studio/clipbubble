@@ -56,10 +56,57 @@ private func childEnv(_ home: URL, _ extra: [String: String]) -> [String: String
     return env
 }
 
+/// One screenshot once landed on a Mac 68 times: Universal Clipboard bounced each received copy back as a new item.
+private func receivedFileTests() {
+    let fm = FileManager.default
+    let dir = testHome.appendingPathComponent("unique")
+    try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    fm.createFile(atPath: dir.appendingPathComponent("shot.png").path, contents: Data("a".utf8))
+    check(uniqueURL(in: dir, name: "shot.png").lastPathComponent == "shot (2).png", "a clash gets (2)")
+    fm.createFile(atPath: dir.appendingPathComponent("shot (2).png").path, contents: Data("b".utf8))
+    check(uniqueURL(in: dir, name: "shot (2).png").lastPathComponent == "shot (3).png", "a numbered name counts on instead of stacking (2)")
+    check(uniqueURL(in: dir, name: "notes").lastPathComponent == "notes", "a free name stays")
+    check(numbered("at 11.40.14 PM (4)") == ("at 11.40.14 PM", 4, ""), "an extension has no spaces")
+
+    // A file arriving again with the same bytes keeps the one copy, and doesn't go back on the clipboard.
+    let bytes = Data((0..<3000).map { UInt8(truncatingIfNeeded: $0 &* 13) })
+    func receive(_ name: String, _ data: Data) -> Download {
+        let d = Download(hash: "f:" + UUID().uuidString, kind: "file", names: [name], shas: [""], sizes: [Int64(data.count)],
+                         from: "Bouncer", apply: true)
+        check(d.write(data, total: Int64(data.count)) == .done, "\(name) arrives")
+        return d
+    }
+    let first = receive("Screenshot.png", bytes)
+    check(!first.bounced, "the first copy is new")
+    let again = receive("Screenshot.png", bytes), echoed = receive("Screenshot (2).png", bytes)
+    check(again.paths == first.paths && echoed.paths == first.paths, "the same bytes again keep the one file")
+    check(again.bounced && echoed.bounced, "a copy saved moments ago is a bounce")
+    let other = receive("Screenshot.png", Data(bytes.reversed()))
+    check(other.paths.first?.hasSuffix("/Screenshot (2).png") ?? false && !other.bounced, "different bytes still get their own file")
+    let folder = receivedFolder("Bouncer").path
+    check((try? fm.contentsOfDirectory(atPath: folder).count) == 2, "nothing else was saved")
+
+    // On the Mac that sent it, Universal Clipboard's copy of that file isn't a new item.
+    let db = DB()
+    let original = testHome.appendingPathComponent("Screenshot.png")
+    try? bytes.write(to: original)
+    db.upsert(kind: "file", text: original.path, file: nil, source: "Screenshot", hash: "f:" + sha(original.path))
+    let handedOver = testHome.appendingPathComponent("shared-pasteboard/items/1/Screenshot.png")
+    try? fm.createDirectory(at: handedOver.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? bytes.write(to: handedOver)
+    check(Capture.isEcho([handedOver.path], db: db), "a Universal Clipboard file matching a recent item is an echo")
+    try? Data(bytes.reversed()).write(to: handedOver)
+    check(!Capture.isEcho([handedOver.path], db: db), "a different file from the iPhone is new")
+    db.delete(hash: "f:" + sha(original.path))
+}
+
 func linkTests() {
     check(safeFileName("../../.ssh/authorized_keys") == "_.._.ssh_authorized_keys", "names can't climb out of their folder")
     check(safeFileName("...hidden") == "hidden", "names can't hide")
     check(safeFileName("") == "file", "empty names get a name")
+    let long = String(repeating: "shot (2) ", count: 30) + "end.png"
+    check(safeFileName(long).count == 200 && safeFileName(long).hasSuffix(".png"), "a long name is cut before its extension")
+    receivedFileTests()
 
     let peerHome = testHome.appendingPathComponent("peer")
     try? FileManager.default.createDirectory(at: peerHome, withIntermediateDirectories: true)
@@ -127,6 +174,20 @@ func linkTests() {
     check(waitFor("peer applies image") { (try? String(contentsOf: appliedFile, encoding: .utf8))?.contains("i:" + sha(png)) ?? false },
           "a new image lands on the peer's clipboard once its bytes arrive")
 
+    // The peer puts a new file on its clipboard; Universal Clipboard hands it back here under a new path, a new item.
+    // The peer keeps its one copy and leaves its clipboard alone, so it doesn't go round again.
+    let shot = testHome.appendingPathComponent("live/Shot.png"), shotBack = testHome.appendingPathComponent("handed over/Shot.png")
+    let shotData = Data((0..<40_000).map { UInt8(truncatingIfNeeded: $0 &* 17) })
+    for f in [shot, shotBack] {
+        try? FileManager.default.createDirectory(at: f.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? shotData.write(to: f)
+    }
+    let shotHash = "f:" + sha(shot.path), backHash = "f:" + sha(shotBack.path)
+    db.upsert(kind: "file", text: shot.path, file: nil, source: "Screenshot", hash: shotHash)
+    check(waitFor("peer applies file") { (try? String(contentsOf: appliedFile, encoding: .utf8))?.contains(shotHash) ?? false },
+          "a new file lands on the peer's clipboard")
+    db.upsert(kind: "file", text: shotBack.path, file: nil, source: "iPhone", hash: backHash)
+
     // Over 25 MB waits for Get, and picks up a partial file a dropped link left behind.
     let hugeHash = "f:" + sha(huge.path)
     check(waitFor("huge offered") { db.clip(hash: hugeHash) != nil }, "a file over 25 MB is listed")
@@ -172,6 +233,10 @@ func linkTests() {
     check(lines.contains { $0.hasPrefix("clip|t:\(sha("mac-old"))|") && !$0.hasSuffix("||false|false") }, "the peer got this Mac's history")
     check(lines.contains("deleted|\(liveHash)") && !lines.contains { $0.hasPrefix("clip|\(liveHash)|") }, "the delete reached the peer")
     check(lines.contains { $0.hasPrefix("clip|i:\(sha(png))|") && $0.hasSuffix("|false|true") }, "the image is stored on the peer")
+    check(lines.contains { $0.hasPrefix("clip|\(backHash)|") && $0.hasSuffix("|false|true") }, "the bounced file reached the peer")
+    let shots = (try? FileManager.default.contentsOfDirectory(atPath: peerHome.appendingPathComponent("Downloads/ClipBubble/\(engine.name)").path)) ?? []
+    check(shots.filter { $0.hasPrefix("Shot") } == ["Shot.png"], "the peer saved it once: \(shots)")
+    check(!((try? String(contentsOf: appliedFile, encoding: .utf8))?.contains(backHash) ?? true), "and didn't put it on its clipboard again")
 
     // The same device dialling in again replaces its old link instead of being turned away.
     func dialIn() -> (Process, Pipe) {

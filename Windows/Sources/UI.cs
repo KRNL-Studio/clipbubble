@@ -2256,7 +2256,9 @@ sealed class App : Application
         if (Prefs.On("downloads"))
         {
             if (downloads != null || FolderWatcher.DownloadsFolder is not { } dir) return;
-            downloads = new FolderWatcher(dir, null, p => !FolderWatcher.TempExts.Contains(Path.GetExtension(p).TrimStart('.').ToLowerInvariant()), (path, date) =>
+            // ClipBubble's own folder of received files isn't a download, as on the Mac and Linux.
+            downloads = new FolderWatcher(dir, null, p => !FolderWatcher.TempExts.Contains(Path.GetExtension(p).TrimStart('.').ToLowerInvariant())
+                && !string.Equals(Path.GetFileName(p), "ClipBubble", StringComparison.OrdinalIgnoreCase), (path, date) =>
                 capture.AddFiles("Downloads", () => new[] { (path, date) }, Captured));
         }
         else { downloads?.Dispose(); downloads = null; }

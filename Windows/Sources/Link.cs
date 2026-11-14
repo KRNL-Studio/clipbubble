@@ -52,14 +52,43 @@ sealed record LinkState(string Kind, string Arg = "", double At = 0)
                     var s = At > 0 ? Math.Max(0, (int)(At - Engine.Now)) : 0;
                     return s is > 0 and < 60 ? $"Offline, retrying in {s} s" : s > 0 ? $"Offline, retrying in {s / 60} min" : "Offline";
                 case "connecting": return "Connecting…";
-                case "needs-key": return "Needs SSH key login";
-                case "unknown-host": return "Connect once in a terminal to trust this host";
+                case "unresolved": return "Can't find it on this network. Check the name, or that it's on";
+                case "refused": return "It's not accepting connections. Turn on Remote Login or SSH there";
+                case "unknown-host": return "Not trusted yet. Check its identity to trust it";
+                case "host-key-changed": return "Its identity changed. Don't trust it unless you reinstalled it, then link it again";
+                case "needs-key": return Arg.Length > 0 ? $"{Arg} wasn't let in. Check the user name, or link it again"
+                    : "Wasn't let in. Link it again, or add this computer's key there";
                 case "not-installed": return "ClipBubble isn't installed there";
                 case "not-running": return "ClipBubble isn't running there";
                 case "version": return $"Update needed (it has {Arg})";
                 default: return Kind;
             }
         }
+    }
+
+    /// Network trouble that often clears by itself, so it keeps retrying soon. Everything else waits for a person.
+    public bool Transient => Kind is "offline" or "unresolved" or "refused" or "connecting";
+
+    /// Why ssh ended, from what it printed, in the order a connection goes: finding the host, reaching its SSH server,
+    /// checking its identity, logging in, then finding ClipBubble. Null means it just dropped or timed out. Nothing
+    /// here turns host checking off or replaces a trusted key.
+    public static LinkState? Failure(string err, bool windows)
+    {
+        if (err.Contains("CLIPBUBBLE_NOT_INSTALLED") || (windows && err.Contains("cannot find the path"))) return new("not-installed");
+        if (err.Contains("CLIPBUBBLE_NOT_RUNNING")) return new("not-running");
+        if (err.Contains("REMOTE HOST IDENTIFICATION HAS CHANGED") || (err.Contains("Host key for") && err.Contains("has changed"))) return new("host-key-changed");
+        if (err.Contains("Host key verification failed") || err.Contains("host key is known")) return new("unknown-host");
+        if (err.Contains("Permission denied") || err.Contains("Too many authentication failures"))
+        {
+            // OpenSSH says "you@host: Permission denied (publickey)."
+            var line = err.Split('\n').FirstOrDefault(l => l.Contains("Permission denied")) ?? "";
+            var i = line.IndexOf(": Permission denied", StringComparison.Ordinal);
+            var who = i > 0 ? line.Substring(0, i).Trim() : "";
+            return new("needs-key", who.Contains("@") && !who.Contains(" ") && who.Length < 200 ? who : "");
+        }
+        if (err.Contains("Could not resolve hostname") || err.Contains("No such host is known")) return new("unresolved");
+        if (err.Contains("Connection refused")) return new("refused");
+        return null;
     }
 }
 
@@ -735,15 +764,10 @@ sealed class HostLink(string alias, Engine engine)
             Connect();
             return;
         }
-        LinkState next =
-            Mismatch != null ? new("version", Mismatch)
-            : err.Contains("CLIPBUBBLE_NOT_INSTALLED") || (IsWindows && err.Contains("cannot find the path")) ? new("not-installed")
-            : err.Contains("CLIPBUBBLE_NOT_RUNNING") ? new("not-running")
-            : err.Contains("Host key verification failed") ? new("unknown-host")
-            : err.Contains("Permission denied") || err.Contains("Too many authentication failures") ? new("needs-key")
-            : new("offline", At: Engine.Now + (wasLive ? 1 : backoff));
+        LinkState next = Mismatch != null ? new("version", Mismatch)
+            : LinkState.Failure(err, IsWindows) ?? new("offline", At: Engine.Now + (wasLive ? 1 : backoff));
         if (err.Trim().Length > 0) SyncLog.Write($"{alias}: {Tail(err.Trim(), 300)}");
-        if (next.Kind != "offline") backoff = Math.Max(backoff, 60);
+        if (!next.Transient) backoff = Math.Max(backoff, 60);
         if (wasLive) backoff = 1;
         Set(next);
         Retry();

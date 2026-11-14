@@ -15,7 +15,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import store, sync
+from . import peers, store, sync
 from .store import DB, DIR, IMAGES, sha
 from .sync import CHUNK, Entry, Hello, Stamp, Blob
 
@@ -160,11 +160,18 @@ class Engine:
 
     def _watch_other_writers(self):
         """Agents (clipbubble --mcp) write history from their own process. SQLite's data_version moves when another
-        connection commits, so a once-a-second check costs nothing while nothing changes."""
+        connection commits, so a once-a-second check costs nothing while nothing changes. The same check notices
+        hosts added from a terminal."""
         version, known = None, {}
+        hosts = (store.Prefs.get("sync.paused", False), store.Prefs.get("sync.hosts", []))
 
         def check():
-            nonlocal version, known
+            nonlocal version, known, hosts
+            # clipbubble --link (another process) adds a host: start linking without a restart.
+            now_hosts = (store.Prefs.get("sync.paused", False), store.Prefs.get("sync.hosts", []))
+            if now_hosts != hosts:
+                hosts = now_hosts
+                self.reconcile_links()
             v = self.db.c.execute("PRAGMA data_version").fetchone()[0]
             if v != version:
                 now = {st.hash: st for st in self.db.stamps()}
@@ -194,6 +201,10 @@ class Engine:
     def publish_status(self):
         self.statuses = {a: l.state for a, l in self.links.items()}
         self.linked = [s.peer for s in self.sessions if s.peer]
+        try:
+            peers.write_status(self.statuses, state_text, self.name, store.Prefs.get("sync.paused", False))
+        except OSError:
+            pass
         self.on_status()
 
     # Manual transfers
@@ -544,8 +555,10 @@ class HostLink:
         if self.stopped or self.proc or self.alias.startswith("-"):
             return
         self._set(("connecting", ""))
+        # A computer linked with --link brings its own key, user and pinned identity; anything else is ~/.ssh/config's.
         args = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15",
-                "-o", "ServerAliveCountMax=2", "--", self.alias, self.WINDOWS if self.windows else self.POSIX]
+                "-o", "ServerAliveCountMax=2"] + (peers.ssh_args(self.alias) or ["--", self.alias]) \
+            + [self.WINDOWS if self.windows else self.POSIX]
         try:
             self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                          start_new_session=True)
@@ -576,6 +589,7 @@ class HostLink:
     def hello_received(self, h):
         self.backoff = 1.0
         self.mismatch = None
+        peers.mark_live(self.alias)
         self._set(("live", h.name))
 
     def session_ended(self, s):
@@ -601,19 +615,11 @@ class HostLink:
             return
         if self.mismatch:
             nxt = ("version", self.mismatch)
-        elif "CLIPBUBBLE_NOT_INSTALLED" in err or (self.windows and "cannot find the path" in err):
-            nxt = ("not-installed", "")
-        elif "CLIPBUBBLE_NOT_RUNNING" in err:
-            nxt = ("not-running", "")
-        elif "Host key verification failed" in err:
-            nxt = ("unknown-host", "")
-        elif "Permission denied" in err or "Too many authentication failures" in err:
-            nxt = ("needs-key", "")
         else:
-            nxt = ("offline", time.time() + (1 if was_live else self.backoff))
+            nxt = classify(err, self.windows) or ("offline", time.time() + (1 if was_live else self.backoff))
         if err.strip():
             log(f"{self.alias}: {err.strip()[-300:]}")
-        if nxt[0] != "offline":
+        if nxt[0] not in TRANSIENT:
             self.backoff = max(self.backoff, 60)
         if was_live:
             self.backoff = 1.0
@@ -995,6 +1001,34 @@ def ssh_hosts():
     return seen
 
 
+# Network trouble that often clears by itself, so it keeps retrying soon. Everything else waits for a person.
+TRANSIENT = {"offline", "unresolved", "refused", "connecting"}
+
+
+def classify(err, windows=False):
+    """Why ssh ended, from what it printed, in the order a connection goes: finding the host, reaching its SSH server,
+    checking its identity, logging in, then finding ClipBubble. None means it just dropped or timed out. Nothing here
+    turns host checking off or replaces a trusted key."""
+    if "CLIPBUBBLE_NOT_INSTALLED" in err or (windows and "cannot find the path" in err):
+        return ("not-installed", "")
+    if "CLIPBUBBLE_NOT_RUNNING" in err:
+        return ("not-running", "")
+    if "REMOTE HOST IDENTIFICATION HAS CHANGED" in err or ("Host key for" in err and "has changed" in err):
+        return ("host-key-changed", "")
+    if "Host key verification failed" in err or "host key is known" in err:
+        return ("unknown-host", "")
+    if "Permission denied" in err or "Too many authentication failures" in err:
+        # OpenSSH says "you@host: Permission denied (publickey)."
+        line = next((x for x in err.splitlines() if "Permission denied" in x), "")
+        who = line.split(": Permission denied")[0] if ": Permission denied" in line else ""
+        return ("needs-key", who if "@" in who and " " not in who and len(who) < 200 else "")
+    if "Could not resolve hostname" in err or "Name or service not known" in err or "nodename nor servname" in err:
+        return ("unresolved", "")
+    if "Connection refused" in err:
+        return ("refused", "")
+    return None
+
+
 def state_text(state):
     kind, arg = state
     if kind == "live":
@@ -1002,8 +1036,14 @@ def state_text(state):
     if kind == "offline":
         s = max(0, int(arg - time.time())) if arg else 0
         return f"Offline, retrying in {s} s" if 0 < s < 60 else f"Offline, retrying in {s // 60} min" if s else "Offline"
-    return {"connecting": "Connecting…", "needs-key": "Needs SSH key login",
-            "unknown-host": "Connect once in a terminal to trust this host",
+    if kind == "needs-key":
+        return f"{arg} wasn't let in. Check the user name, or link it again" if arg \
+            else "Wasn't let in. Link it again, or add this computer's key there"
+    return {"connecting": "Connecting…",
+            "unresolved": "Can't find it on this network. Check the name, or that it's on",
+            "refused": "It's not accepting connections. Turn on Remote Login or SSH there",
+            "unknown-host": "Not trusted yet. Check its identity to trust it",
+            "host-key-changed": "Its identity changed. Don't trust it unless you reinstalled it, then link it again",
             "not-installed": "ClipBubble isn't installed there", "not-running": "ClipBubble isn't running there",
             "version": f"Update needed (it has {arg})"}.get(kind, kind)
 

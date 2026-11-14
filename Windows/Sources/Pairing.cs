@@ -27,6 +27,11 @@ sealed class Pairing
     const string FirewallRule = "ClipBubble iPhone pairing";
 
     readonly string code;
+    /// What a person types on another computer. Short, so a few wrong guesses end the listener.
+    public readonly string ShortCode;
+    const string Alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+    const int MaxWrong = 5;
+    int wrong;
     readonly string name;
     readonly TcpListener listener;
     readonly Action<string> done;
@@ -39,6 +44,9 @@ sealed class Pairing
         var bytes = new byte[16];
         using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(bytes);
         code = string.Concat(bytes.Select(b => b.ToString("x2")));
+        var shortBytes = new byte[8];
+        using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(shortBytes);
+        ShortCode = new string(shortBytes.Select(b => Alphabet[b % Alphabet.Length]).ToArray());
         this.name = name;
         this.done = done;
         try { listener = new TcpListener(IPAddress.Any, FixedPort); listener.Start(); }
@@ -56,6 +64,20 @@ sealed class Pairing
                    $"&p={port}&c={code}&n={Uri.EscapeDataString(name)}";
         }
     }
+
+    /// What to type into another computer's Add a computer: this PC's name, with the port if it's unusual.
+    public string TypedAddress
+    {
+        get
+        {
+            var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            var a = Addresses().FirstOrDefault() ?? Environment.MachineName;
+            return port == FixedPort ? a : $"{a}:{port}";
+        }
+    }
+
+    /// "K7QM-4ZTD", for showing.
+    public string ShortCodeShown => ShortCode.Substring(0, 4) + "-" + ShortCode.Substring(4);
 
     /// Stops listening. True for the call that actually stopped it.
     public bool Stop()
@@ -82,6 +104,7 @@ sealed class Pairing
             {
                 var phone = Answer(c);
                 if (phone != null) { Finish($"Linked {phone}. It syncs whenever ClipBubble is open there."); return; }
+                if (wrong >= MaxWrong) { Finish("Too many wrong codes, so linking stopped. Click Link iPhone… for a new code."); return; }
             }
         }
     }
@@ -119,6 +142,12 @@ sealed class Pairing
         }
         catch (Exception e) when (e is ArgumentException or InvalidOperationException) { }
         catch (PairingException e) { reply["error"] = e.Message; }
+        if (phone == null && !reply.ContainsKey("error"))
+        {
+            wrong++;
+            reply["error"] = wrong >= MaxWrong ? "Too many wrong codes, so this PC stopped linking. Start linking there again for a new code."
+                : "That code isn't right. Check it on this PC and try again.";
+        }
         try
         {
             var out_ = Encoding.UTF8.GetBytes(Store.Json.Serialize(reply) + "\n");
@@ -128,11 +157,15 @@ sealed class Pairing
         return phone;
     }
 
-    bool SameCode(string given)
+    /// The QR code's long code, or the short one typed on a computer, where case, spaces and dashes don't matter.
+    bool SameCode(string given) =>
+        Same(given, code) || Same(new string(given.ToUpperInvariant().Where(char.IsLetterOrDigit).ToArray()), ShortCode);
+
+    static bool Same(string given, string want)
     {
-        if (given.Length != code.Length) return false;
+        if (given.Length != want.Length) return false;
         var diff = 0;
-        for (var i = 0; i < code.Length; i++) diff |= given[i] ^ code[i];
+        for (var i = 0; i < want.Length; i++) diff |= given[i] ^ want[i];
         return diff == 0;
     }
 

@@ -25,8 +25,9 @@ enum Platform {
     static func dial(_ alias: String, _ command: String, stderr: @escaping (Data) -> Void, exited: @escaping () -> Void) throws -> Tunnel {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        // A computer linked with Add a computer brings its own key, user and pinned identity; anything else is ~/.ssh/config's.
         p.arguments = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15",
-                       "-o", "ServerAliveCountMax=2", "--", alias, command]
+                       "-o", "ServerAliveCountMax=2"] + (Peers.sshArguments(alias) ?? ["--", alias]) + [command]
         let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
         p.standardInput = inPipe
         p.standardOutput = outPipe

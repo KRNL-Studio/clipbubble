@@ -465,7 +465,7 @@ struct HostRow: View {
             Image(systemName: "laptopcomputer").font(.title3).foregroundStyle(.secondary).frame(width: 32).accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 Text(name).font(.subheadline.weight(.semibold))
-                Text(state.map { if case .live = $0 { return "Linked" }; return $0.text } ?? "Connecting…")
+                Text(state.map { if case .live = $0 { return "Linked" }; return $0.phoneText } ?? "Connecting…")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Spacer()

@@ -31,6 +31,20 @@ enum Platform {
     }
 }
 
+/// What a link's state means on an iPhone, where there's no Terminal and linking again is the fix for most things.
+extension LinkState {
+    var phoneText: String {
+        switch self {
+        case .needsKeyAuth: return "Not allowed in. Link this iPhone again from the computer"
+        case .unknownHost: return "The computer's identity changed. Link it again to trust it"
+        case .notInstalled: return "ClipBubble isn't installed on the computer"
+        case .appNotRunning: return "Open ClipBubble on the computer"
+        case .versionMismatch(let h): return "Update ClipBubble on \(h.name) (it has \(h.version))"
+        default: return text
+        }
+    }
+}
+
 enum Clipboard {
     @discardableResult
     static func write(_ c: Clip) -> Bool {

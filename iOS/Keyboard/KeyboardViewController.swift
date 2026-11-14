@@ -106,7 +106,7 @@ final class KeyboardModel: ObservableObject {
         linked = viaApp || !live.isEmpty
         status = SyncEngine.enabledHosts.isEmpty ? "No computers linked yet"
             : viaApp ? "Synced by the ClipBubble app"
-            : !live.isEmpty ? live.joined(separator: ", ") : SyncEngine.shared.statuses.values.first?.text ?? "Connecting…"
+            : !live.isEmpty ? live.joined(separator: ", ") : SyncEngine.shared.statuses.values.first?.phoneText ?? "Connecting…"
     }
 
     func tap(_ c: Clip) {

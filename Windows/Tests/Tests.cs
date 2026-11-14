@@ -345,7 +345,8 @@ static class Program
             Directory.CreateDirectory(folder);
             var shot = Path.Combine(folder, "Screenshot 1.png");
             File.WriteAllBytes(shot, TinyPng());
-            Snapshots.Pump(6);   // the watcher re-checks for a missing folder every 5 s
+            // The watcher re-checks for a missing folder every 5 s; a busy CI machine can need a little longer.
+            for (var i = 0; i < 15 && !seen.Contains(shot); i++) Snapshots.Pump(1);
             Check(seen.Contains(shot), "first screenshot reported: " + string.Join(",", seen));
         }),
 

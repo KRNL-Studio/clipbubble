@@ -94,6 +94,16 @@ tar xzf ClipBubble-Linux.tar.gz && ClipBubble-Linux/install.sh
 
 `install.sh` installs ClipBubble for your user in `~/.local` and starts it at login. Run it again to update. Log out and back in once so GNOME loads the extension.
 
+## Sync between computers
+
+Copy on one computer, paste on another: ClipBubble links Macs, Windows PCs and Linux machines directly over SSH, with no server in between.
+
+**Link two computers:** on one, open ClipBubble → Settings → Sync over SSH → **Link iPhone…**. Below the QR code it shows an address and a short code. On the other computer, choose **Add a computer…** in the same place and enter them. On Linux, run `clipbubble --link ADDRESS CODE` instead. Before anything syncs, it shows who answered, the user it connects as, and that computer's identity, and nothing syncs until you start it.
+- It uses ClipBubble's own key, `~/.ssh/clipbubble_ed25519`, and sends only its public half. On the other computer, that key can run ClipBubble and nothing else.
+- It pins the other computer's identity in ClipBubble's own `known_hosts`, and never edits `~/.ssh/config`. Hosts already in `~/.ssh/config` show up too, with a switch each.
+- If a link fails, Settings says at which step: the name doesn't resolve, SSH is off there, its identity is new or changed, the login was refused (naming the user and host it tried), or ClipBubble isn't installed or running there. Each comes with the button that fixes it, such as **Check identity…** or **Link again…**.
+- `ClipBubble --status` (`clipbubble --status` on Linux) prints each link's state, version and last connection, and nothing from your history. A Mac app's binary is at `~/Applications/ClipBubble.app/Contents/MacOS/ClipBubble`.
+
 ## iPhone
 
 The iPhone app lives in [`iOS/`](iOS). It shows the history from your computers, takes anything you share to it, and adds a keyboard that types from your history in any app. It syncs with a Mac, a Windows PC or a Linux computer over SSH on your Wi-Fi, so it gives you a Universal Clipboard with computers Apple's doesn't reach.

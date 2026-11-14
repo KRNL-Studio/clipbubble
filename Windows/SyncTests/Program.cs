@@ -141,6 +141,18 @@ static class Program
             }
         }),
 
+        ("link failures", () =>
+        {
+            // What OpenSSH prints for each way a link fails, in the order a connection goes.
+            Check(LinkState.Failure("ssh: Could not resolve hostname old-mac: No such host is known.", false)?.Kind == "unresolved", "unresolved");
+            Check(LinkState.Failure("ssh: connect to host 10.0.0.9 port 22: Connection refused", false)?.Kind == "refused", "refused");
+            Check(LinkState.Failure("No ED25519 host key is known for rog.\nHost key verification failed.", false)?.Kind == "unknown-host", "unknown host");
+            Check(LinkState.Failure("@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @\nHost key verification failed.", false)?.Kind == "host-key-changed", "changed key");
+            Check(LinkState.Failure("rohit@air: Permission denied (publickey).", false) is { Kind: "needs-key", Arg: "rohit@air" }, "names who was turned down");
+            Check(LinkState.Failure("ssh: connect to host rog port 22: Connection timed out", false) == null, "a timeout is just offline");
+            Check(new LinkState("refused").Transient && !new LinkState("host-key-changed").Transient, "only network trouble retries soon");
+        }),
+
         ("merge rules", () =>
         {
             var a = new Stamp("t:x", 10, false);

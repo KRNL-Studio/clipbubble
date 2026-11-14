@@ -601,7 +601,8 @@ struct PanelView: View {
 struct SettingsView: View {
     @ObservedObject var model: Model
     @State private var copyShots = UserDefaults.standard.bool(forKey: "copyScreenshots")
-    @State private var openAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var openAtLogin = LoginItem.on
+    @State private var loginNote: String?
     @State private var promptCopied = false
     @State private var autoPaste = UserDefaults.standard.object(forKey: "autoPaste") as? Bool ?? true
     @State private var shotsOK: Bool?
@@ -718,7 +719,8 @@ struct SettingsView: View {
         }
         .onChange(of: copyShots) { _, on in UserDefaults.standard.set(on, forKey: "copyScreenshots") }
         .onChange(of: openAtLogin) { _, on in
-            try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
+            // Says what macOS really did: it can refuse, or wait for approval in System Settings.
+            loginNote = LoginItem.set(on)
         }
     }
 
@@ -732,7 +734,7 @@ struct SettingsView: View {
     private var general: some View {
         section("General") {
             UpdateRow(updater: Updater.shared)
-            toggleRow("power", "Open at login", nil, isOn: $openAtLogin)
+            toggleRow("power", "Open at login", loginNote, isOn: $openAtLogin)
             HStack {
                 Button("Clear all history…", action: clearAll)
                 Spacer()
@@ -860,56 +862,47 @@ struct SettingsView: View {
     }
 }
 
-/// Settings → Sync over SSH: one switch per host in ~/.ssh/config, with its live status.
+/// Settings → Sync over SSH: computers linked with Add a computer, then one switch per host in ~/.ssh/config, each with
+/// its live status and the one action that fixes what's wrong.
 struct SyncSettings: View {
     @ObservedObject var model: Model
-    @State private var hosts: [String] = []
+    @State private var configHosts: [String] = []
+    @State private var peers: [Peer] = Peers.all
     @State private var enabled = Set(SyncEngine.enabledHosts)
     @State private var setup: [String: String] = [:]   // progress or result text per host
     @State private var installing: Set<String> = []
+    @State private var adding = false
+    @State private var relink: Peer?
+    @State private var checking: String?
+
+    private var hosts: [String] { peers.map(\.alias) + configHosts.filter { h in !peers.contains { $0.alias == h } } }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("Copy on one machine, paste on another. Works with ClipBubble on your other Macs, Linux and Windows machines, using your SSH config and keys.")
+            Text("Copy on one machine, paste on another. Works with ClipBubble on your other Macs, Linux and Windows machines, and your iPhone.")
                 .font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).padding(.bottom, 6)
             PhonePairing()
-            if hosts.isEmpty {
-                Text("No hosts in ~/.ssh/config yet. Add one there and it shows up here.")
-                    .font(.system(size: 11)).foregroundStyle(.tertiary)
+            HStack(spacing: 10) {
+                Image(systemName: "desktopcomputer").font(.system(size: 13)).foregroundStyle(.secondary).frame(width: 20)
+                Text("Another computer").font(.system(size: 13, weight: .medium))
+                Spacer(minLength: 8)
+                Button(adding ? "Cancel" : "Add a computer…") { relink = nil; adding.toggle() }.controlSize(.small)
             }
-            ForEach(hosts, id: \.self) { host in
-                HStack(spacing: 10) {
-                    Image(systemName: "server.rack").font(.system(size: 13)).foregroundStyle(.secondary).frame(width: 20)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(host).font(.system(size: 13, weight: .medium))
-                        if enabled.contains(host) {
-                            TimelineView(.periodic(from: .now, by: 1)) { _ in
-                                let state = model.syncPaused ? nil : model.links[host]
-                                HStack(spacing: 5) {
-                                    Circle().fill(state?.ok == true ? Color.green : state == nil ? Color.gray : Color.orange)
-                                        .frame(width: 6, height: 6)
-                                    Text(model.syncPaused ? "Paused" : state?.text ?? "Connecting…")
-                                }
-                                .font(.system(size: 11)).foregroundStyle(.secondary)
-                            }
-                            if let note = setup[host] {
-                                Text(note).font(.system(size: 11)).foregroundStyle(.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
-                    }
-                    Spacer(minLength: 8)
-                    if enabled.contains(host), !model.syncPaused, let label = setupLabel(model.links[host]) {
-                        Button(label) { install(host) }
-                            .controlSize(.small).disabled(installing.contains(host))
-                    }
-                    Toggle("", isOn: Binding(get: { enabled.contains(host) }, set: { on in
-                        if on { enabled.insert(host) } else { enabled.remove(host) }
-                        SyncEngine.shared.setHost(host, on: on)
-                    }))
-                    .toggleStyle(.switch).controlSize(.mini).labelsHidden()
+            .padding(.vertical, 5)
+            if adding {
+                AddComputer(relinking: relink, taken: configHosts) { peer, start in
+                    adding = false
+                    relink = nil
+                    peers = Peers.all
+                    if start { enabled.insert(peer.alias); SyncEngine.shared.setHost(peer.alias, on: true) }
+                    SyncEngine.shared.redial(peer.alias)
                 }
-                .padding(.vertical, 5)
+                .padding(.leading, 30).padding(.bottom, 6)
+            }
+            ForEach(hosts, id: \.self) { host in hostRow(host) }
+            if hosts.isEmpty {
+                Text("Computers you add show up here, along with any hosts in ~/.ssh/config.")
+                    .font(.system(size: 11)).foregroundStyle(.tertiary)
             }
             if !enabled.isEmpty {
                 HStack(spacing: 10) {
@@ -923,16 +916,87 @@ struct SyncSettings: View {
             }
             Text("This Mac shows up as \(SyncEngine.shared.name). Files up to 25 MB move on their own. Password-manager copies never leave this Mac.")
                 .font(.system(size: 10.5)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true).padding(.top, 2)
+            if let id = HostIdentity.mine {
+                Text("This Mac's identity: \(id)").font(.system(size: 10.5, design: .monospaced)).foregroundStyle(.tertiary)
+                    .textSelection(.enabled).padding(.top, 2)
+            }
         }
-        .onAppear { hosts = SSHConfig.hosts() }
+        .onAppear { configHosts = SSHConfig.hosts(); peers = Peers.all }
     }
 
-    private func setupLabel(_ state: LinkState?) -> String? {
+    private func hostRow(_ host: String) -> some View {
+        let peer = peers.first { $0.alias == host }
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 10) {
+                Image(systemName: peer == nil ? "server.rack" : "desktopcomputer").font(.system(size: 13)).foregroundStyle(.secondary).frame(width: 20)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(peer?.name ?? host).font(.system(size: 13, weight: .medium))
+                    if enabled.contains(host) {
+                        TimelineView(.periodic(from: .now, by: 1)) { _ in
+                            let state = model.syncPaused ? nil : model.links[host]
+                            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                                Circle().fill(state?.ok == true ? Color.green : state == nil ? Color.gray : Color.orange)
+                                    .frame(width: 6, height: 6)
+                                Text(model.syncPaused ? "Paused" : state?.text ?? "Connecting…").fixedSize(horizontal: false, vertical: true)
+                            }
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                        }
+                    } else if let peer {
+                        Text("Off. Connects as \(peer.user)@\(peer.host)").font(.system(size: 11)).foregroundStyle(.tertiary)
+                    }
+                    if let note = setup[host] {
+                        Text(note).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Spacer(minLength: 8)
+                if enabled.contains(host), !model.syncPaused { action(host, peer: peer, state: model.links[host]) }
+                Toggle("", isOn: Binding(get: { enabled.contains(host) }, set: { on in
+                    if on { enabled.insert(host) } else { enabled.remove(host) }
+                    SyncEngine.shared.setHost(host, on: on)
+                }))
+                .toggleStyle(.switch).controlSize(.mini).labelsHidden()
+            }
+            if checking == host {
+                IdentityCheck(alias: host, peer: peer) { trusted in
+                    checking = nil
+                    peers = Peers.all
+                    if trusted { SyncEngine.shared.redial(host) }
+                }
+                .padding(.leading, 30)
+            }
+        }
+        .padding(.vertical, 5)
+        .contextMenu {
+            if let peer {
+                Button("Link again…") { relink = peer; adding = true }
+                Button("Remove \(peer.name)") {
+                    SyncEngine.shared.setHost(peer.alias, on: false)
+                    enabled.remove(peer.alias)
+                    Peers.remove(peer.alias)
+                    peers = Peers.all
+                }
+            }
+        }
+    }
+
+    /// The one button that fixes what's wrong, if there's something to press.
+    @ViewBuilder private func action(_ host: String, peer: Peer?, state: LinkState?) -> some View {
         switch state {
-        case .notInstalled: return "Set up"
-        case .versionMismatch(let h): return h.os == "linux" ? "Update" : nil
-        case .live(let h): return RemoteSetup.isOutdated(h) ? "Update" : nil
-        default: return nil
+        case .notInstalled?:
+            Button("Set up") { install(host) }.controlSize(.small).disabled(installing.contains(host))
+        case .versionMismatch(let h)? where h.os == "linux":
+            Button("Update") { install(host) }.controlSize(.small).disabled(installing.contains(host))
+        case .live(let h)? where RemoteSetup.isOutdated(h):
+            Button("Update") { install(host) }.controlSize(.small).disabled(installing.contains(host))
+        case .unknownHost?:
+            Button("Check identity…") { checking = host }.controlSize(.small)
+        case .hostKeyChanged?, .needsKeyAuth?:
+            if let peer { Button("Link again…") { relink = peer; adding = true }.controlSize(.small) }
+            else { Button("Try again") { SyncEngine.shared.redial(host) }.controlSize(.small) }
+        case .unresolved?, .refused?, .appNotRunning?:
+            Button("Try again") { SyncEngine.shared.redial(host) }.controlSize(.small)
+        default:
+            EmptyView()
         }
     }
 
@@ -947,7 +1011,129 @@ struct SyncSettings: View {
     }
 }
 
-/// Settings → Sync over SSH → iPhone: shows a QR code for the ClipBubble iPhone app to scan.
+/// Add a computer: type the address and code the other computer shows, check who answered, then choose to sync.
+struct AddComputer: View {
+    /// Linking a computer again keeps its name in ClipBubble, and replaces its key only because you asked.
+    let relinking: Peer?
+    let taken: [String]
+    let done: (Peer, Bool) -> Void
+    @State private var address = ""
+    @State private var code = ""
+    @State private var busy = false
+    @State private var error: String?
+    @State private var found: Peer?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let found {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Ready to link with \(found.name)").font(.system(size: 12, weight: .semibold))
+                    detail("Connects as \(found.summary).")
+                    if let id = fingerprint(found.hostKey) {
+                        detail("Its identity is \(id). It should match the one in ClipBubble's settings on \(found.name).")
+                    } else {
+                        detail("It didn't send its identity, so you'll be asked to check it the first time it connects.")
+                    }
+                    detail("That key can only run ClipBubble there: no shell, no files, no forwarding.")
+                    detail("Syncing shares what you copy, plus screenshots and downloads if they're on above. Nothing syncs until you start it.")
+                }
+                HStack {
+                    Button("Start syncing") { finish(found, start: true) }.keyboardShortcut(.defaultAction)
+                    Button("Not now") { finish(found, start: false) }
+                }
+                .controlSize(.small)
+            } else {
+                detail(relinking.map { "On \($0.name), open ClipBubble → Settings → Sync over SSH → Link iPhone…, then enter what it shows." }
+                       ?? "On the other computer, open ClipBubble → Settings → Sync over SSH → Link iPhone…, then enter what it shows. On Linux without a desktop, run clipbubble --pair there.")
+                HStack(spacing: 6) {
+                    TextField("Address, like rohits-mac.local", text: $address).frame(minWidth: 170)
+                    TextField("Code", text: $code).frame(width: 96)
+                    Button(busy ? "Linking…" : "Link") { link() }
+                        .disabled(busy || LinkClient.target(address: address, code: code) == nil)
+                }
+                .textFieldStyle(.roundedBorder).controlSize(.small)
+                if let error { Text(error).font(.system(size: 11)).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true) }
+                detail("This uses ClipBubble's own key, \(Peers.keyDisplay), and leaves ~/.ssh/config alone. Only the public half is sent.")
+            }
+        }
+        .onAppear { if let relinking { address = relinking.host } }
+    }
+
+    private func detail(_ s: String) -> some View {
+        Text(s).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func link() {
+        busy = true
+        error = nil
+        Task { @MainActor in
+            do {
+                let (host, a) = try await LinkClient.link(address: address, code: code)
+                let alias = relinking?.alias ?? Peers.freeAlias(for: a.name, taken: taken)
+                found = Peer(alias: alias, name: a.name, user: a.user, host: host, hostKey: a.hostKey)
+            } catch {
+                self.error = error.localizedDescription
+            }
+            busy = false
+        }
+    }
+
+    private func finish(_ p: Peer, start: Bool) {
+        Peers.save(p)
+        SyncLog.write("linked \(p.alias) as \(p.user)@\(p.host)")
+        done(p, start)
+    }
+}
+
+/// Unknown host: shows the identity its SSH server presents, to compare with what that computer shows, before trusting it.
+struct IdentityCheck: View {
+    let alias: String
+    let peer: Peer?
+    let done: (Bool) -> Void
+    @State private var scanned: (entry: String, key: String)?
+    @State private var failed = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let scanned, let id = fingerprint(scanned.key) {
+                Text("It says its identity is").font(.system(size: 11)).foregroundStyle(.secondary)
+                Text(id).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                Text("On that computer, ClipBubble shows its identity under Settings → Sync over SSH. Trust it only if they match.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Button("They match, trust it") { trust(scanned) }
+                    Button("Cancel") { done(false) }
+                }
+                .controlSize(.small)
+            } else if failed {
+                Text("Couldn't ask it for its identity. Check that it's on and reachable, then try again.")
+                    .font(.system(size: 11)).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                Button("Close") { done(false) }.controlSize(.small)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+        }
+        .task {
+            let result = await Task.detached { [alias, peer] in
+                peer.map { HostIdentity.scan(host: $0.host) } ?? HostIdentity.scan(alias)
+            }.value
+            if let result { scanned = result } else { failed = true }
+        }
+    }
+
+    private func trust(_ s: (entry: String, key: String)) {
+        if var p = peer {
+            p.hostKey = s.key
+            Peers.save(p)
+        } else {
+            do { try HostIdentity.trust(s.entry) } catch { failed = true; scanned = nil; return }
+        }
+        done(true)
+    }
+}
+
+/// Settings → Sync over SSH → iPhone: shows a QR code for the ClipBubble iPhone app to scan, and the address and code
+/// another computer types into Add a computer.
 struct PhonePairing: View {
     @State private var server: PairingServer?
     @State private var qr: NSImage?
@@ -964,9 +1150,17 @@ struct PhonePairing: View {
                 Spacer(minLength: 8)
                 Button(server == nil ? "Link iPhone…" : "Done") { server == nil ? start() : stop() }.controlSize(.small)
             }
-            if let qr {
+            if let qr, let server {
                 Image(nsImage: qr).interpolation(.none).resizable().frame(width: 150, height: 150)
                     .padding(8).background(Color.white, in: RoundedRectangle(cornerRadius: 8)).padding(.leading, 30)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Linking another computer instead? In its Add a computer…, enter")
+                    HStack(spacing: 14) {
+                        Text(server.typedAddress).font(.system(size: 12, weight: .semibold, design: .monospaced)).textSelection(.enabled)
+                        Text(LinkCode.display(server.shortCode)).font(.system(size: 12, weight: .semibold, design: .monospaced)).textSelection(.enabled)
+                    }
+                }
+                .font(.system(size: 11)).foregroundStyle(.secondary).padding(.leading, 30)
             }
         }
         .padding(.vertical, 5)
@@ -982,6 +1176,7 @@ struct PhonePairing: View {
         let s = PairingServer()
         s.onReady = { qr = PairingServer.qr($0); note = "Scan with the iPhone's Camera, or in ClipBubble on the iPhone. Same Wi-Fi as this Mac." }
         s.onPaired = { name in qr = nil; server = nil; note = "Linked \(name). It syncs whenever ClipBubble is open there." }
+        s.onGaveUp = { qr = nil; server = nil; note = "Too many wrong codes, so linking stopped. Press Link iPhone… for a new code." }
         server = s
         s.start()
     }
@@ -1129,7 +1324,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Before the folder watchers: a pending privacy prompt for a folder mustn't keep linked devices waiting.
         let sync = SyncEngine.shared
         sync.onReceived = { [weak self] in self?.captured() }
-        sync.onStatus = { [weak self] in self?.model.links = sync.statuses; self?.model.linked = sync.linked }
+        sync.onStatus = { [weak self] in
+            self?.model.links = sync.statuses
+            self?.model.linked = sync.linked
+            SyncStatus.write(sync.statuses, paused: self?.model.syncPaused ?? false, openAtLogin: LoginItem.describe())
+        }
         sync.onTransfers = { [weak self] t in
             let finished = self?.model.transfers.keys.contains { t[$0] == nil } ?? false
             self?.model.transfers = t

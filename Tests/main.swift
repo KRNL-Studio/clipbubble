@@ -27,6 +27,7 @@ if child { runChild() }
 syncTests()
 storeTests()
 linkTests()
+peerTests()
 updaterTests()
 
 try? FileManager.default.removeItem(at: testHome)

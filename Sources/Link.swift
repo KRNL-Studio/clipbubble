@@ -410,11 +410,21 @@ final class SyncEngine {
 
 // MARK: - Link state
 
+/// Where a link stands. The failures follow the order a connection goes through: finding the host, reaching its SSH
+/// server, checking its identity, logging in, finding ClipBubble there, then agreeing on a version.
 enum LinkState: Equatable {
     case connecting
     case live(Hello)
-    case needsKeyAuth
+    /// The name doesn't resolve: not on this network, or a typo.
+    case unresolved
+    /// Something answered but refused SSH: Remote Login or the SSH server is off there.
+    case refused
+    /// Its identity isn't known yet: check its fingerprint before trusting it.
     case unknownHost
+    /// Its identity is different from the one trusted before. Never fixed by retrying.
+    case hostKeyChanged
+    /// The login was turned down, for this user and host ("you@mac.local") when SSH says which.
+    case needsKeyAuth(String)
     case notInstalled
     case appNotRunning
     case versionMismatch(Hello)
@@ -424,8 +434,13 @@ enum LinkState: Equatable {
         switch self {
         case .connecting: return "Connecting…"
         case .live(let h): return "Linked with \(h.name)"
-        case .needsKeyAuth: return "Needs SSH key login"
-        case .unknownHost: return "Connect once in Terminal to trust this host"
+        case .unresolved: return "Can't find it on this network. Check the name, or that it's on"
+        case .refused: return "It's not accepting connections. Turn on Remote Login or SSH there"
+        case .unknownHost: return "Not trusted yet. Check its identity to trust it"
+        case .hostKeyChanged: return "Its identity changed. Don't trust it unless you reinstalled it, then link it again"
+        case .needsKeyAuth(let who):
+            return who.isEmpty ? "Wasn't let in. Link it again, or add this computer's key there"
+                : "\(who) wasn't let in. Check the user name, or link it again"
         case .notInstalled: return "ClipBubble isn't installed there"
         case .appNotRunning: return "ClipBubble isn't running there"
         case .versionMismatch(let h): return "Update needed (it has \(h.version))"
@@ -436,6 +451,51 @@ enum LinkState: Equatable {
     }
 
     var ok: Bool { if case .live = self { true } else { false } }
+
+    /// A short name for diagnostics, the same on every platform.
+    var kind: String {
+        switch self {
+        case .connecting: return "connecting"
+        case .live: return "live"
+        case .unresolved: return "unresolved"
+        case .refused: return "refused"
+        case .unknownHost: return "unknown-host"
+        case .hostKeyChanged: return "host-key-changed"
+        case .needsKeyAuth: return "needs-key"
+        case .notInstalled: return "not-installed"
+        case .appNotRunning: return "not-running"
+        case .versionMismatch: return "version"
+        case .offline: return "offline"
+        }
+    }
+
+    /// Network trouble that often clears by itself, so it keeps retrying soon. Everything else waits for a person.
+    var transient: Bool {
+        switch self {
+        case .offline, .unresolved, .refused, .connecting: return true
+        default: return false
+        }
+    }
+
+    /// Reads why ssh (or the iPhone's own SSH) ended, from what it printed. Nil means it just dropped or timed out.
+    /// Nothing here ever turns host checking off or replaces a trusted key: those are left to the person.
+    static func failure(stderr err: String, windows: Bool) -> LinkState? {
+        if err.contains("CLIPBUBBLE_NOT_INSTALLED") || (windows && err.contains("cannot find the path")) { return .notInstalled }
+        if err.contains("CLIPBUBBLE_NOT_RUNNING") { return .appNotRunning }
+        if err.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") || err.contains("Host key for") && err.contains("has changed") {
+            return .hostKeyChanged
+        }
+        if err.contains("Host key verification failed") || err.contains("host key is known") { return .unknownHost }
+        if err.contains("Permission denied") || err.contains("Too many authentication failures") {
+            // OpenSSH says "you@host: Permission denied (publickey)."
+            let line = err.split(whereSeparator: \.isNewline).first { $0.contains("Permission denied") }.map(String.init) ?? ""
+            let who = line.components(separatedBy: ": Permission denied").first ?? ""
+            return .needsKeyAuth(who.contains("@") && who.count < 200 && !who.contains(" ") ? who : "")
+        }
+        if err.contains("Could not resolve hostname") || err.contains("nodename nor servname") { return .unresolved }
+        if err.contains("Connection refused") { return .refused }
+        return nil
+    }
 }
 
 /// A relay running on a host over SSH: frames in on `input`, frames out on `output`.
@@ -496,6 +556,7 @@ final class HostLink {
     func helloReceived(_ h: Hello) {
         backoff = 1
         mismatch = nil
+        Platform.defaults.set(Date().timeIntervalSince1970, forKey: "sync.lastLive." + alias)
         set(.live(h))
     }
 
@@ -518,16 +579,11 @@ final class HostLink {
             connect()
             return
         }
-        let next: LinkState
-        if let h = mismatch { next = .versionMismatch(h) }
-        else if err.contains("CLIPBUBBLE_NOT_INSTALLED") || (windows && err.contains("cannot find the path")) { next = .notInstalled }
-        else if err.contains("CLIPBUBBLE_NOT_RUNNING") { next = .appNotRunning }
-        else if err.contains("Host key verification failed") { next = .unknownHost }
-        else if err.contains("Permission denied") || err.contains("Too many authentication failures") { next = .needsKeyAuth }
-        else { next = .offline(Date().addingTimeInterval(wasLive ? 1 : backoff)) }
+        let next = mismatch.map(LinkState.versionMismatch) ?? LinkState.failure(stderr: err, windows: windows)
+            ?? .offline(Date().addingTimeInterval(wasLive ? 1 : backoff))
         if !err.isEmpty { SyncLog.write("\(alias): \(err.trimmingCharacters(in: .whitespacesAndNewlines).suffix(300))") }
         // Problems only you can fix retry slowly; a dropped link comes back fast.
-        if case .offline = next {} else { backoff = max(backoff, 60) }
+        if !next.transient { backoff = max(backoff, 60) }
         if wasLive { backoff = 1 }
         set(next)
         scheduleRetry()

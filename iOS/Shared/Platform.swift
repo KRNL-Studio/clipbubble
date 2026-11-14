@@ -36,7 +36,9 @@ extension LinkState {
     var phoneText: String {
         switch self {
         case .needsKeyAuth: return "Not allowed in. Link this iPhone again from the computer"
-        case .unknownHost: return "The computer's identity changed. Link it again to trust it"
+        case .unknownHost, .hostKeyChanged: return "The computer's identity changed. Link it again to trust it"
+        case .unresolved: return "Can't find the computer. Is this iPhone on the same Wi-Fi?"
+        case .refused: return "The computer isn't accepting connections. Turn on Remote Login or SSH there"
         case .notInstalled: return "ClipBubble isn't installed on the computer"
         case .appNotRunning: return "Open ClipBubble on the computer"
         case .versionMismatch(let h): return "Update ClipBubble on \(h.name) (it has \(h.version))"

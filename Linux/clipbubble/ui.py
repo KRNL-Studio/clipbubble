@@ -11,7 +11,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango  # noqa: E402
 
-from . import board, mascots, pairing, qr  # noqa: E402
+from . import board, mascots, pairing, peers, qr  # noqa: E402
 from .capture import Capture  # noqa: E402
 from .engine import Engine, log, ssh_hosts, state_text  # noqa: E402
 from .shell import NAME as SHELL_NAME, Shell  # noqa: E402
@@ -778,12 +778,15 @@ class App(Gtk.Application):
         self.settings_box.append(self.pair_box)
         self.show_pairing()
         self.host_labels = {}
-        hosts = ssh_hosts()
+        linked = peers.all_peers()
+        hosts = [p["alias"] for p in linked] + [h for h in ssh_hosts() if not peers.peer(h)]
+        names = {p["alias"]: p["name"] for p in linked}
         enabled = set(Prefs.get("sync.hosts", []))
         if not hosts:
-            self.note("No hosts in ~/.ssh/config yet. Machines that link to this one show up by themselves.")
+            self.note("To link another computer, run clipbubble --link ADDRESS CODE with what its Link iPhone… shows. "
+                      "Hosts in ~/.ssh/config show up here too.")
         for h in hosts:
-            self.host_labels[h] = self.switch_row(h, "", h in enabled, lambda on, h=h: self.set_host(h, on))
+            self.host_labels[h] = self.switch_row(names.get(h, h), "", h in enabled, lambda on, h=h: self.set_host(h, on))
         self.switch_row("Pause sync", None, bool(Prefs.get("sync.paused")), self.set_paused)
         self.linked_label = self.note("")
         self.refresh_hosts()
@@ -828,13 +831,15 @@ class App(Gtk.Application):
                                           lambda: GLib.idle_add(self.pairing_done, None))
             hint = pairing.firewall_hint()
             self.pair_state = (self.pairing.link(), "Scan with the iPhone's Camera, or in ClipBubble on the iPhone. "
-                                                    "It needs the same Wi-Fi as this computer." + (f" {hint}." if hint else ""))
+                                                    "It needs the same Wi-Fi as this computer." + (f" {hint}." if hint else "") +
+                               f"\n\nLinking another computer instead? In its Add a computer…, enter "
+                               f"{self.pairing.typed_address()} and the code {peers.display_code(self.pairing.short_code)}.")
         self.show_pairing()
 
     def pairing_done(self, name):
         self.pairing = None
         self.pair_state = (None, f"Linked {name}. It syncs whenever ClipBubble is open there." if name else
-                           "That code expired. Press Link iPhone… for a new one.")
+                           "That code expired or was mistyped too often. Press Link iPhone… for a new one.")
         self.show_pairing()
         return False
 

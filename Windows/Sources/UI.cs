@@ -1742,7 +1742,8 @@ sealed class SettingsView : Grid
                 }
                 var p = new Pairing(name, note => Show(null, note));
                 Dispatcher.BeginInvoke(new Action(() => pairing = p));
-                Show(p.Link, "Scan with the iPhone's Camera, or in ClipBubble on the iPhone. It needs the same Wi-Fi as this PC.");
+                Show(p.Link, "Scan with the iPhone's Camera, or in ClipBubble on the iPhone. It needs the same Wi-Fi as this PC.\n\n" +
+                             $"Linking another computer instead? In its Add a computer…, enter {p.TypedAddress} and the code {p.ShortCodeShown}.");
             }
             catch (PairingException e) { Show(null, e.Message); }
         });

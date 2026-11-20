@@ -7,8 +7,6 @@ enum Platform {
     static let dataDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("ClipBubble")
     static let defaults = UserDefaults.standard
     static let retryCap: Double = 300
-    static let hostChanged = "Connect once in Terminal to trust this host"
-    static let keyRefused = "Needs SSH key login"
     static var downloads: URL {
         FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads")
@@ -28,8 +26,9 @@ enum Platform {
     static func dial(_ alias: String, _ command: String, stderr: @escaping (Data) -> Void, exited: @escaping () -> Void) throws -> Tunnel {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        // A computer linked with Add a computer brings its own key, user and pinned identity; anything else is ~/.ssh/config's.
         p.arguments = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15",
-                       "-o", "ServerAliveCountMax=2", "--", alias, command]
+                       "-o", "ServerAliveCountMax=2"] + (Peers.sshArguments(alias) ?? ["--", alias]) + [command]
         let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
         p.standardInput = inPipe
         p.standardOutput = outPipe

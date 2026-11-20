@@ -6,6 +6,7 @@ using System.IO;
 using System.IO.Pipes;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 
 namespace ClipBubble;
@@ -51,14 +52,43 @@ sealed record LinkState(string Kind, string Arg = "", double At = 0)
                     var s = At > 0 ? Math.Max(0, (int)(At - Engine.Now)) : 0;
                     return s is > 0 and < 60 ? $"Offline, retrying in {s} s" : s > 0 ? $"Offline, retrying in {s / 60} min" : "Offline";
                 case "connecting": return "Connecting…";
-                case "needs-key": return "Needs SSH key login";
-                case "unknown-host": return "Connect once in a terminal to trust this host";
+                case "unresolved": return "Can't find it on this network. Check the name, or that it's on";
+                case "refused": return "It's not accepting connections. Turn on Remote Login or SSH there";
+                case "unknown-host": return "Not trusted yet. Check its identity to trust it";
+                case "host-key-changed": return "Its identity changed. Don't trust it unless you reinstalled it, then link it again";
+                case "needs-key": return Arg.Length > 0 ? $"{Arg} wasn't let in. Check the user name, or link it again"
+                    : "Wasn't let in. Link it again, or add this computer's key there";
                 case "not-installed": return "ClipBubble isn't installed there";
                 case "not-running": return "ClipBubble isn't running there";
                 case "version": return $"Update needed (it has {Arg})";
                 default: return Kind;
             }
         }
+    }
+
+    /// Network trouble that often clears by itself, so it keeps retrying soon. Everything else waits for a person.
+    public bool Transient => Kind is "offline" or "unresolved" or "refused" or "connecting";
+
+    /// Why ssh ended, from what it printed, in the order a connection goes: finding the host, reaching its SSH server,
+    /// checking its identity, logging in, then finding ClipBubble. Null means it just dropped or timed out. Nothing
+    /// here turns host checking off or replaces a trusted key.
+    public static LinkState? Failure(string err, bool windows)
+    {
+        if (err.Contains("CLIPBUBBLE_NOT_INSTALLED") || (windows && err.Contains("cannot find the path"))) return new("not-installed");
+        if (err.Contains("CLIPBUBBLE_NOT_RUNNING")) return new("not-running");
+        if (err.Contains("REMOTE HOST IDENTIFICATION HAS CHANGED") || (err.Contains("Host key for") && err.Contains("has changed"))) return new("host-key-changed");
+        if (err.Contains("Host key verification failed") || err.Contains("host key is known")) return new("unknown-host");
+        if (err.Contains("Permission denied") || err.Contains("Too many authentication failures"))
+        {
+            // OpenSSH says "you@host: Permission denied (publickey)."
+            var line = err.Split('\n').FirstOrDefault(l => l.Contains("Permission denied")) ?? "";
+            var i = line.IndexOf(": Permission denied", StringComparison.Ordinal);
+            var who = i > 0 ? line.Substring(0, i).Trim() : "";
+            return new("needs-key", who.Contains("@") && !who.Contains(" ") && who.Length < 200 ? who : "");
+        }
+        if (err.Contains("Could not resolve hostname") || err.Contains("No such host is known")) return new("unresolved");
+        if (err.Contains("Connection refused")) return new("refused");
+        return null;
     }
 }
 
@@ -503,7 +533,7 @@ sealed class Engine
         s.Offered.Remove(d.Hash);
         if (d.Kind == "image") db.Received(d.Hash, file: d.Paths[0]);
         else db.Received(d.Hash, text: string.Join("\n", d.Paths));
-        if (d.Apply && db.Clips(limit: 1).FirstOrDefault() is { } newest && newest.Hash == d.Hash) ApplyNow(newest, s);
+        if (d.Apply && !d.Bounced && db.Clips(limit: 1).FirstOrDefault() is { } newest && newest.Hash == d.Hash) ApplyNow(newest, s);
         Received();
     }
 
@@ -514,8 +544,14 @@ sealed class Engine
     {
         var bad = new HashSet<char>(Path.GetInvalidFileNameChars().Concat("/\\:*?\"<>|\r\n\0"));
         var s = new string(raw.Select(ch => bad.Contains(ch) || ch < ' ' ? '_' : ch).ToArray());
-        s = s.TrimStart('.');
-        if (s.Length > 200) s = s.Substring(0, 200);
+        s = s.TrimStart('.').Trim();
+        // A long name is cut before its extension, so the file still opens with the right app.
+        if (s.Length > 200)
+        {
+            var ext = Numbered(s).Ext;
+            var tail = ext.Length > 0 ? "." + ext : "";
+            s = s.Substring(0, 200 - tail.Length).TrimEnd() + tail;
+        }
         s = s.Trim().TrimEnd('.', ' ');
         var stem = s.Split('.')[0].ToUpperInvariant();
         if (stem is "CON" or "PRN" or "AUX" or "NUL" || (stem.Length == 4 && (stem.StartsWith("COM") || stem.StartsWith("LPT")) && char.IsDigit(stem[3]))) s = "_" + s;
@@ -524,12 +560,65 @@ sealed class Engine
 
     public static string ReceivedFolder(string device) => Path.Combine(Downloads(), "ClipBubble", SafeFileName(device));
 
+    /// A name split for numbering: "shot (3).png" is "shot", 3, "png". Extensions are short and have no spaces.
+    public static (string Base, int N, string Ext) Numbered(string name)
+    {
+        var dot = name.LastIndexOf('.');
+        var (stem, ext) = dot > 0 && dot < name.Length - 1 ? (name.Substring(0, dot), name.Substring(dot + 1)) : (name, "");
+        if (ext.Length > 10 || ext.IndexOf(' ') >= 0) (stem, ext) = (name, "");
+        var m = Regex.Match(stem, @"(?<=.) \(([0-9]{1,6})\)$");
+        return m.Success ? (stem.Substring(0, m.Index), int.Parse(m.Groups[1].Value), ext) : (stem, 1, ext);
+    }
+
+    /// A free name in the folder. A clash gets " (2)", " (3)" and so on, counting on from a number the name already
+    /// has rather than stacking another one on.
     public static string UniquePath(string folder, string name)
     {
         var p = Path.Combine(folder, name);
-        var (stem, ext) = (Path.GetFileNameWithoutExtension(name), Path.GetExtension(name));
-        for (var n = 2; File.Exists(p) || Directory.Exists(p); n++) p = Path.Combine(folder, $"{stem} ({n}){ext}");
+        var (stem, start, ext) = Numbered(name);
+        var tail = ext.Length > 0 ? "." + ext : "";
+        for (var n = Math.Max(2, start + 1); File.Exists(p) || Directory.Exists(p); n++) p = Path.Combine(folder, $"{stem} ({n}){tail}");
         return p;
+    }
+
+    /// A file in the folder with the same name, give or take a " (n)", and the same bytes as `file`.
+    public static string? SameFile(string file, string name, string folder)
+    {
+        var key = Numbered(name);
+        foreach (var other in Directory.EnumerateFiles(folder))
+        {
+            var k = Numbered(Path.GetFileName(other));
+            if (string.Equals(k.Base, key.Base, StringComparison.OrdinalIgnoreCase) && string.Equals(k.Ext, key.Ext, StringComparison.OrdinalIgnoreCase)
+                && SameBytes(other, file)) return other;
+        }
+        return null;
+    }
+
+    /// Whether two files hold the same bytes, compared a megabyte at a time.
+    public static bool SameBytes(string a, string b)
+    {
+        try
+        {
+            if (!File.Exists(a) || !File.Exists(b) || new FileInfo(a).Length != new FileInfo(b).Length) return false;
+            using var fa = File.OpenRead(a);
+            using var fb = File.OpenRead(b);
+            byte[] ba = new byte[1 << 20], bb = new byte[1 << 20];
+            while (true)
+            {
+                int na = Fill(fa, ba), nb = Fill(fb, bb);
+                if (na != nb) return false;
+                for (var i = 0; i < na; i++) if (ba[i] != bb[i]) return false;
+                if (na == 0) return true;
+            }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return false; }
+    }
+
+    static int Fill(Stream s, byte[] buf)
+    {
+        var n = 0;
+        for (int r; n < buf.Length && (r = s.Read(buf, n, buf.Length - n)) > 0;) n += r;
+        return n;
     }
 
     // MARK: Hosts from ~/.ssh/config
@@ -692,15 +781,10 @@ sealed class HostLink(string alias, Engine engine)
             Connect();
             return;
         }
-        LinkState next =
-            Mismatch != null ? new("version", Mismatch)
-            : err.Contains("CLIPBUBBLE_NOT_INSTALLED") || (IsWindows && err.Contains("cannot find the path")) ? new("not-installed")
-            : err.Contains("CLIPBUBBLE_NOT_RUNNING") ? new("not-running")
-            : err.Contains("Host key verification failed") ? new("unknown-host")
-            : err.Contains("Permission denied") || err.Contains("Too many authentication failures") ? new("needs-key")
-            : new("offline", At: Engine.Now + (wasLive ? 1 : backoff));
+        LinkState next = Mismatch != null ? new("version", Mismatch)
+            : LinkState.Failure(err, IsWindows) ?? new("offline", At: Engine.Now + (wasLive ? 1 : backoff));
         if (err.Trim().Length > 0) SyncLog.Write($"{alias}: {Tail(err.Trim(), 300)}");
-        if (next.Kind != "offline") backoff = Math.Max(backoff, 60);
+        if (!next.Transient) backoff = Math.Max(backoff, 60);
         if (wasLive) backoff = 1;
         Set(next);
         Retry();
@@ -1014,6 +1098,8 @@ sealed class Download
     public int Index;
     public long ReceivedBytes;
     public readonly List<string> Paths = new();
+    /// A file was already here from a moment ago, so this is the same file coming back: it doesn't go on the clipboard.
+    public bool Bounced;
     FileStream? f;
 
     public Download(string hash, string kind, List<string> names, List<string> shas, List<long> sizes, string source, bool apply)
@@ -1075,7 +1161,17 @@ sealed class Download
         }
         var folder = Engine.ReceivedFolder(Source);
         Directory.CreateDirectory(folder);
-        var to = Engine.UniquePath(folder, Engine.SafeFileName(names[Index]));
+        var name = Engine.SafeFileName(names[Index]);
+        // The same bytes under the same name are already here: keep that one copy instead of saving another.
+        if (Engine.SameFile(Temp, name, folder) is { } same)
+        {
+            File.Delete(Temp);
+            // Saved moments ago, it's bouncing back (two Macs pass each clipboard write on through Universal Clipboard),
+            // so putting it on the clipboard again would send it round once more.
+            if (DateTime.UtcNow - File.GetLastWriteTimeUtc(same) < TimeSpan.FromSeconds(60)) Bounced = true;
+            return same;
+        }
+        var to = Engine.UniquePath(folder, name);
         File.Move(Temp, to);
         return to;
     }

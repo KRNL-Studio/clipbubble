@@ -63,7 +63,9 @@ Each frame is a 4-byte big-endian length, then that many bytes, a 1-byte type an
 
 ## Received files
 
-Files land in `Downloads/ClipBubble/<device name>/`. Names lose path separators and leading dots, and a clash gets ` (2)`, ` (3)` and so on. A transfer resumes with `fetch` at the received length after a drop.
+Files land in `Downloads/ClipBubble/<device name>/`. Names lose path separators and leading dots, and a name over 200 characters is cut before its extension. A clash gets ` (2)`, ` (3)` and so on, counting on from a number the name already ends in rather than adding another. A transfer resumes with `fetch` at the received length after a drop.
+
+A file whose name (give or take that number) and bytes match one already in the folder isn't saved again: the item points at the file that's there. If that file was saved in the last minute, the item is the same file coming back and doesn't go on the clipboard. Two Macs on one Apple ID pass each clipboard write on through Universal Clipboard, which hands a file over under a new path, so a Mac doesn't record a Universal Clipboard file whose bytes match a recent item's file either. Without both, one copy went round the two Macs as a new item every few seconds.
 
 ## What a peer can reach
 
@@ -72,3 +74,35 @@ A linked device reaches a file only by being offered it from history. Three rule
 1. A peer's text is names, never paths. A receiver reduces every line of a file `put` the way it reduces a received file's name before storing it. The only paths in history are ones the machine captured itself or placed after a download.
 2. A sender answers `fetch` only for a hash it sent in a `put` with blobs on this session, while the item is still in history, still has its bytes here, and its category is switched on. Anything else gets `cancel`, including a hash the peer listed in its `summary`. Peers have always fetched after a `put` on the same session, so older versions are unaffected.
 3. A sender reads only absolute paths, so a name left in history can't resolve against its working directory. The same goes for writing a file to the clipboard.
+
+## Linking
+
+A device that wants to link (an iPhone, or a computer using Add a computer) asks another computer's pairing listener to
+accept its SSH key. The listener runs only while that computer shows Link iPhone… (or `--pair`), on TCP port 47821 when
+it's free and any port otherwise.
+
+The request is one line of JSON, `{"code", "key", "name"}`, and the answer is one line back: either
+`{"ok": true, "user", "name", "hostKey"}`, or `{"ok": false, "error"}` with a sentence to show.
+
+- **The code** is either the 32-character one in the QR code, or the 8-character short code the computer shows for
+  typing (from `23456789ABCDEFGHJKLMNPQRSTUVWXYZ`, shown as `K7QM-4ZTD`; case, spaces and dashes don't matter). Five
+  wrong codes stop the listener, so the short code can't be guessed.
+- **The key** is a public `ssh-ed25519` key. It goes into `authorized_keys` as `restrict,command="… --peer"`, so it can
+  run ClipBubble's relay and nothing else. A private key never leaves its device.
+- **`hostKey`** is the computer's SSH host key. The linking side pins it from the first connection: the iPhone in its
+  own store; a computer in ClipBubble's `known_hosts`, under an alias like `clipbubble-rohits-mac`, with
+  `StrictHostKeyChecking=yes`. A computer linked this way is kept in ClipBubble's settings, never in `~/.ssh/config`.
+
+When a link fails, every platform reports the stage it failed at, with the same names (`--status` shows them):
+
+| State | Meaning |
+| --- | --- |
+| `unresolved` | The name doesn't resolve on this network. Retries soon. |
+| `refused` | Nothing accepts SSH there (Remote Login or the SSH server is off). Retries soon. |
+| `unknown-host` | Its host key isn't trusted yet. Check its fingerprint against the one its settings show. |
+| `host-key-changed` | Its host key differs from the trusted one. Never fixed by retrying; link again if it was reinstalled. |
+| `needs-key` | The login was refused, naming `user@host` when SSH does. |
+| `not-installed` | SSH worked, but ClipBubble isn't installed there. |
+| `not-running` | SSH worked, but ClipBubble isn't running there. Retries soon, so the link comes back once it's opened. |
+| `version` | Both sides run ClipBubble, but they need the same protocol version. |
+| `offline` | It dropped or timed out. Retries soon. |

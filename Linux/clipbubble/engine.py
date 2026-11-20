@@ -4,8 +4,10 @@ Engine state is touched only on the engine thread, which runs posted callables i
 queue. Each session has a reader thread and a writer thread; writes put control frames ahead of file chunks."""
 import collections
 import dataclasses
+import filecmp
 import os
 import queue
+import re
 import shutil
 import socket
 import subprocess
@@ -14,7 +16,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import store, sync
+from . import peers, store, sync
 from .store import DB, DIR, IMAGES, sha
 from .sync import CHUNK, Entry, Hello, Stamp, Blob
 
@@ -52,20 +54,58 @@ def safe_file_name(raw):
     """A name from another machine can't climb out of its folder or hide itself."""
     s = raw.replace("/", "_").replace("\\", "_").replace(":", "_")
     s = "".join(ch for ch in s if ch not in "\r\n\0")
-    s = s.lstrip(".")[:200].strip()
+    s = s.lstrip(".").strip()
+    # A long name is cut before its extension, so the file still opens with the right app.
+    if len(s) > 200:
+        ext = numbered(s)[2]
+        tail = "." + ext if ext else ""
+        s = s[:200 - len(tail)].strip() + tail
     return s or "file"
 
 
-def unique_path(folder, name):
-    p = folder / name
+def numbered(name):
+    """A name split for numbering: "shot (3).png" is "shot", 3, "png". Extensions are short and have no spaces."""
     base, dot, ext = name.rpartition(".")
-    if not dot:
+    if not dot or not base or not ext or len(ext) > 10 or " " in ext:
         base, ext = name, ""
-    n = 2
+    m = re.search(r"(?<=.) \(([0-9]{1,6})\)$", base)
+    if not m:
+        return base, 1, ext
+    return base[:m.start()], int(m.group(1)), ext
+
+
+def unique_path(folder, name):
+    """A free name in `folder`. A clash gets " (2)", " (3)" and so on, counting on from a number the name already
+    has rather than stacking another one on."""
+    p = folder / name
+    base, start, ext = numbered(name)
+    n = max(2, start + 1)
     while p.exists():
         p = folder / (f"{base} ({n}).{ext}" if ext else f"{base} ({n})")
         n += 1
     return p
+
+
+def same_file(path, name, folder):
+    """A file in `folder` with the same name, give or take a " (n)", and the same bytes as `path`."""
+    base, _, ext = numbered(name)
+    try:
+        others = os.listdir(folder)
+    except OSError:
+        return None
+    for other in others:
+        b, _, e = numbered(other)
+        if b == base and e == ext and same_bytes(folder / other, path):
+            return folder / other
+    return None
+
+
+def same_bytes(a, b):
+    """Whether two regular files hold the same bytes."""
+    try:
+        return os.path.isfile(a) and os.path.isfile(b) and filecmp.cmp(a, b, shallow=False)
+    except OSError:
+        return False
 
 
 class Engine:
@@ -128,11 +168,18 @@ class Engine:
 
     def _watch_other_writers(self):
         """Agents (clipbubble --mcp) write history from their own process. SQLite's data_version moves when another
-        connection commits, so a once-a-second check costs nothing while nothing changes."""
+        connection commits, so a once-a-second check costs nothing while nothing changes. The same check notices
+        hosts added from a terminal."""
         version, known = None, {}
+        hosts = (store.Prefs.get("sync.paused", False), store.Prefs.get("sync.hosts", []))
 
         def check():
-            nonlocal version, known
+            nonlocal version, known, hosts
+            # clipbubble --link (another process) adds a host: start linking without a restart.
+            now_hosts = (store.Prefs.get("sync.paused", False), store.Prefs.get("sync.hosts", []))
+            if now_hosts != hosts:
+                hosts = now_hosts
+                self.reconcile_links()
             v = self.db.c.execute("PRAGMA data_version").fetchone()[0]
             if v != version:
                 now = {st.hash: st for st in self.db.stamps()}
@@ -162,6 +209,10 @@ class Engine:
     def publish_status(self):
         self.statuses = {a: l.state for a, l in self.links.items()}
         self.linked = [s.peer for s in self.sessions if s.peer]
+        try:
+            peers.write_status(self.statuses, state_text, self.name, store.Prefs.get("sync.paused", False))
+        except OSError:
+            pass
         self.on_status()
 
     # Manual transfers
@@ -483,7 +534,7 @@ class Engine:
         else:
             self.db.received(d.hash, text="\n".join(d.paths))
         newest = self.db.clips(limit=1)
-        if d.apply and newest and newest[0].hash == d.hash:
+        if d.apply and not d.bounced and newest and newest[0].hash == d.hash:
             self.apply_now(newest[0], s)
         self.on_received()
 
@@ -527,8 +578,10 @@ class HostLink:
         if self.stopped or self.proc or self.alias.startswith("-"):
             return
         self._set(("connecting", ""))
+        # A computer linked with --link brings its own key, user and pinned identity; anything else is ~/.ssh/config's.
         args = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15",
-                "-o", "ServerAliveCountMax=2", "--", self.alias, self.WINDOWS if self.windows else self.POSIX]
+                "-o", "ServerAliveCountMax=2"] + (peers.ssh_args(self.alias) or ["--", self.alias]) \
+            + [self.WINDOWS if self.windows else self.POSIX]
         try:
             self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                          start_new_session=True)
@@ -559,6 +612,7 @@ class HostLink:
     def hello_received(self, h):
         self.backoff = 1.0
         self.mismatch = None
+        peers.mark_live(self.alias)
         self._set(("live", h.name))
 
     def session_ended(self, s):
@@ -584,19 +638,11 @@ class HostLink:
             return
         if self.mismatch:
             nxt = ("version", self.mismatch)
-        elif "CLIPBUBBLE_NOT_INSTALLED" in err or (self.windows and "cannot find the path" in err):
-            nxt = ("not-installed", "")
-        elif "CLIPBUBBLE_NOT_RUNNING" in err:
-            nxt = ("not-running", "")
-        elif "Host key verification failed" in err:
-            nxt = ("unknown-host", "")
-        elif "Permission denied" in err or "Too many authentication failures" in err:
-            nxt = ("needs-key", "")
         else:
-            nxt = ("offline", time.time() + (1 if was_live else self.backoff))
+            nxt = classify(err, self.windows) or ("offline", time.time() + (1 if was_live else self.backoff))
         if err.strip():
             log(f"{self.alias}: {err.strip()[-300:]}")
-        if nxt[0] != "offline":
+        if nxt[0] not in TRANSIENT:
             self.backoff = max(self.backoff, 60)
         if was_live:
             self.backoff = 1.0
@@ -863,6 +909,8 @@ class Download:
         self.index = 0
         self.received = 0
         self.paths = []
+        # A file was already here from a moment ago, so this is the same file coming back: it doesn't go on the clipboard.
+        self.bounced = False
         self.f = None
         # A partial first file from a link that dropped: carry on from its end.
         try:
@@ -919,7 +967,20 @@ class Download:
             return str(dest)
         folder = received_folder(self.source)
         folder.mkdir(parents=True, exist_ok=True)
-        dest = unique_path(folder, safe_file_name(self.names[self.index]))
+        name = safe_file_name(self.names[self.index])
+        # The same bytes under the same name are already here: keep that one copy instead of saving another.
+        same = same_file(self.temp, name, folder)
+        if same:
+            self.temp.unlink(missing_ok=True)
+            # Saved moments ago, it's bouncing back (two Macs pass each clipboard write on through Universal Clipboard),
+            # so putting it on the clipboard again would send it round once more.
+            try:
+                if time.time() - same.stat().st_mtime < 60:
+                    self.bounced = True
+            except OSError:
+                pass
+            return str(same)
+        dest = unique_path(folder, name)
         shutil.move(str(self.temp), dest)
         return str(dest)
 
@@ -966,6 +1027,34 @@ def ssh_hosts():
     return seen
 
 
+# Network trouble that often clears by itself, so it keeps retrying soon. Everything else waits for a person.
+TRANSIENT = {"offline", "unresolved", "refused", "connecting"}
+
+
+def classify(err, windows=False):
+    """Why ssh ended, from what it printed, in the order a connection goes: finding the host, reaching its SSH server,
+    checking its identity, logging in, then finding ClipBubble. None means it just dropped or timed out. Nothing here
+    turns host checking off or replaces a trusted key."""
+    if "CLIPBUBBLE_NOT_INSTALLED" in err or (windows and "cannot find the path" in err):
+        return ("not-installed", "")
+    if "CLIPBUBBLE_NOT_RUNNING" in err:
+        return ("not-running", "")
+    if "REMOTE HOST IDENTIFICATION HAS CHANGED" in err or ("Host key for" in err and "has changed" in err):
+        return ("host-key-changed", "")
+    if "Host key verification failed" in err or "host key is known" in err:
+        return ("unknown-host", "")
+    if "Permission denied" in err or "Too many authentication failures" in err:
+        # OpenSSH says "you@host: Permission denied (publickey)."
+        line = next((x for x in err.splitlines() if "Permission denied" in x), "")
+        who = line.split(": Permission denied")[0] if ": Permission denied" in line else ""
+        return ("needs-key", who if "@" in who and " " not in who and len(who) < 200 else "")
+    if "Could not resolve hostname" in err or "Name or service not known" in err or "nodename nor servname" in err:
+        return ("unresolved", "")
+    if "Connection refused" in err:
+        return ("refused", "")
+    return None
+
+
 def state_text(state):
     kind, arg = state
     if kind == "live":
@@ -973,8 +1062,14 @@ def state_text(state):
     if kind == "offline":
         s = max(0, int(arg - time.time())) if arg else 0
         return f"Offline, retrying in {s} s" if 0 < s < 60 else f"Offline, retrying in {s // 60} min" if s else "Offline"
-    return {"connecting": "Connecting…", "needs-key": "Needs SSH key login",
-            "unknown-host": "Connect once in a terminal to trust this host",
+    if kind == "needs-key":
+        return f"{arg} wasn't let in. Check the user name, or link it again" if arg \
+            else "Wasn't let in. Link it again, or add this computer's key there"
+    return {"connecting": "Connecting…",
+            "unresolved": "Can't find it on this network. Check the name, or that it's on",
+            "refused": "It's not accepting connections. Turn on Remote Login or SSH there",
+            "unknown-host": "Not trusted yet. Check its identity to trust it",
+            "host-key-changed": "Its identity changed. Don't trust it unless you reinstalled it, then link it again",
             "not-installed": "ClipBubble isn't installed there", "not-running": "ClipBubble isn't running there",
             "version": f"Update needed (it has {arg})"}.get(kind, kind)
 

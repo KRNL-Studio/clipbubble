@@ -12,8 +12,6 @@ enum Platform {
     static let defaults = UserDefaults(suiteName: group) ?? .standard
     /// The app is only ever linking while you're looking at it, so it never waits long.
     static let retryCap: Double = 30
-    static let hostChanged = "This computer's identity changed. Link it again."
-    static let keyRefused = "This computer doesn't know this iPhone. Link it again."
     /// Files from other devices; open them from ClipBubble to save or share.
     static var downloads: URL { dataDir }
 
@@ -32,6 +30,22 @@ enum Platform {
 
     static func dial(_ alias: String, _ command: String, stderr: @escaping (Data) -> Void, exited: @escaping () -> Void) throws -> Tunnel {
         try SSHTunnel(alias: alias, command: command, stderr: stderr, exited: exited)
+    }
+}
+
+/// What a link's state means on an iPhone, where there's no Terminal and linking again is the fix for most things.
+extension LinkState {
+    var phoneText: String {
+        switch self {
+        case .needsKeyAuth: return "Not allowed in. Link this iPhone again from the computer"
+        case .unknownHost, .hostKeyChanged: return "The computer's identity changed. Link it again to trust it"
+        case .unresolved: return "Can't find the computer. Is this iPhone on the same Wi-Fi?"
+        case .refused: return "The computer isn't accepting connections. Turn on Remote Login or SSH there"
+        case .notInstalled: return "ClipBubble isn't installed on the computer"
+        case .appNotRunning: return "Open ClipBubble on the computer"
+        case .versionMismatch(let h): return "Update ClipBubble on \(h.name) (it has \(h.version))"
+        default: return text
+        }
     }
 }
 

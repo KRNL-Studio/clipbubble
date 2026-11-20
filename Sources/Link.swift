@@ -428,7 +428,7 @@ final class SyncEngine {
         if d.kind == "image" { db.received(hash: d.hash, file: d.paths.first, text: nil) }
         else { db.received(hash: d.hash, file: nil, text: d.paths.joined(separator: "\n")) }
         // Still the newest item once the bytes are here: put it on the clipboard.
-        if d.apply, let c = db.clip(hash: d.hash), db.clips(limit: 1).first?.hash == d.hash { applyNow(c, to: s) }
+        if d.apply, !d.bounced, let c = db.clip(hash: d.hash), db.clips(limit: 1).first?.hash == d.hash { applyNow(c, to: s) }
         notifyUI()
     }
 
@@ -446,11 +446,21 @@ final class SyncEngine {
 
 // MARK: - Link state
 
+/// Where a link stands. The failures follow the order a connection goes through: finding the host, reaching its SSH
+/// server, checking its identity, logging in, finding ClipBubble there, then agreeing on a version.
 enum LinkState: Equatable {
     case connecting
     case live(Hello)
-    case needsKeyAuth
+    /// The name doesn't resolve: not on this network, or a typo.
+    case unresolved
+    /// Something answered but refused SSH: Remote Login or the SSH server is off there.
+    case refused
+    /// Its identity isn't known yet: check its fingerprint before trusting it.
     case unknownHost
+    /// Its identity is different from the one trusted before. Never fixed by retrying.
+    case hostKeyChanged
+    /// The login was turned down, for this user and host ("you@mac.local") when SSH says which.
+    case needsKeyAuth(String)
     case notInstalled
     case appNotRunning
     case versionMismatch(Hello)
@@ -460,8 +470,13 @@ enum LinkState: Equatable {
         switch self {
         case .connecting: return "Connecting…"
         case .live(let h): return "Linked with \(h.name)"
-        case .needsKeyAuth: return Platform.keyRefused
-        case .unknownHost: return Platform.hostChanged
+        case .unresolved: return "Can't find it on this network. Check the name, or that it's on"
+        case .refused: return "It's not accepting connections. Turn on Remote Login or SSH there"
+        case .unknownHost: return "Not trusted yet. Check its identity to trust it"
+        case .hostKeyChanged: return "Its identity changed. Don't trust it unless you reinstalled it, then link it again"
+        case .needsKeyAuth(let who):
+            return who.isEmpty ? "Wasn't let in. Link it again, or add this computer's key there"
+                : "\(who) wasn't let in. Check the user name, or link it again"
         case .notInstalled: return "ClipBubble isn't installed there"
         case .appNotRunning: return "ClipBubble isn't running there"
         case .versionMismatch(let h): return "Update needed (it has \(h.version))"
@@ -472,6 +487,52 @@ enum LinkState: Equatable {
     }
 
     var ok: Bool { if case .live = self { true } else { false } }
+
+    /// A short name for diagnostics, the same on every platform.
+    var kind: String {
+        switch self {
+        case .connecting: return "connecting"
+        case .live: return "live"
+        case .unresolved: return "unresolved"
+        case .refused: return "refused"
+        case .unknownHost: return "unknown-host"
+        case .hostKeyChanged: return "host-key-changed"
+        case .needsKeyAuth: return "needs-key"
+        case .notInstalled: return "not-installed"
+        case .appNotRunning: return "not-running"
+        case .versionMismatch: return "version"
+        case .offline: return "offline"
+        }
+    }
+
+    /// Network trouble that often clears by itself, so it keeps retrying soon, as does ClipBubble not running there yet,
+    /// so the link comes back as soon as it's opened. Everything else waits for a person.
+    var transient: Bool {
+        switch self {
+        case .offline, .unresolved, .refused, .connecting, .appNotRunning: return true
+        default: return false
+        }
+    }
+
+    /// Reads why ssh (or the iPhone's own SSH) ended, from what it printed. Nil means it just dropped or timed out.
+    /// Nothing here ever turns host checking off or replaces a trusted key: those are left to the person.
+    static func failure(stderr err: String, windows: Bool) -> LinkState? {
+        if err.contains("CLIPBUBBLE_NOT_INSTALLED") || (windows && err.contains("cannot find the path")) { return .notInstalled }
+        if err.contains("CLIPBUBBLE_NOT_RUNNING") { return .appNotRunning }
+        if err.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") || err.contains("Host key for") && err.contains("has changed") {
+            return .hostKeyChanged
+        }
+        if err.contains("Host key verification failed") || err.contains("host key is known") { return .unknownHost }
+        if err.contains("Permission denied") || err.contains("Too many authentication failures") {
+            // OpenSSH says "you@host: Permission denied (publickey)."
+            let line = err.split(whereSeparator: \.isNewline).first { $0.contains("Permission denied") }.map(String.init) ?? ""
+            let who = line.components(separatedBy: ": Permission denied").first ?? ""
+            return .needsKeyAuth(who.contains("@") && who.count < 200 && !who.contains(" ") ? who : "")
+        }
+        if err.contains("Could not resolve hostname") || err.contains("nodename nor servname") { return .unresolved }
+        if err.contains("Connection refused") { return .refused }
+        return nil
+    }
 }
 
 /// A relay running on a host over SSH: frames in on `input`, frames out on `output`.
@@ -551,6 +612,7 @@ final class HostLink {
         deadline?.cancel()
         backoff = 1
         mismatch = nil
+        Platform.defaults.set(Date().timeIntervalSince1970, forKey: "sync.lastLive." + alias)
         set(.live(h))
         watchPeer()
     }
@@ -612,19 +674,11 @@ final class HostLink {
             connect()
             return
         }
-        let next: LinkState
-        if let h = mismatch { next = .versionMismatch(h) }
-        else if err.contains("CLIPBUBBLE_NOT_INSTALLED") || (windows && err.contains("cannot find the path")) { next = .notInstalled }
-        else if err.contains("CLIPBUBBLE_NOT_RUNNING") { next = .appNotRunning }
-        else if err.contains("Host key verification failed") { next = .unknownHost }
-        else if err.contains("Permission denied") || err.contains("Too many authentication failures") { next = .needsKeyAuth }
-        else { next = .offline(Date().addingTimeInterval(wasLive ? 1 : backoff)) }
+        let next = mismatch.map(LinkState.versionMismatch) ?? LinkState.failure(stderr: err, windows: windows)
+            ?? .offline(Date().addingTimeInterval(wasLive ? 1 : backoff))
         if !err.isEmpty { SyncLog.write("\(alias): \(err.trimmingCharacters(in: .whitespacesAndNewlines).suffix(300))") }
         // Problems only you can fix retry slowly; a dropped link comes back fast.
-        switch next {
-        case .offline, .appNotRunning: break
-        default: backoff = max(backoff, 60)
-        }
+        if !next.transient { backoff = max(backoff, 60) }
         if wasLive { backoff = 1 }
         set(next)
         scheduleRetry()
@@ -914,6 +968,8 @@ final class Download {
     private(set) var index = 0
     private(set) var received: Int64 = 0
     private(set) var paths: [String] = []
+    /// A file was already here from a moment ago, so this is the same file coming back: it doesn't go on the clipboard.
+    private(set) var bounced = false
     private var handle: FileHandle?
     private var temp: URL { Paths.dir.appendingPathComponent("incoming/\(sha(hash))-\(index)") }
 
@@ -969,7 +1025,17 @@ final class Download {
         }
         let dir = receivedFolder(from)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let dest = uniqueURL(in: dir, name: safeFileName(names[index]))
+        let name = safeFileName(names[index])
+        // The same bytes under the same name are already here: keep that one copy instead of saving another.
+        if let same = sameFile(as: temp.path, named: name, in: dir) {
+            try? FileManager.default.removeItem(at: temp)
+            // Saved moments ago, it's bouncing back: two Macs on one Apple ID pass every clipboard write on through
+            // Universal Clipboard, so putting it on the clipboard again would send it round once more.
+            let saved = (try? FileManager.default.attributesOfItem(atPath: same.path))?[.modificationDate] as? Date
+            if let saved, Date().timeIntervalSince(saved) < 60 { bounced = true }
+            return same.path
+        }
+        let dest = uniqueURL(in: dir, name: name)
         guard (try? FileManager.default.moveItem(at: temp, to: dest)) != nil else { return nil }
         return dest.path
     }
@@ -1006,19 +1072,66 @@ func safeFileName(_ raw: String) -> String {
     var s = raw.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "\\", with: "_")
         .replacingOccurrences(of: ":", with: "_").filter { !$0.isNewline && $0 != "\0" }
     while s.hasPrefix(".") { s.removeFirst() }
-    s = String(s.prefix(200)).trimmingCharacters(in: .whitespaces)
+    s = s.trimmingCharacters(in: .whitespaces)
+    // A long name is cut before its extension, so the file still opens with the right app.
+    if s.count > 200 {
+        let ext = numbered(s).ext
+        let tail = ext.isEmpty ? "" : "." + ext
+        s = String(s.prefix(200 - tail.count)).trimmingCharacters(in: .whitespaces) + tail
+    }
     return s.isEmpty ? "file" : s
 }
 
+/// A name split for numbering: "shot (3).png" is "shot", 3, "png". Extensions are short and have no spaces.
+func numbered(_ name: String) -> (base: String, n: Int, ext: String) {
+    var ext = (name as NSString).pathExtension
+    if ext.count > 10 { ext = "" }
+    var base = ext.isEmpty ? name : (name as NSString).deletingPathExtension
+    guard let r = base.range(of: #" \([0-9]{1,6}\)$"#, options: .regularExpression), r.lowerBound > base.startIndex,
+          let n = Int(base[r].dropFirst(2).dropLast()) else { return (base, 1, ext) }
+    base.removeSubrange(r)
+    return (base, n, ext)
+}
+
+/// A free name in `dir`. A clash gets " (2)", " (3)" and so on, counting on from a number the name already has
+/// rather than stacking another one on.
 func uniqueURL(in dir: URL, name: String) -> URL {
     var url = dir.appendingPathComponent(name)
-    let base = (name as NSString).deletingPathExtension, ext = (name as NSString).pathExtension
-    var n = 2
+    let (base, start, ext) = numbered(name)
+    var n = max(2, start + 1)
     while FileManager.default.fileExists(atPath: url.path) {
         url = dir.appendingPathComponent(ext.isEmpty ? "\(base) (\(n))" : "\(base) (\(n)).\(ext)")
         n += 1
     }
     return url
+}
+
+/// A file in `dir` with the same name, give or take a " (n)", and the same bytes as `file`.
+func sameFile(as file: String, named name: String, in dir: URL) -> URL? {
+    let key = numbered(name)
+    let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+    for other in names {
+        let k = numbered(other)
+        guard k.base == key.base, k.ext == key.ext else { continue }
+        let url = dir.appendingPathComponent(other)
+        if sameBytes(url.path, file) { return url }
+    }
+    return nil
+}
+
+/// Whether two regular files hold the same bytes, compared a megabyte at a time.
+func sameBytes(_ a: String, _ b: String) -> Bool {
+    let fm = FileManager.default
+    guard let x = try? fm.attributesOfItem(atPath: a), let y = try? fm.attributesOfItem(atPath: b),
+          x[.type] as? FileAttributeType == .typeRegular, y[.type] as? FileAttributeType == .typeRegular,
+          (x[.size] as? NSNumber)?.int64Value == (y[.size] as? NSNumber)?.int64Value,
+          let ha = FileHandle(forReadingAtPath: a), let hb = FileHandle(forReadingAtPath: b) else { return false }
+    defer { try? ha.close(); try? hb.close() }
+    while true {
+        let ca = (try? ha.read(upToCount: 1 << 20)) ?? Data(), cb = (try? hb.read(upToCount: 1 << 20)) ?? Data()
+        if ca != cb { return false }
+        if ca.isEmpty { return true }
+    }
 }
 
 extension Array {

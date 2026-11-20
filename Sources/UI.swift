@@ -17,7 +17,6 @@ final class Model: ObservableObject {
     @Published var filter = "all" { didSet { if filter != oldValue { reload() } } }
     @Published var selection: Int64?
     @Published var previewing = false
-    @Published var showSettings = false
     @Published var prefsTick = 0
     @Published var shown = 0          // bumps on every open: refocuses search and refreshes relative times
     @Published var pulse = false
@@ -49,6 +48,8 @@ final class Model: ObservableObject {
     var hoverChanged: () -> Void = {}
     var prefsChanged: () -> Void = {}
     var bubbleModeChanged: () -> Void = {}
+    var openApp: (AppPage) -> Void = { _ in }
+    var historyChanged: () -> Void = {}
 
     var selected: Clip? { clips.first { $0.id == selection } ?? clips.first }
 
@@ -285,6 +286,7 @@ final class BubbleView: NSView {
     var onDragStart: () -> Void = {}
     var onDragEnd: () -> Void = {}
     var onHover: (Bool) -> Void = { _ in }
+    var onMenu: () -> NSMenu = { NSMenu() }
     private var downAt = NSPoint.zero
     private var startOrigin = NSPoint.zero
     private var moved = false
@@ -325,6 +327,23 @@ final class BubbleView: NSView {
     override func mouseUp(with e: NSEvent) {
         onPress(false)
         moved ? onDragEnd() : onClick()
+    }
+
+    override func rightMouseDown(with e: NSEvent) { NSMenu.popUpContextMenu(onMenu(), with: e, for: self) }
+}
+
+/// A menu item that runs a closure.
+final class MenuAction: NSObject {
+    private let run: () -> Void
+    private init(_ run: @escaping () -> Void) { self.run = run }
+    @objc private func fire() { run() }
+
+    static func item(_ title: String, _ run: @escaping () -> Void) -> NSMenuItem {
+        let target = MenuAction(run)
+        let i = NSMenuItem(title: title, action: #selector(fire), keyEquivalent: "")
+        i.target = target
+        i.representedObject = target   // the item keeps its target alive
+        return i
     }
 }
 
@@ -544,7 +563,7 @@ struct PanelView: View {
 
     var body: some View {
         Group {
-            if model.showSettings { SettingsView(model: model) } else { main }
+            main
         }
         .frame(width: 420, height: 470)
         .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.white.opacity(0.1)))
@@ -629,13 +648,17 @@ struct PanelView: View {
 
     private var footer: some View {
         HStack(spacing: 14) {
-            Button { model.showSettings = true } label: {
+            Button { model.dismiss(); model.openApp(.general) } label: {
                 Image(systemName: "gearshape.fill").font(.system(size: 12)).foregroundStyle(.secondary)
                     .overlay(alignment: .topTrailing) {
                         if case .available = updater.state { Circle().fill(Color.accentColor).frame(width: 6, height: 6).offset(x: 3, y: -2) }
                     }
             }
             .buttonStyle(.plain).help(updateAvailable ? "Settings: an update is available" : "Settings")
+            Button { model.dismiss(); model.openApp(.history) } label: {
+                Image(systemName: "macwindow").font(.system(size: 12)).foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain).help("Open ClipBubble")
             Spacer()
             Key(keys: "↩", label: "Paste")
             Key(keys: "⌥↩", label: "Copy")
@@ -647,624 +670,6 @@ struct PanelView: View {
 
 }
 
-/// Settings, shown in place of the list (⚙ in the footer, Esc to go back).
-struct SettingsView: View {
-    @ObservedObject var model: Model
-    @State private var copyShots = UserDefaults.standard.bool(forKey: "copyScreenshots")
-    @State private var openAtLogin = LoginItem.on
-    @State private var loginNote: String?
-    @State private var promptCopied = false
-    @State private var autoPaste = UserDefaults.standard.object(forKey: "autoPaste") as? Bool ?? true
-    @State private var shotsOK: Bool?
-    @State private var dlOK: Bool?
-    @State private var axOK: Bool?
-    private let ticker = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
-    private var customShots: Bool { _ = model.prefsTick; return !(UserDefaults.standard.string(forKey: "screenshotFolder") ?? "").isEmpty }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Button { model.showSettings = false } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "chevron.left").font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
-                        Text("Settings").font(.system(size: 16, weight: .semibold))
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                Spacer()
-                Text("esc").font(.system(size: 10, weight: .medium, design: .rounded)).foregroundStyle(.tertiary)
-            }
-            .padding(.horizontal, 16).frame(height: 50)
-            Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1)
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    section("Bubble") {
-                        toggleRow("eye.slash", "Hide bubble until needed", "Shows up when you copy something or press \(model.bubbleShortcut.label).",
-                                  isOn: $model.hideBubble)
-                        if model.hideBubble {
-                            row("keyboard", "Show or hide bubble", model.shortcutNote) { ShortcutBox(model: model) }
-                        }
-                    }
-                    section("Save to history") {
-                        ForEach(Prefs.categories.filter { !["screenshots", "downloads"].contains($0.key) }, id: \.key) { c in
-                            toggleRow(c.icon, c.title, c.detail, isOn: Binding(
-                                get: { _ = model.prefsTick; return Prefs.on(c.key) },
-                                set: { model.setPref(c.key, $0) }))
-                        }
-                        Text("Turning one off stops saving it and hides what's already there, for your agents too.")
-                            .font(.system(size: 10.5)).foregroundStyle(.tertiary).padding(.top, 2)
-                    }
-                    section("Folders & permissions") {
-                        permRow("camera.viewfinder", "Screenshots", folder: FolderWatcher.screenshotFolder,
-                                note: customShots ? "Folder you picked" : "From your macOS screenshot setting",
-                                ok: shotsOK, isOn: pref("screenshots"), fix: openFilesSettings) {
-                            HStack(spacing: 12) {
-                                Button("Change folder…", action: pickShotsFolder)
-                                if customShots { Button("Use macOS setting") { UserDefaults.standard.removeObject(forKey: "screenshotFolder"); model.setPref("screenshots", true) } }
-                            }
-                            .buttonStyle(.link).font(.system(size: 11))
-                            Toggle("Also copy new ones to the clipboard", isOn: $copyShots)
-                                .toggleStyle(.checkbox).font(.system(size: 11)).foregroundStyle(.secondary)
-                        }
-                        permRow("arrow.down.circle", "Recent downloads", folder: FolderWatcher.downloadsFolder, note: nil,
-                                ok: dlOK, isOn: pref("downloads"), fix: openFilesSettings) { EmptyView() }
-                        permRow("keyboard", "Auto-paste", folder: nil, note: autoPasteNote,
-                                ok: autoPaste ? axOK : nil, isOn: $autoPaste, fix: openAccessibilitySettings) { EmptyView() }
-                        Text("macOS doesn't let apps change these themselves. Switching one on asks for access; if it was blocked, Fix opens the right page in System Settings.")
-                            .font(.system(size: 10.5)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true).padding(.top, 2)
-                    }
-                    section("Sync over SSH") {
-                        SyncSettings(model: model)
-                    }
-                    section("Mascot") {
-                        LazyVGrid(columns: Array(repeating: GridItem(.fixed(44), spacing: 8), count: 7), alignment: .leading, spacing: 8) {
-                            ForEach(model.mascots) { m in
-                                ZStack {
-                                    Circle().fill(Color(white: 0.09))
-                                    MascotView(mascot: m, hover: false, pressed: false, happy: false, hoverTicks: 0, happyTicks: 0)
-                                        .scaleEffect(0.8)
-                                }
-                                .frame(width: 42, height: 42)
-                                .overlay(Circle().strokeBorder(m.id == model.mascot.id ? Color.accentColor : Color.white.opacity(0.1),
-                                                               lineWidth: m.id == model.mascot.id ? 2 : 1))
-                                .contentShape(Circle())
-                                .onTapGesture { Mascots.setActive(m.id); model.loadMascots() }
-                                .help(m.name)
-                            }
-                            Button(action: addMascot) {
-                                Image(systemName: "plus").font(.system(size: 14, weight: .semibold)).foregroundStyle(.secondary)
-                                    .frame(width: 42, height: 42)
-                                    .overlay(Circle().strokeBorder(Color.white.opacity(0.18), style: StrokeStyle(lineWidth: 1, dash: [3, 3])))
-                                    .contentShape(Circle())
-                            }
-                            .buttonStyle(.plain).help("Add your own (PNG, GIF, SVG)")
-                        }
-                    }
-                    section("AI agents (MCP)") {
-                        Text("Let Claude Code, Codex, Cursor and other agents search your history, see your screenshots, put things on your clipboard and design mascots.")
-                            .font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                            .padding(.bottom, 6)
-                        Button {
-                            Board.writeText(MCP.setupPrompt(binary: Bundle.main.executablePath ?? ""), transient: true)
-                            promptCopied = true
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { promptCopied = false }
-                        } label: {
-                            Label(promptCopied ? "Copied! Paste it into your agent" : "Copy setup prompt",
-                                  systemImage: promptCopied ? "checkmark" : "doc.on.doc")
-                        }
-                        .controlSize(.small)
-                        Text("Paste it into your agent and it connects itself.")
-                            .font(.system(size: 10.5)).foregroundStyle(.tertiary).padding(.top, 4)
-                    }
-                    general
-                }
-                .padding(16)
-            }
-            .scrollIndicators(.never)
-        }
-        .onAppear(perform: refresh)
-        .onReceive(ticker) { _ in refresh() }   // picks up changes made in System Settings
-        .onChange(of: model.prefsTick) { refresh() }
-        .onChange(of: autoPaste) { _, on in
-            UserDefaults.standard.set(on, forKey: "autoPaste")
-            if on && !AXIsProcessTrusted() {
-                AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
-            }
-            refresh()
-        }
-        .onChange(of: copyShots) { _, on in UserDefaults.standard.set(on, forKey: "copyScreenshots") }
-        .onChange(of: openAtLogin) { _, on in
-            // Says what macOS really did: it can refuse, or wait for approval in System Settings.
-            loginNote = LoginItem.set(on)
-        }
-    }
-
-    /// macOS keeps a grant for each signature: an entry left by an older copy stays switched on but no longer counts.
-    private var autoPasteNote: String {
-        let what = "↩ pastes into the app you were in. Needs Accessibility access."
-        guard autoPaste, axOK == false else { return what }
-        return what + " If ClipBubble is already switched on there, that's an older copy: select it, remove it with −, then switch Auto-paste off and on here."
-    }
-
-    private var general: some View {
-        section("General") {
-            UpdateRow(updater: Updater.shared)
-            toggleRow("power", "Open at login", loginNote, isOn: $openAtLogin)
-            HStack {
-                Button("Clear all history…", action: clearAll)
-                Spacer()
-                Button("Quit ClipBubble") { NSApp.terminate(nil) }
-            }
-            .controlSize(.small).padding(.top, 6)
-        }
-    }
-
-    private func pref(_ key: String) -> Binding<Bool> {
-        Binding(get: { _ = model.prefsTick; return Prefs.on(key) }, set: { model.setPref(key, $0) })
-    }
-
-    private func refresh() {
-        shotsOK = Prefs.on("screenshots") ? FolderWatcher.canRead(FolderWatcher.screenshotFolder) : nil
-        dlOK = Prefs.on("downloads") ? FolderWatcher.canRead(FolderWatcher.downloadsFolder) : nil
-        axOK = AXIsProcessTrusted()
-    }
-
-    private func openFilesSettings() {
-        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders")!)
-    }
-
-    private func openAccessibilitySettings() {
-        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-    }
-
-    private func pickShotsFolder() {
-        model.dismiss()
-        NSApp.activate(ignoringOtherApps: true)
-        let open = NSOpenPanel()
-        open.canChooseDirectories = true
-        open.canChooseFiles = false
-        open.directoryURL = FolderWatcher.screenshotFolder
-        open.message = "Pick the folder ClipBubble should watch for screenshots."
-        guard open.runModal() == .OK, let url = open.url else { return }
-        UserDefaults.standard.set(url.path, forKey: "screenshotFolder")
-        model.setPref("screenshots", true)
-    }
-
-    /// A feature that needs a folder or permission: switch, where it looks, and whether macOS lets it.
-    private func permRow<X: View>(_ icon: String, _ title: String, folder: URL?, note: String?, ok: Bool?,
-                                  isOn: Binding<Bool>, fix: @escaping () -> Void, @ViewBuilder extra: () -> X) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: icon).font(.system(size: 13)).foregroundStyle(.secondary).frame(width: 20).padding(.top, 1)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(.system(size: 13, weight: .medium))
-                if let folder {
-                    Text((folder.path as NSString).abbreviatingWithTildeInPath)
-                        .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
-                        .lineLimit(1).truncationMode(.middle)
-                }
-                if let note { Text(note).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
-                HStack(spacing: 6) {
-                    switch ok {
-                    case .some(true):
-                        Label("Allowed", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                    case .some(false):
-                        Label("No access", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                        Button("Fix", action: fix).buttonStyle(.link)
-                    case .none:
-                        Label("Off", systemImage: "minus.circle").foregroundStyle(.tertiary)
-                    }
-                }
-                .font(.system(size: 11, weight: .medium)).labelStyle(.titleAndIcon)
-                extra()
-            }
-            Spacer(minLength: 8)
-            Toggle("", isOn: isOn).toggleStyle(.switch).controlSize(.mini).labelsHidden()
-        }
-        .padding(.vertical, 6)
-    }
-
-    private func section<C: View>(_ title: String, @ViewBuilder _ content: () -> C) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title.uppercased()).font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(.tertiary)
-                .padding(.bottom, 4)
-            content()
-        }
-    }
-
-    private func toggleRow(_ icon: String, _ title: String, _ detail: String?, isOn: Binding<Bool>) -> some View {
-        row(icon, title, detail) {
-            Toggle("", isOn: isOn).toggleStyle(.switch).controlSize(.mini).labelsHidden()
-        }
-    }
-
-    private func row<T: View>(_ icon: String, _ title: String, _ detail: String?, @ViewBuilder trailing: () -> T) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: icon).font(.system(size: 13)).foregroundStyle(.secondary).frame(width: 20)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title).font(.system(size: 13, weight: .medium))
-                if let detail { Text(detail).font(.system(size: 11)).foregroundStyle(.secondary) }
-            }
-            Spacer(minLength: 8)
-            trailing()
-        }
-        .padding(.vertical, 5)
-    }
-
-    /// Picks an image or GIF and makes it the mascot.
-    private func addMascot() {
-        model.dismiss()
-        NSApp.activate(ignoringOtherApps: true)
-        let open = NSOpenPanel()
-        open.allowedContentTypes = [.png, .gif, .jpeg, .svg, .heic, .webP]
-        open.message = "Pick an image or GIF for your mascot. Square with a transparent background looks best."
-        guard open.runModal() == .OK, let url = open.url else { return }
-        do {
-            let m = try Mascots.add(name: url.deletingPathExtension().lastPathComponent, kind: "image", states: ["idle": url.path])
-            Mascots.setActive(m.id)
-            model.loadMascots()
-        } catch {
-            NSAlert(error: error).runModal()
-        }
-    }
-
-    private func clearAll() {
-        let alert = NSAlert()
-        alert.messageText = "Clear all clipboard history?"
-        alert.informativeText = "This removes every saved item and image, here and on your linked devices. It can't be undone."
-        alert.addButton(withTitle: "Clear")
-        alert.addButton(withTitle: "Cancel")
-        if alert.runModal() == .alertFirstButtonReturn { model.db.deleteAll(); model.reload(); model.reloadRecent() }
-    }
-}
-
-/// Settings → Sync over SSH: computers linked with Add a computer, then one switch per host in ~/.ssh/config, each with
-/// its live status and the one action that fixes what's wrong.
-struct SyncSettings: View {
-    @ObservedObject var model: Model
-    @State private var configHosts: [String] = []
-    @State private var peers: [Peer] = Peers.all
-    @State private var enabled = Set(SyncEngine.enabledHosts)
-    @State private var setup: [String: String] = [:]   // progress or result text per host
-    @State private var installing: Set<String> = []
-    @State private var adding = false
-    @State private var relink: Peer?
-    @State private var checking: String?
-
-    private var hosts: [String] { peers.map(\.alias) + configHosts.filter { h in !peers.contains { $0.alias == h } } }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("Copy on one machine, paste on another. Works with ClipBubble on your other Macs, Linux and Windows machines, and your iPhone.")
-                .font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).padding(.bottom, 6)
-            PhonePairing()
-            HStack(spacing: 10) {
-                Image(systemName: "desktopcomputer").font(.system(size: 13)).foregroundStyle(.secondary).frame(width: 20)
-                Text("Another computer").font(.system(size: 13, weight: .medium))
-                Spacer(minLength: 8)
-                Button(adding ? "Cancel" : "Add a computer…") { relink = nil; adding.toggle() }.controlSize(.small)
-            }
-            .padding(.vertical, 5)
-            if adding {
-                AddComputer(relinking: relink, taken: configHosts) { peer, start in
-                    adding = false
-                    relink = nil
-                    peers = Peers.all
-                    if start { enabled.insert(peer.alias); SyncEngine.shared.setHost(peer.alias, on: true) }
-                    SyncEngine.shared.redial(peer.alias)
-                }
-                .padding(.leading, 30).padding(.bottom, 6)
-            }
-            ForEach(hosts, id: \.self) { host in hostRow(host) }
-            if hosts.isEmpty {
-                Text("Computers you add show up here, along with any hosts in ~/.ssh/config.")
-                    .font(.system(size: 11)).foregroundStyle(.tertiary)
-            }
-            if !enabled.isEmpty {
-                HStack(spacing: 10) {
-                    Image(systemName: "pause.circle").font(.system(size: 13)).foregroundStyle(.secondary).frame(width: 20)
-                    Text("Pause sync").font(.system(size: 13, weight: .medium))
-                    Spacer()
-                    Toggle("", isOn: Binding(get: { model.syncPaused }, set: { model.syncPaused = $0; SyncEngine.shared.setPaused($0) }))
-                        .toggleStyle(.switch).controlSize(.mini).labelsHidden()
-                }
-                .padding(.vertical, 5)
-            }
-            Text("This Mac shows up as \(SyncEngine.shared.name). Files up to 25 MB move on their own. Password-manager copies never leave this Mac.")
-                .font(.system(size: 10.5)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true).padding(.top, 2)
-            if let id = HostIdentity.mine {
-                Text("This Mac's identity: \(id)").font(.system(size: 10.5, design: .monospaced)).foregroundStyle(.tertiary)
-                    .textSelection(.enabled).padding(.top, 2)
-            }
-        }
-        .onAppear { configHosts = SSHConfig.hosts(); peers = Peers.all }
-    }
-
-    private func hostRow(_ host: String) -> some View {
-        let peer = peers.first { $0.alias == host }
-        return VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 10) {
-                Image(systemName: peer == nil ? "server.rack" : "desktopcomputer").font(.system(size: 13)).foregroundStyle(.secondary).frame(width: 20)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(peer?.name ?? host).font(.system(size: 13, weight: .medium))
-                    if enabled.contains(host) {
-                        TimelineView(.periodic(from: .now, by: 1)) { _ in
-                            let state = model.syncPaused ? nil : model.links[host]
-                            HStack(alignment: .firstTextBaseline, spacing: 5) {
-                                Circle().fill(state?.ok == true ? Color.green : state == nil ? Color.gray : Color.orange)
-                                    .frame(width: 6, height: 6)
-                                Text(model.syncPaused ? "Paused" : state?.text ?? "Connecting…").fixedSize(horizontal: false, vertical: true)
-                            }
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                        }
-                    } else if let peer {
-                        Text("Off. Connects as \(peer.user)@\(peer.host)").font(.system(size: 11)).foregroundStyle(.tertiary)
-                    }
-                    if let note = setup[host] {
-                        Text(note).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                Spacer(minLength: 8)
-                if enabled.contains(host), !model.syncPaused { action(host, peer: peer, state: model.links[host]) }
-                Toggle("", isOn: Binding(get: { enabled.contains(host) }, set: { on in
-                    if on { enabled.insert(host) } else { enabled.remove(host) }
-                    SyncEngine.shared.setHost(host, on: on)
-                }))
-                .toggleStyle(.switch).controlSize(.mini).labelsHidden()
-            }
-            if checking == host {
-                IdentityCheck(alias: host, peer: peer) { trusted in
-                    checking = nil
-                    peers = Peers.all
-                    if trusted { SyncEngine.shared.redial(host) }
-                }
-                .padding(.leading, 30)
-            }
-        }
-        .padding(.vertical, 5)
-        .contextMenu {
-            if let peer {
-                Button("Link again…") { relink = peer; adding = true }
-                Button("Remove \(peer.name)") {
-                    SyncEngine.shared.setHost(peer.alias, on: false)
-                    enabled.remove(peer.alias)
-                    Peers.remove(peer.alias)
-                    peers = Peers.all
-                }
-            }
-        }
-    }
-
-    /// The one button that fixes what's wrong, if there's something to press.
-    @ViewBuilder private func action(_ host: String, peer: Peer?, state: LinkState?) -> some View {
-        switch state {
-        case .notInstalled?:
-            Button("Set up") { install(host) }.controlSize(.small).disabled(installing.contains(host))
-        case .versionMismatch(let h)? where h.os == "linux":
-            Button("Update") { install(host) }.controlSize(.small).disabled(installing.contains(host))
-        case .live(let h)? where RemoteSetup.isOutdated(h):
-            Button("Update") { install(host) }.controlSize(.small).disabled(installing.contains(host))
-        case .unknownHost?:
-            Button("Check identity…") { checking = host }.controlSize(.small)
-        case .hostKeyChanged?, .needsKeyAuth?:
-            if let peer { Button("Link again…") { relink = peer; adding = true }.controlSize(.small) }
-            else { Button("Try again") { SyncEngine.shared.redial(host) }.controlSize(.small) }
-        case .unresolved?, .refused?, .appNotRunning?:
-            Button("Try again") { SyncEngine.shared.redial(host) }.controlSize(.small)
-        default:
-            EmptyView()
-        }
-    }
-
-    private func install(_ host: String) {
-        installing.insert(host)
-        RemoteSetup.run(host, progress: { setup[host] = $0 }, done: { r in
-            installing.remove(host)
-            setup[host] = r.text
-            if case .otherOS = r { NSWorkspace.shared.open(RemoteSetup.releases) }
-            SyncEngine.shared.redial(host)
-        })
-    }
-}
-
-/// Add a computer: type the address and code the other computer shows, check who answered, then choose to sync.
-struct AddComputer: View {
-    /// Linking a computer again keeps its name in ClipBubble, and replaces its key only because you asked.
-    let relinking: Peer?
-    let taken: [String]
-    let done: (Peer, Bool) -> Void
-    @State private var address = ""
-    @State private var code = ""
-    @State private var busy = false
-    @State private var error: String?
-    @State private var found: Peer?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if let found {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Ready to link with \(found.name)").font(.system(size: 12, weight: .semibold))
-                    detail("Connects as \(found.summary).")
-                    if let id = fingerprint(found.hostKey) {
-                        detail("Its identity is \(id). It should match the one in ClipBubble's settings on \(found.name).")
-                    } else {
-                        detail("It didn't send its identity, so you'll be asked to check it the first time it connects.")
-                    }
-                    detail("That key can only run ClipBubble there: no shell, no files, no forwarding.")
-                    detail("Syncing shares what you copy, plus screenshots and downloads if they're on above. Nothing syncs until you start it.")
-                }
-                HStack {
-                    Button("Start syncing") { finish(found, start: true) }.keyboardShortcut(.defaultAction)
-                    Button("Not now") { finish(found, start: false) }
-                }
-                .controlSize(.small)
-            } else {
-                detail(relinking.map { "On \($0.name), open ClipBubble → Settings → Sync over SSH → Link iPhone…, then enter what it shows." }
-                       ?? "On the other computer, open ClipBubble → Settings → Sync over SSH → Link iPhone…, then enter what it shows. On Linux without a desktop, run clipbubble --pair there.")
-                HStack(spacing: 6) {
-                    TextField("Address, like rohits-mac.local", text: $address).frame(minWidth: 170)
-                    TextField("Code", text: $code).frame(width: 96)
-                    Button(busy ? "Linking…" : "Link") { link() }
-                        .disabled(busy || LinkClient.target(address: address, code: code) == nil)
-                }
-                .textFieldStyle(.roundedBorder).controlSize(.small)
-                if let error { Text(error).font(.system(size: 11)).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true) }
-                detail("This uses ClipBubble's own key, \(Peers.keyDisplay), and leaves ~/.ssh/config alone. Only the public half is sent.")
-            }
-        }
-        .onAppear { if let relinking { address = relinking.host } }
-    }
-
-    private func detail(_ s: String) -> some View {
-        Text(s).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-    }
-
-    private func link() {
-        busy = true
-        error = nil
-        Task { @MainActor in
-            do {
-                let (host, a) = try await LinkClient.link(address: address, code: code)
-                let alias = relinking?.alias ?? Peers.freeAlias(for: a.name, taken: taken)
-                found = Peer(alias: alias, name: a.name, user: a.user, host: host, hostKey: a.hostKey)
-            } catch {
-                self.error = error.localizedDescription
-            }
-            busy = false
-        }
-    }
-
-    private func finish(_ p: Peer, start: Bool) {
-        Peers.save(p)
-        SyncLog.write("linked \(p.alias) as \(p.user)@\(p.host)")
-        done(p, start)
-    }
-}
-
-/// Unknown host: shows the identity its SSH server presents, to compare with what that computer shows, before trusting it.
-struct IdentityCheck: View {
-    let alias: String
-    let peer: Peer?
-    let done: (Bool) -> Void
-    @State private var scanned: (entry: String, key: String)?
-    @State private var failed = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if let scanned, let id = fingerprint(scanned.key) {
-                Text("It says its identity is").font(.system(size: 11)).foregroundStyle(.secondary)
-                Text(id).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
-                Text("On that computer, ClipBubble shows its identity under Settings → Sync over SSH. Trust it only if they match.")
-                    .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                HStack {
-                    Button("They match, trust it") { trust(scanned) }
-                    Button("Cancel") { done(false) }
-                }
-                .controlSize(.small)
-            } else if failed {
-                Text("Couldn't ask it for its identity. Check that it's on and reachable, then try again.")
-                    .font(.system(size: 11)).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
-                Button("Close") { done(false) }.controlSize(.small)
-            } else {
-                ProgressView().controlSize(.small)
-            }
-        }
-        .task {
-            let result = await Task.detached { [alias, peer] in
-                peer.map { HostIdentity.scan(host: $0.host) } ?? HostIdentity.scan(alias)
-            }.value
-            if let result { scanned = result } else { failed = true }
-        }
-    }
-
-    private func trust(_ s: (entry: String, key: String)) {
-        if var p = peer {
-            p.hostKey = s.key
-            Peers.save(p)
-        } else {
-            do { try HostIdentity.trust(s.entry) } catch { failed = true; scanned = nil; return }
-        }
-        done(true)
-    }
-}
-
-/// Settings → Sync over SSH → iPhone: shows a QR code for the ClipBubble iPhone app to scan, and the address and code
-/// another computer types into Add a computer.
-struct PhonePairing: View {
-    @State private var server: PairingServer?
-    @State private var qr: NSImage?
-    @State private var note: String?
-    @State private var phones: [(name: String, key: String)] = []
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 10) {
-                Image(systemName: "iphone").font(.system(size: 13)).foregroundStyle(.secondary).frame(width: 20)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("iPhone").font(.system(size: 13, weight: .medium))
-                    if let note { Text(note).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
-                }
-                Spacer(minLength: 8)
-                Button(server == nil ? "Link iPhone…" : "Done") { server == nil ? start() : stop() }.controlSize(.small)
-            }
-            if let qr, let server {
-                Image(nsImage: qr).interpolation(.none).resizable().frame(width: 150, height: 150)
-                    .padding(8).background(Color.white, in: RoundedRectangle(cornerRadius: 8)).padding(.leading, 30)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Linking another computer instead? In its Add a computer…, enter")
-                    HStack(spacing: 14) {
-                        Text(server.typedAddress).font(.system(size: 12, weight: .semibold, design: .monospaced)).textSelection(.enabled)
-                        Text(LinkCode.display(server.shortCode)).font(.system(size: 12, weight: .semibold, design: .monospaced)).textSelection(.enabled)
-                    }
-                }
-                .font(.system(size: 11)).foregroundStyle(.secondary).padding(.leading, 30)
-            }
-            ForEach(phones, id: \.key) { p in
-                HStack {
-                    Text(p.name).font(.system(size: 12)).foregroundStyle(.secondary).padding(.leading, 30)
-                    Spacer(minLength: 8)
-                    Button("Unlink") { unlink(p.key) }.controlSize(.small)
-                }
-            }
-        }
-        .padding(.vertical, 5)
-        .onAppear { phones = AuthorizedKeys.phones() }
-        .onDisappear(perform: stop)
-    }
-
-    private func unlink(_ key: String) {
-        do {
-            try AuthorizedKeys.remove(key: key)
-            SyncEngine.shared.dropPhones()
-            phones = AuthorizedKeys.phones()
-        } catch {
-            note = "Couldn't unlink it: \(error.localizedDescription)"
-        }
-    }
-
-    private func start() {
-        guard PairingServer.remoteLoginOn() else {
-            note = "Turn on Remote Login first, in System Settings → General → Sharing."
-            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Sharing-Settings.extension")!)
-            return
-        }
-        let s = PairingServer()
-        s.onReady = { qr = PairingServer.qr($0); note = "Scan with the iPhone's Camera, or in ClipBubble on the iPhone. Same Wi-Fi as this Mac." }
-        s.onPaired = { name in qr = nil; server = nil; phones = AuthorizedKeys.phones(); note = "Linked \(name). It syncs whenever ClipBubble is open there." }
-        s.onGaveUp = { qr = nil; server = nil; note = "Too many wrong codes, so linking stopped. Press Link iPhone… for a new code." }
-        server = s
-        s.start()
-    }
-
-    private func stop() {
-        server?.stop()
-        server = nil
-        qr = nil
-    }
-}
-
-/// Click, then press the new shortcut. Esc cancels.
 struct ShortcutBox: View {
     @ObservedObject var model: Model
 
@@ -1360,6 +765,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: FloatingPanel!
     private var peek: FloatingPanel!
     private var peekHost: NSView!
+    private(set) var appWindow: AppWindow!
+    private var localClickMonitor: Any?
     private var capture: Capture!
     private var screenshots: FolderWatcher?
     private var downloads: FolderWatcher?
@@ -1383,6 +790,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         setUpWindows()
         startServices()
+        // The first time, show the window so ClipBubble's settings are easy to find.
+        if !UserDefaults.standard.bool(forKey: "shownAppWindow") {
+            UserDefaults.standard.set(true, forKey: "shownAppWindow")
+            appWindow.show(.general)
+        }
     }
 
     /// The bubble, panel and peek. Tests stop here, so they start no capture, sync or global shortcuts, and pass
@@ -1392,7 +804,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.db.prune()
         model.reload()
         model.reloadRecent()
-        installEditMenu()
+        MainMenu.install(full: false)
+        appWindow = AppWindow(model: model)
+        MainMenu.openPage = { [weak self] in self?.appWindow.show($0) }
 
         bubble = FloatingPanel(size: NSSize(width: 64, height: 64), keyable: false)
         let view = BubbleView(frame: NSRect(x: 0, y: 0, width: 64, height: 64))
@@ -1431,6 +845,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.dismiss = { [weak self] in self?.hidePanel() }
         model.hoverChanged = { [weak self] in self?.updatePeek() }
         model.bubbleModeChanged = { [weak self] in self?.bubbleModeChanged() }
+        model.openApp = { [weak self] in self?.appWindow.show($0) }
+        model.historyChanged = { [weak self] in self?.appWindow.historyChanged() }
+        view.onMenu = { [weak self] in self?.bubbleMenu() ?? NSMenu() }
     }
 
     @MainActor private func startServices() {
@@ -1551,21 +968,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return container
     }
 
-    /// No main menu otherwise, and ⌘C/⌘V/⌘A in the search field need one.
-    private func installEditMenu() {
-        let edit = NSMenu(title: "Edit")
-        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
-        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
-        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
-        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
-        let item = NSMenuItem()
-        item.submenu = edit
-        let main = NSMenu()
-        main.addItem(item)
-        NSApp.mainMenu = main
-    }
-
     // MARK: Picking
 
     /// Puts the clip on the clipboard and, unless copying only, pastes it into the app underneath.
@@ -1610,12 +1012,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleKey(_ e: NSEvent) -> NSEvent? {
+        // Settings records a new shortcut in the ClipBubble window.
+        if model.recordingShortcut, e.window != nil, e.window === appWindow.window { recordShortcut(e); return nil }
         guard panel.isKeyWindow else { return e }
         if model.recordingShortcut { recordShortcut(e); return nil }
-        if model.showSettings {
-            if Int(e.keyCode) == kVK_Escape { model.showSettings = false; return nil }
-            return e
-        }
         let cmd = e.modifierFlags.contains(.command), opt = e.modifierFlags.contains(.option)
         switch Int(e.keyCode) {
         case kVK_DownArrow: model.move(1)
@@ -1678,6 +1078,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// History changed, but there's nothing new to announce.
     private func refreshLists() {
         model.reloadRecent()
+        appWindow.historyChanged()
         if panel.isVisible { model.reload() }
         if peek.isVisible { resizePeek() }
     }
@@ -1785,9 +1186,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func toggle() { panel.isVisible ? hidePanel() : showPanel() }
 
+    /// Opening ClipBubble again, from Finder, Spotlight or the Dock, opens its window. The panel stays on its shortcut.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !panel.isVisible { showPanel() }
+        hidePanel()
+        appWindow.show()
         return false
+    }
+
+    /// Right-clicking the bubble.
+    private func bubbleMenu() -> NSMenu {
+        let m = NSMenu()
+        let items: [(String, AppPage?)] = [("Open ClipBubble", .history), ("Settings…", .general)]
+        for (title, page) in items {
+            let i = MenuAction.item(title) { [weak self] in self?.hidePanel(); self?.appWindow.show(page) }
+            m.addItem(i)
+        }
+        m.addItem(.separator())
+        m.addItem(MenuAction.item("Quit ClipBubble") { NSApp.terminate(nil) })
+        return m
     }
 
     /// Opens the panel anchored to the bubble's corner, growing toward the screen center.
@@ -1797,7 +1213,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.query = ""
         model.filter = "all"
         model.previewing = false
-        model.showSettings = false
         model.reload()
         model.selection = model.clips.first?.id
         model.unseen = 0
@@ -1821,11 +1236,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             self?.hidePanel()
         }
+        // A click in ClipBubble's own window doesn't reach the global monitor.
+        localClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] e in
+            if let self, e.window != nil, e.window !== self.panel, e.window !== self.bubble { self.hidePanel() }
+            return e
+        }
     }
 
     /// Instant, so a paste lands without waiting on an animation.
     private func hidePanel() {
         if let m = clickMonitor { NSEvent.removeMonitor(m); clickMonitor = nil }
+        if let m = localClickMonitor { NSEvent.removeMonitor(m); localClickMonitor = nil }
         // orderOut doesn't count as disappearing to SwiftUI, and recording keeps both shortcuts off.
         if model.recordingShortcut { model.recordingShortcut = false }
         guard panel.isVisible else { return }

@@ -200,7 +200,7 @@ struct UpdateRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 10) {
-                Image(systemName: "arrow.down.circle").font(.system(size: 13)).foregroundStyle(.secondary).frame(width: 20)
+                SettingIcon(symbol: "arrow.down.circle", tint: .blue)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("ClipBubble \(Updater.current)").font(.system(size: 13, weight: .medium))
                     detail
@@ -209,7 +209,7 @@ struct UpdateRow: View {
                 action
             }
             Toggle("Check for updates automatically", isOn: $updater.automatic)
-                .toggleStyle(.checkbox).font(.system(size: 11)).foregroundStyle(.secondary).padding(.leading, 30)
+                .toggleStyle(.checkbox).font(.system(size: 11)).foregroundStyle(.secondary).padding(.leading, 34)
         }
         .padding(.vertical, 5)
     }

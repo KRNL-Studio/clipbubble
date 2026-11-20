@@ -27,6 +27,7 @@
 
 - **A floating bubble with a pet.** It stays translucent in a screen corner until you need it. Drag it anywhere and it magnet-snaps to the nearest corner. When it catches a copy, the mascot hops and a badge counts up. Rather not see it all day? On Mac and Windows, switch on **Hide bubble until needed** in Settings: it stays out of sight until you copy something or press <kbd>⌃⌥B</kbd>, and leaves again after a few idle seconds.
 - **Remembers 7 days of everything.** Text, images, files, **every screenshot** (even the ones you never copied), **recent downloads**, and copies from your iPhone through Universal Clipboard.
+- **Polish a screenshot before you share it (Mac).** When you take one, a card slides out by the bubble: click **Polish** and it opens in an editor that gives it a background, padding, rounded corners, a shadow and a window frame, sized for X or LinkedIn if you like. Mark it up with arrows (drag the middle to curve them), boxes, text, numbered steps, a spotlight and a pixel ruler. **Hide sensitive info** reads the text on your Mac and covers emails, phone and card numbers, IP addresses and API keys, and redactions replace the pixels in the export rather than sitting on top. Then copy, drag, share or save it. Open any image in history the same way with <kbd>⌘E</kbd> or the ✨ button.
 - **A real window when you want one.** Open ClipBubble again from Finder or Spotlight, click ⚙ in the panel, or right-click the bubble. It shows your whole history as cards you can search, filter, copy, open or send, and every setting, with ClipBubble in the Dock only while it's open.
 - **You choose what shows up.** Settings → **Capture** has a switch for each kind. Off means it isn't saved and is hidden everywhere, your agents included.
 - **Paste without hunting.** Press <kbd>⌃⌥V</kbd> anywhere, type to search, and press <kbd>↩</kbd>: it pastes straight into the app you were in. Or drag any item out into Slack, Figma or a browser upload.
@@ -133,8 +134,11 @@ Settings → Sync over SSH lists the hosts in your `~/.ssh/config`, with a switc
 | <kbd>⌘1</kbd>–<kbd>⌘9</kbd> | Paste one of the first nine items |
 | <kbd>⌘Y</kbd> | Full-size preview |
 | <kbd>⌘⌫</kbd> | Delete from history |
+| <kbd>⌘E</kbd> | Polish the selected image or screenshot (Mac) |
 | <kbd>Tab</kbd> | Next filter (All, Text, Images, Files, Screenshots, Downloads, iPhone) |
 | <kbd>Esc</kbd> | Close the preview, clear the search, or close the panel |
+
+In the Polish editor: <kbd>V</kbd> select, <kbd>C</kbd> crop, <kbd>A</kbd> arrow, <kbd>L</kbd> line, <kbd>R</kbd> box, <kbd>O</kbd> ellipse, <kbd>P</kbd> pen, <kbd>T</kbd> text, <kbd>N</kbd> numbered step, <kbd>M</kbd> measure, <kbd>H</kbd> spotlight, <kbd>B</kbd> redact. Hold <kbd>⇧</kbd> for straight lines and squares. <kbd>⌘C</kbd> copies, <kbd>↩</kbd> copies and closes, <kbd>⌘S</kbd> saves a copy, <kbd>⇧⌘R</kbd> hides sensitive info, <kbd>⇧⌘C</kbd> copies the text in the image, <kbd>⌘Z</kbd> undoes, and pinch or <kbd>⌘+</kbd>/<kbd>⌘−</kbd> zoom.
 
 ## Mascots
 

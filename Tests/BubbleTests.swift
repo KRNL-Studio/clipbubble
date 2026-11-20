@@ -330,6 +330,18 @@ private func screenshotTests(_ r: Rig) {
 
     let both = take("both on.png")
     check(both == (1, 1, true), "with both on, capture announces it, once, got \(both)")
+
+    // The Polish card comes out by the bubble's corner for a new screenshot, and stays on the bubble's display.
+    check(r.d.shotCard.isVisible, "a new screenshot offers to polish it")
+    check(until(2) { stage.contains { $0.visible.contains(r.d.shotCard.frame) } }, "on the bubble's display")
+    r.d.shotCard.hide()
+    check(until(2) { !r.d.shotCard.isVisible }, "and the card goes when dismissed")
+    UserDefaults.standard.set(false, forKey: "polishCard")
+    _ = take("no card.png")
+    check(!r.d.shotCard.isVisible, "with the card switched off, there's no card")
+    UserDefaults.standard.set(true, forKey: "polishCard")
+    let polished = take("both on polished.png")
+    check(polished.news == 0 && polished.hops == 0 && !r.d.shotCard.isVisible, "a saved polished copy isn't a new screenshot, got \(polished)")
     check(until { !bubble.isVisible }, "gone again")
     r.model.hideBubble = false
     check(until { bubble.isVisible }, "back for the rest")

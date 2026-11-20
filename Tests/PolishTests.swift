@@ -112,6 +112,11 @@ func polishTests() {
     check(saved.lastPathComponent == "shot polished.png", "saved copies are named after the original: \(saved.lastPathComponent)")
     FileManager.default.createFile(atPath: saved.path, contents: Data())
     check(PolishRenderer.saveURL(for: url).lastPathComponent == "shot polished 2.png", "and never overwrite one")
+    check(PolishRenderer.isPolished(saved) && PolishRenderer.isPolished(PolishRenderer.saveURL(for: url)) && !PolishRenderer.isPolished(url),
+          "saved copies are told apart from screenshots")
+    let internalCopy = PolishRenderer.saveURL(for: Paths.images.appendingPathComponent("3f2a.png"))
+    check(internalCopy.deletingLastPathComponent().standardizedFileURL != Paths.images.standardizedFileURL && internalCopy.lastPathComponent.hasPrefix("Image polished"),
+          "a copied image's polished copy goes somewhere you can find it: \(internalCopy.path)")
 
     // Marks: hit testing, moves and the Shift snaps.
     let line = Mark(.line, [CGPoint(x: 0, y: 0), CGPoint(x: 100, y: 0)])

@@ -658,6 +658,10 @@ struct ScreenshotsPage: View {
     @ObservedObject var model: Model
     @StateObject private var access = Access()
     @State private var copyShots = UserDefaults.standard.bool(forKey: "copyScreenshots")
+    @State private var polishCard = UserDefaults.standard.bool(forKey: "polishCard")
+    @State private var export1x = UserDefaults.standard.bool(forKey: "polish.export1x")
+    @State private var polishFolder = UserDefaults.standard.string(forKey: "polish.folder") ?? ""
+    @State private var startStyle = PolishPreset.all.first { $0.style == PolishPreset.last }?.name ?? ""
     private var customFolder: Bool { _ = model.prefsTick; return !(UserDefaults.standard.string(forKey: "screenshotFolder") ?? "").isEmpty }
 
     var body: some View {
@@ -681,6 +685,31 @@ struct ScreenshotsPage: View {
                 ToggleRow(icon: "doc.on.clipboard", tint: .pink, title: "Also copy new ones to the clipboard",
                           detail: "Ready to paste the moment you take one.", isOn: $copyShots)
             }
+            SettingsCard(title: "Polish", footer: "Polish gives a screenshot a background, a frame and a shadow, and lets you mark it up and hide private details before you share it.") {
+                ToggleRow(icon: "sparkles", tint: .purple, title: "Offer to polish new screenshots",
+                          detail: "A card with Polish and Copy slides out by the bubble for a few seconds.", isOn: $polishCard)
+                RowDivider()
+                SettingRow(icon: "paintpalette", tint: .purple, title: "Starting style",
+                           detail: "The editor remembers the last style you used, starting from this one.") {
+                    Picker("", selection: $startStyle) {
+                        if startStyle.isEmpty { Text("Last used").tag("") }
+                        ForEach(PolishPreset.all) { Text($0.name).tag($0.name) }
+                    }
+                    .labelsHidden().fixedSize()
+                }
+                RowDivider()
+                SettingRow(icon: "folder", tint: .blue, title: "Save polished copies",
+                           detail: polishFolder.isEmpty ? "Next to the original" : (polishFolder as NSString).abbreviatingWithTildeInPath) {
+                    HStack(spacing: 10) {
+                        if !polishFolder.isEmpty { Button("Next to Original") { polishFolder = "" }.buttonStyle(.link) }
+                        Button("Change…", action: pickPolishFolder).controlSize(.small)
+                    }
+                    .font(.system(size: 11))
+                }
+                RowDivider()
+                ToggleRow(icon: "arrow.down.right.and.arrow.up.left", tint: .gray, title: "Export at 1×",
+                          detail: "Half the pixels of a Retina screenshot: smaller files that upload faster, a little softer up close.", isOn: $export1x)
+            }
             if Screencapture.showsThumbnail {
                 SettingsCard(footer: "macOS holds each screenshot for a few seconds while its own thumbnail shows in the corner, so it reaches ClipBubble late. To get it at once, press ⌘⇧5, open Options and untick Show Floating Thumbnail.") {
                     SettingRow(icon: "timer", tint: .yellow, title: "Screenshots arrive a few seconds late") {
@@ -693,10 +722,25 @@ struct ScreenshotsPage: View {
         .onDisappear { access.stop() }
         .onChange(of: model.prefsTick) { access.refresh() }
         .onChange(of: copyShots) { _, on in UserDefaults.standard.set(on, forKey: "copyScreenshots") }
+        .onChange(of: polishCard) { _, on in UserDefaults.standard.set(on, forKey: "polishCard") }
+        .onChange(of: export1x) { _, on in UserDefaults.standard.set(on, forKey: "polish.export1x") }
+        .onChange(of: polishFolder) { _, p in UserDefaults.standard.set(p, forKey: "polish.folder") }
+        .onChange(of: startStyle) { _, name in
+            if let p = PolishPreset.all.first(where: { $0.name == name }) { PolishPreset.last = p.style }
+        }
     }
 
     private func pref(_ key: String) -> Binding<Bool> {
         Binding(get: { _ = model.prefsTick; return Prefs.on(key) }, set: { model.setPref(key, $0) })
+    }
+
+    private func pickPolishFolder() {
+        let open = NSOpenPanel()
+        open.canChooseDirectories = true
+        open.canChooseFiles = false
+        open.canCreateDirectories = true
+        open.message = "Pick where polished copies are saved."
+        Dialogs.open(open) { url in polishFolder = url.path }
     }
 
     private func pickFolder() {

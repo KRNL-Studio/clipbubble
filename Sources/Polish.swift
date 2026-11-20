@@ -330,10 +330,12 @@ enum PolishRenderer {
     }
 
     /// Where a saved copy goes: next to the original unless Settings picked a folder, never over another file.
+    /// A copied image lives in ClipBubble's own data, so its copy goes to the screenshot folder instead.
     static func saveURL(for source: URL) -> URL {
-        let custom = UserDefaults.standard.string(forKey: "polish.folder").map { URL(fileURLWithPath: $0) }
-        let dir = custom ?? source.deletingLastPathComponent()
-        let base = source.deletingPathExtension().lastPathComponent + " polished"
+        let custom = UserDefaults.standard.string(forKey: "polish.folder").flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
+        let inApp = source.deletingLastPathComponent().resolvingSymlinksInPath().path == Paths.images.resolvingSymlinksInPath().path
+        let dir = custom ?? (inApp ? FolderWatcher.screenshotFolder : source.deletingLastPathComponent())
+        let base = (inApp ? "Image" : source.deletingPathExtension().lastPathComponent) + " polished"
         var url = dir.appendingPathComponent(base + ".png")
         var n = 2
         while FileManager.default.fileExists(atPath: url.path) {
@@ -341,6 +343,13 @@ enum PolishRenderer {
             n += 1
         }
         return url
+    }
+}
+
+extension PolishRenderer {
+    /// A copy this editor saved, so the screenshot watcher doesn't treat it as a new screenshot.
+    static func isPolished(_ url: URL) -> Bool {
+        url.deletingPathExtension().lastPathComponent.range(of: #" polished( \d+)?$"#, options: .regularExpression) != nil
     }
 }
 

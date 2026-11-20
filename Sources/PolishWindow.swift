@@ -338,6 +338,14 @@ final class PolishModel: ObservableObject {
     }
 }
 
+extension Clip {
+    /// The image Polish can open: a copied image or an image file, here on this Mac.
+    var polishPath: String? {
+        guard !remote, let p = imagePath, FileManager.default.fileExists(atPath: p) else { return nil }
+        return p
+    }
+}
+
 // MARK: - Window
 
 final class PolishWindow: NSObject, NSWindowDelegate {

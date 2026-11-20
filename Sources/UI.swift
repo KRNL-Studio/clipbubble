@@ -50,6 +50,8 @@ final class Model: ObservableObject {
     var bubbleModeChanged: () -> Void = {}
     var openApp: (AppPage) -> Void = { _ in }
     var historyChanged: () -> Void = {}
+    /// Opens an image in the Polish editor.
+    var polish: (Clip) -> Void = { _ in }
 
     var selected: Clip? { clips.first { $0.id == selection } ?? clips.first }
 
@@ -422,6 +424,8 @@ struct Row: View, Equatable {
                         Image(systemName: "camera.viewfinder").font(.system(size: 9.5))
                     } else if clip.source == "Downloads" {
                         Image(systemName: "arrow.down.circle").font(.system(size: 9.5))
+                    } else if clip.source == "Polished" {
+                        Image(systemName: "sparkles").font(.system(size: 9.5))
                     } else if let icon = appIcon(clip.source) {
                         Image(nsImage: icon).resizable().frame(width: 12, height: 12)
                     }
@@ -442,6 +446,14 @@ struct Row: View, Equatable {
                 }
                 .buttonStyle(.borderless).help("Download it from \(model.devices[clip.origin] ?? "the other device")")
             }
+            if hover, transfer == nil, clip.polishPath != nil {
+                Button { model.polish(clip) } label: {
+                    Image(systemName: "sparkles").font(.system(size: 12, weight: .medium)).frame(width: 24, height: 24)
+                        .background(Circle().fill(Color.white.opacity(0.1)))
+                }
+                .buttonStyle(.plain).help("Polish  ⌘E")
+                .transition(.scale(scale: 0.6).combined(with: .opacity))
+            }
             if index >= 0 && index < 9 {
                 Text("⌘\(index + 1)").font(.system(size: 11, weight: .medium, design: .rounded))
                     .foregroundStyle(selected ? .secondary : .tertiary)
@@ -451,13 +463,14 @@ struct Row: View, Equatable {
         .background(RoundedRectangle(cornerRadius: 9, style: .continuous)
             .fill(Color.white.opacity(selected ? 0.12 : hover ? 0.06 : 0)))
         .contentShape(Rectangle())
-        .onHover { hover = $0 }
+        .onHover { h in withAnimation(.easeOut(duration: 0.12)) { hover = h } }
         .onTapGesture { model.pick(clip, !NSEvent.modifierFlags.contains(.option)) }
         .onDrag { dragItem }
         .contextMenu {
             if !clip.remote {
                 Button("Paste") { model.pick(clip, true) }
                 Button("Copy") { model.pick(clip, false) }
+                if clip.polishPath != nil { Button("Polish…") { model.polish(clip) } }
                 if let p = clip.imagePath ?? clip.paths.first {
                     Button("Open") { NSWorkspace.shared.open(URL(fileURLWithPath: p)) }
                     Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p)]) }
@@ -663,7 +676,7 @@ struct PanelView: View {
             Key(keys: "↩", label: "Paste")
             Key(keys: "⌥↩", label: "Copy")
             Key(keys: "⌘Y", label: "Preview")
-            Key(keys: "⌘⌫", label: "Delete")
+            if model.selected?.polishPath != nil { Key(keys: "⌘E", label: "Polish") } else { Key(keys: "⌘⌫", label: "Delete") }
         }
         .padding(.horizontal, 14).frame(height: 36)
     }
@@ -766,6 +779,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var peek: FloatingPanel!
     private var peekHost: NSView!
     private(set) var appWindow: AppWindow!
+    private(set) var shotCard = ShotCard()
     private var localClickMonitor: Any?
     private var capture: Capture!
     private var screenshots: FolderWatcher?
@@ -800,7 +814,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The bubble, panel and peek. Tests stop here, so they start no capture, sync or global shortcuts, and pass
     /// `keyable: false` so a run can't take the keyboard, or lose its panel to a click you make somewhere else.
     func setUpWindows(keyable: Bool = true) {
-        UserDefaults.standard.register(defaults: ["copyScreenshots": true, "corner": "br"])
+        UserDefaults.standard.register(defaults: ["copyScreenshots": true, "corner": "br", "polishCard": true])
         model.db.prune()
         model.reload()
         model.reloadRecent()
@@ -848,6 +862,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.openApp = { [weak self] in self?.appWindow.show($0) }
         model.historyChanged = { [weak self] in self?.appWindow.historyChanged() }
         view.onMenu = { [weak self] in self?.bubbleMenu() ?? NSMenu() }
+        model.polish = { [weak self] in self?.polish($0) }
+        PolishWindow.onSaved = { [weak self] in self?.polishedSaved($0) }
+        shotCard.onPolish = { [weak self] in self?.polish(file: $0) }
+        shotCard.onCopy = { [weak self] url in
+            guard let self, let c = self.model.db.clip(hash: "f:" + sha(url.path)) else { return }
+            self.pick(c, paste: false)
+        }
+        shotCard.onHidden = { [weak self] in self?.restBubble() }
+    }
+
+    // MARK: Polish
+
+    func polish(_ c: Clip) {
+        guard let p = c.polishPath else { NSSound.beep(); return }
+        polish(file: URL(fileURLWithPath: p))
+    }
+
+    private func polish(file url: URL) {
+        hidePanel()
+        hidePeek()
+        shotCard.hide()
+        if !PolishWindow.open(url) { NSSound.beep() }
+    }
+
+    /// A saved copy joins history as Polished, not as a new screenshot.
+    private func polishedSaved(_ url: URL) {
+        model.db.insertIfMissing(kind: "file", text: url.path, source: "Polished", hash: "f:" + sha(url.path), created: Date())
+        refreshLists()
+    }
+
+    /// The card by the bubble, for a screenshot just taken. Not for backfills, and not over the open panel.
+    private func offerPolish(_ url: URL) {
+        guard UserDefaults.standard.bool(forKey: "polishCard"), isImagePath(url.path), !panel.isVisible else { return }
+        // Hidden until needed, the bubble stays hidden: the card comes out of its corner on its own.
+        if bubble.isVisible { bubble.animator().alphaValue = 1 }
+        hidePeek()
+        shotCard.show(url, beside: bubble.frame, in: bubbleDisplay?.visible ?? NSScreen.main?.visibleFrame ?? .zero)
     }
 
     @MainActor private func startServices() {
@@ -918,12 +969,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func screenshotAdded(_ url: URL, at date: Date) {
+        // A polished copy saved into the screenshot folder is already in history, as Polished.
+        if PolishRenderer.isPolished(url) { return }
         let hash = "f:" + sha(url.path)
         model.db.insertIfMissing(kind: "file", text: url.path, source: "Screenshot", hash: hash, created: date)
         // A copy to the clipboard is announced when capture saves it, unless copied files aren't saved.
         let copy = UserDefaults.standard.bool(forKey: "copyScreenshots")
         if !copy || !Prefs.on("files") { captured() }
         if copy, let c = model.db.clip(hash: hash) { _ = putOnClipboard(c) }
+        offerPolish(url)
     }
 
     /// Watches ~/Downloads only while that's switched on (so the privacy prompt only shows up if you want it).
@@ -1028,6 +1082,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             else { hidePanel() }
         case kVK_Delete where cmd: if let c = model.selected { model.delete(c) }
         case kVK_ANSI_Y where cmd: model.previewing.toggle()
+        case kVK_ANSI_E where cmd: if let c = model.selected { polish(c) }
         default:
             if cmd, let d = Int(e.charactersIgnoringModifiers ?? ""), (1...9).contains(d), d <= model.clips.count {
                 pick(model.clips[d - 1], paste: !opt)
@@ -1118,7 +1173,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Worked out when asked, never stored. A press counts because the rim of the bubble takes clicks but isn't hover.
     private var bubbleNeeded: Bool {
-        panel.isVisible || peek.isVisible || model.bubbleHover || model.pulse || dragging || model.pressed
+        panel.isVisible || peek.isVisible || shotCard.isVisible || model.bubbleHover || model.pulse || dragging || model.pressed
     }
 
     /// Nothing needs the bubble now: dim it and, in Hide bubble until needed, start the countdown.
@@ -1210,6 +1265,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showPanel() {
         showBubble()
         hidePeek()
+        shotCard.hide()
         model.query = ""
         model.filter = "all"
         model.previewing = false
@@ -1258,7 +1314,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updatePeek() {
         peekWork?.cancel()
-        let want = (model.bubbleHover || model.peekHover) && !panel.isVisible && !dragging
+        let want = (model.bubbleHover || model.peekHover) && !panel.isVisible && !shotCard.isVisible && !dragging
         if want && peek.isVisible { return }
         let w = DispatchWorkItem { [weak self] in want ? self?.showPeek() : self?.hidePeek() }
         peekWork = w

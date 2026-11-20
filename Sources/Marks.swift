@@ -32,6 +32,12 @@ struct Mark: Codable, Equatable, Identifiable {
     var redaction: Redaction = .pixelate
     /// Added by auto-redact, so a second run can replace its own marks and keep yours.
     var auto = false
+    private var storedRotation: CGFloat?
+
+    private enum CodingKeys: String, CodingKey {
+        case id, kind, points, color, width, fill, text, size, number, pill, doubleHead, redaction, auto
+        case storedRotation = "rotation"
+    }
 
     init(_ kind: Kind, _ points: [CGPoint]) {
         self.kind = kind
@@ -64,8 +70,34 @@ struct Mark: Codable, Equatable, Identifiable {
         return CGRect(x: a.x, y: a.y, width: ceil(s.width) + pad.width * 2, height: ceil(s.height) + pad.height * 2)
     }
 
-    /// Everything the mark covers, for selection and hit testing.
-    var bounds: CGRect {
+    var canRotate: Bool { kind == .rect || kind == .ellipse || kind == .text }
+
+    /// Clockwise radians in source coordinates. Older marks without an angle are upright.
+    var rotation: CGFloat {
+        get { canRotate ? storedRotation ?? 0 : 0 }
+        set { storedRotation = newValue == 0 ? nil : newValue }
+    }
+
+    var rotationCenter: CGPoint {
+        let r = unrotatedBounds
+        return CGPoint(x: r.midX, y: r.midY)
+    }
+
+    var rotationTransform: CGAffineTransform {
+        rotation == 0 ? .identity : rotationTransform(around: rotationCenter)
+    }
+
+    /// Preserve the source rotation when the canvas snaps each axis to whole pixels.
+    func rotationTransform(around center: CGPoint, aspect: CGFloat = 1) -> CGAffineTransform {
+        guard rotation != 0 else { return .identity }
+        let c = cos(rotation), sx = -sin(rotation) * aspect, sy = sin(rotation) / aspect
+        return CGAffineTransform(a: c, b: sy, c: sx, d: c,
+                                 tx: center.x - c * center.x - sx * center.y,
+                                 ty: center.y - sy * center.x - c * center.y)
+    }
+
+    /// Everything the mark covers before applying its rotation.
+    var unrotatedBounds: CGRect {
         switch kind {
         case .text: return textRect
         case .step: return CGRect(x: a.x - size / 2, y: a.y - size / 2, width: size, height: size)
@@ -81,8 +113,11 @@ struct Mark: Codable, Equatable, Identifiable {
         }
     }
 
+    var bounds: CGRect { unrotatedBounds.applying(rotationTransform) }
+
     /// Whether a click at `p` lands on this mark. `slop` is how far off it can be, in source pixels.
-    func hit(_ p: CGPoint, slop: CGFloat) -> Bool {
+    func hit(_ point: CGPoint, slop: CGFloat) -> Bool {
+        let p = rotation == 0 ? point : point.applying(rotationTransform.inverted())
         let near = max(slop, width)
         switch kind {
         case .line, .measure: return Mark.distance(p, a, b) <= near
@@ -97,11 +132,12 @@ struct Mark: Codable, Equatable, Identifiable {
             // An empty box is only grabbed by its edge, so you can still click what's inside it.
             let r = rect
             return r.insetBy(dx: -near, dy: -near).contains(p) && !r.insetBy(dx: near, dy: near).contains(p)
-        case .ellipse where fill == .stroke:
+        case .ellipse:
             let r = rect, rx = max(r.width / 2, 1), ry = max(r.height / 2, 1)
             let d = hypot((p.x - r.midX) / rx, (p.y - r.midY) / ry)
-            return abs(d - 1) * min(rx, ry) <= near
-        default: return bounds.insetBy(dx: -slop, dy: -slop).contains(p)
+            let distance = (d - 1) * min(rx, ry)
+            return fill == .stroke ? abs(distance) <= near : distance <= slop
+        default: return unrotatedBounds.insetBy(dx: -slop, dy: -slop).contains(p)
         }
     }
 
@@ -205,7 +241,10 @@ enum MarkPainter {
             ctx.fill(L.image)
             ctx.restoreGState()
         }
-        for m in marks where m.kind != .redact && m.kind != .highlight { draw(m, map: map, scale: L.scale, in: ctx) }
+        let aspect = L.pixelAspect(crop: crop)
+        for m in marks where m.kind != .redact && m.kind != .highlight {
+            draw(m, map: map, scale: L.scale, aspect: aspect, in: ctx)
+        }
     }
 
     private static func clipOutside(_ path: CGPath, image: CGRect, in ctx: CGContext) {
@@ -220,10 +259,13 @@ enum MarkPainter {
         return CGRect(x: p.x, y: p.y, width: q.x - p.x, height: q.y - p.y)
     }
 
-    static func draw(_ m: Mark, map: (CGPoint) -> CGPoint, scale s: CGFloat, in ctx: CGContext) {
+    private static func draw(_ m: Mark, map: (CGPoint) -> CGPoint, scale s: CGFloat, aspect: CGFloat, in ctx: CGContext) {
         let w = m.width * s
         ctx.saveGState()
         defer { ctx.restoreGState() }
+        if m.rotation != 0 {
+            ctx.concatenate(m.rotationTransform(around: map(m.rotationCenter), aspect: aspect))
+        }
         ctx.setLineCap(.round)
         ctx.setLineJoin(.round)
         ctx.setStrokeColor(m.color.cg)

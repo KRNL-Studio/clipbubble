@@ -98,6 +98,11 @@ struct Geometry: Equatable {
         return CGRect(x: a.x, y: a.y, width: b.x - a.x, height: b.y - a.y)
     }
 
+    func rotationTransform(for mark: Mark) -> CGAffineTransform {
+        guard mark.rotation != 0 else { return .identity }
+        return mark.rotationTransform(around: view(mark.rotationCenter), aspect: layout.pixelAspect(crop: crop))
+    }
+
     var canvasRect: CGRect { CGRect(origin: origin, size: layout.canvas) }
 
     static func lerp(_ a: Geometry, _ b: Geometry, _ t: CGFloat) -> Geometry {
@@ -152,12 +157,12 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
         }
     }
 
-    private enum Handle: Equatable { case point(Int), box(Int, Int) }
+    private enum Handle: Equatable { case point(Int), box(Int, Int), rotation }
     private enum Drag {
         case none
         case create(Mark, CGPoint)
         case move(UUID, CGPoint)
-        case handle(UUID, Handle, CGRect)
+        case handle(Mark, Handle, CGPoint)
         case pan(CGPoint)
         case cropNew(CGPoint), cropMove(CGPoint), cropHandle(Int, Int, CGRect)
     }
@@ -378,20 +383,29 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
     private func drawSelection(_ m: PolishModel, _ g: Geometry, _ ctx: CGContext) {
         guard let id = m.selection, id != editingID, let mk = m.mark(id) else { return }
         ctx.saveGState()
+        var transform = g.rotationTransform(for: mk)
         if !(mk.isBoxy || mk.isLiney) {
-            let r = g.view(mk.bounds).insetBy(dx: -5, dy: -5)
+            let r = g.view(mk.unrotatedBounds).insetBy(dx: -5, dy: -5)
             ctx.setStrokeColor(accent)
             ctx.setLineWidth(1.5)
             ctx.setLineDash(phase: 0, lengths: [4, 3])
-            ctx.addPath(CGPath(roundedRect: r, cornerWidth: 4, cornerHeight: 4, transform: nil))
+            ctx.addPath(CGPath(roundedRect: r, cornerWidth: 4, cornerHeight: 4, transform: &transform))
             ctx.strokePath()
             ctx.setLineDash(phase: 0, lengths: [])
         } else if mk.isBoxy {
             ctx.setStrokeColor(accent)
             ctx.setLineWidth(1)
-            ctx.stroke(g.view(mk.rect))
+            ctx.addPath(CGPath(rect: g.view(mk.rect), transform: &transform))
+            ctx.strokePath()
         }
-        for (h, p) in handles(mk) { drawHandle(g.view(p), bend: h == .point(2), ctx) }
+        if let arm = rotationArm(mk, g) {
+            ctx.setStrokeColor(accent)
+            ctx.setLineWidth(1)
+            ctx.move(to: g.view(arm.start))
+            ctx.addLine(to: g.view(arm.end))
+            ctx.strokePath()
+        }
+        for (h, p) in handles(mk, g) { drawHandle(g.view(p), bend: h == .point(2), ctx) }
         ctx.restoreGState()
     }
 
@@ -438,8 +452,7 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
             ctx.move(to: CGPoint(x: x, y: y + k * dy)); ctx.addLine(to: CGPoint(x: x, y: y)); ctx.addLine(to: CGPoint(x: x + k * dx, y: y))
         }
         ctx.strokePath()
-        // The size, in real pixels.
-        let label = "\(Int(m.cropDraft.width.rounded())) × \(Int(m.cropDraft.height.rounded()))" as NSString
+        let label = m.cropBadgeText as NSString
         let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold), .foregroundColor: NSColor.white]
         let sz = label.size(withAttributes: attrs)
         var pill = CGRect(x: r.midX - sz.width / 2 - 8, y: r.minY - sz.height - 14, width: sz.width + 16, height: sz.height + 6)
@@ -452,26 +465,34 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
 
     // MARK: Handles
 
-    private func handles(_ mk: Mark) -> [(Handle, CGPoint)] {
+    private func rotationArm(_ mk: Mark, _ g: Geometry) -> (start: CGPoint, end: CGPoint)? {
+        guard mk.canRotate else { return nil }
+        let r = mk.unrotatedBounds, transform = mk.rotationTransform
+        let top = CGPoint(x: r.midX, y: r.minY)
+        let knob = CGPoint(x: top.x, y: top.y - 18 / g.layout.scale)
+        return (top.applying(transform), knob.applying(transform))
+    }
+
+    private func handles(_ mk: Mark, _ g: Geometry) -> [(Handle, CGPoint)] {
+        var out: [(Handle, CGPoint)] = []
+        if let arm = rotationArm(mk, g) { out.append((.rotation, arm.end)) }
         if mk.isBoxy {
-            let r = mk.rect
-            var out: [(Handle, CGPoint)] = []
+            let r = mk.rect, transform = mk.rotationTransform
             for dy in -1...1 { for dx in -1...1 where dx != 0 || dy != 0 {
-                out.append((.box(dx, dy), CGPoint(x: r.midX + CGFloat(dx) * r.width / 2, y: r.midY + CGFloat(dy) * r.height / 2)))
+                let p = CGPoint(x: r.midX + CGFloat(dx) * r.width / 2, y: r.midY + CGFloat(dy) * r.height / 2)
+                out.append((.box(dx, dy), p.applying(transform)))
             } }
-            return out
         }
         if mk.isLiney {
-            var out: [(Handle, CGPoint)] = [(.point(0), mk.a), (.point(1), mk.b)]
+            out += [(.point(0), mk.a), (.point(1), mk.b)]
             if mk.kind == .arrow { out.append((.point(2), mk.bendHandle)) }
-            return out
         }
-        return []
+        return out
     }
 
     private func handle(at v: CGPoint, for mk: Mark, _ g: Geometry) -> Handle? {
         // Endpoints win over the bend handle when they're close together.
-        handles(mk).min { hypot(g.view($0.1).x - v.x, g.view($0.1).y - v.y) < hypot(g.view($1.1).x - v.x, g.view($1.1).y - v.y) }
+        handles(mk, g).min { hypot(g.view($0.1).x - v.x, g.view($0.1).y - v.y) < hypot(g.view($1.1).x - v.x, g.view($1.1).y - v.y) }
             .flatMap { hypot(g.view($0.1).x - v.x, g.view($0.1).y - v.y) <= 8 ? $0.0 : nil }
     }
 
@@ -510,7 +531,7 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
 
         // The selected mark's handles come first, whatever the tool.
         if let id = m.selection, let mk = m.mark(id), let h = handle(at: v, for: mk, g) {
-            drag = .handle(id, h, mk.rect)
+            drag = .handle(mk, h, p)
             return
         }
         let slop = 6 / g.layout.scale
@@ -579,23 +600,39 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
             m.update(id) { $0 = $0.moved(by: CGSize(width: p.x - from.x, height: p.y - from.y)) }
             drag = .move(id, p)
             NSCursor.closedHand.set()
-        case .handle(let id, let h, let rect):
-            record()
-            m.update(id) { mk in
-                switch h {
-                case .box(let dx, let dy):
-                    let r = PolishCanvas.resize(rect, dx, dy, to: p, square: shift)
-                    mk.points = [r.origin, CGPoint(x: r.maxX, y: r.maxY)]
-                case .point(2):
-                    // Dragged back onto the straight line, the bend goes away.
-                    let straight = Mark.distance(p, mk.a, mk.b) < 4 / g.layout.scale
-                    if straight { mk.points = Array(mk.points.prefix(2)) }
-                    else if mk.points.count > 2 { mk.points[2] = p } else { mk.points.append(p) }
-                case .point(let i):
-                    let other = mk.points[1 - i]
-                    mk.points[i] = shift ? Mark.snap45(other, p) : p
-                }
+        case .handle(let original, let h, let start):
+            guard let current = m.mark(original.id) else { return }
+            var mk = current
+            switch h {
+            case .box(let dx, let dy):
+                let transform = original.rotationTransform
+                let local = p.applying(transform.inverted())
+                let r = PolishCanvas.resize(original.rect, dx, dy, to: local, square: shift)
+                // Rotate around the resized centre while keeping the opposite edge in place.
+                let center = CGPoint(x: r.midX, y: r.midY)
+                let moved = center.applying(transform)
+                let result = r.offsetBy(dx: moved.x - center.x, dy: moved.y - center.y)
+                mk.points = [result.origin, CGPoint(x: result.maxX, y: result.maxY)]
+            case .rotation:
+                let center = original.rotationCenter
+                guard p != center else { return }
+                let delta = atan2(p.y - center.y, p.x - center.x) - atan2(start.y - center.y, start.x - center.x)
+                var angle = original.rotation + delta
+                let step = CGFloat.pi / 12
+                if shift { angle = (angle / step).rounded() * step }
+                mk.rotation = atan2(sin(angle), cos(angle))
+            case .point(2):
+                // Dragged back onto the straight line, the bend goes away.
+                let straight = Mark.distance(p, mk.a, mk.b) < 4 / g.layout.scale
+                if straight { mk.points = Array(mk.points.prefix(2)) }
+                else if mk.points.count > 2 { mk.points[2] = p } else { mk.points.append(p) }
+            case .point(let i):
+                let other = mk.points[1 - i]
+                mk.points[i] = shift ? Mark.snap45(other, p) : p
             }
+            guard mk != current else { return }
+            record()
+            m.update(original.id) { $0 = mk }
         case .pan(let from):
             m.pan = CGPoint(x: m.pan.x + v.x - from.x, y: m.pan.y + v.y - from.y)
             drag = .pan(v)
@@ -691,7 +728,7 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
             for mk in m.doc.marks { addCursorRect(g.view(mk.bounds).insetBy(dx: -4, dy: -4), cursor: .openHand) }
         }
         if let id = m.selection, let mk = m.mark(id) {
-            for (_, p) in handles(mk) {
+            for (_, p) in handles(mk, g) {
                 let v = g.view(p)
                 addCursorRect(CGRect(x: v.x - 7, y: v.y - 7, width: 14, height: 14), cursor: .crosshair)
             }
@@ -775,7 +812,11 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
         let pad = mk.pill ? CGSize(width: mk.size * 0.4 * s, height: mk.size * 0.18 * s) : .zero
         let r = g.view(mk.textRect)
         tv.font = Mark.font(mk.size * s)
-        tv.frame = CGRect(x: r.minX + pad.width, y: r.minY + pad.height, width: max(r.width - pad.width * 2, 4) + mk.size * s, height: r.height - pad.height * 2)
+        let transform = g.rotationTransform(for: mk)
+        let origin = CGPoint(x: r.minX + pad.width, y: r.minY + pad.height).applying(transform)
+        tv.frameRotation = 0
+        tv.frame = CGRect(origin: origin, size: CGSize(width: max(r.width - pad.width * 2, 4) + mk.size * s, height: r.height - pad.height * 2))
+        tv.frameRotation = atan2(transform.b, transform.a) * 180 / .pi
     }
 
     func textDidChange(_ n: Notification) {

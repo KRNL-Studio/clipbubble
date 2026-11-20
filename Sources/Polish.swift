@@ -212,6 +212,10 @@ struct PolishLayout: Equatable {
         CGPoint(x: (p.x - image.minX) * crop.width / image.width + crop.minX,
                 y: (p.y - image.minY) * crop.height / image.height + crop.minY)
     }
+
+    func pixelAspect(crop: CGRect) -> CGFloat {
+        (image.width / crop.width) / (image.height / crop.height)
+    }
 }
 
 // MARK: - Rendering

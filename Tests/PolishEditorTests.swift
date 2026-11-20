@@ -18,9 +18,9 @@ private func editorKey(_ key: String, _ code: Int, in window: EditorWindow, mods
     if !mods.contains(.command) || !window.performKeyEquivalent(with: event) { window.sendEvent(event) }
 }
 
-private func editorMouse(_ type: NSEvent.EventType, _ p: CGPoint, on canvas: PolishCanvas, clicks: Int = 1) {
+private func editorMouse(_ type: NSEvent.EventType, _ p: CGPoint, on canvas: PolishCanvas, clicks: Int = 1, mods: NSEvent.ModifierFlags = []) {
     let event = NSEvent.mouseEvent(with: type, location: canvas.convert(canvas.viewPoint(p), to: nil),
-                                   modifierFlags: [], timestamp: 0, windowNumber: canvas.window?.windowNumber ?? 0,
+                                   modifierFlags: mods, timestamp: 0, windowNumber: canvas.window?.windowNumber ?? 0,
                                    context: nil, eventNumber: 0, clickCount: clicks, pressure: 1)!
     switch type {
     case .leftMouseDown: canvas.mouseDown(with: event)
@@ -63,6 +63,9 @@ private func editorExports(_ dir: URL) throws {
     let src = editorImage(text: true)
     try editorPNG(src).write(to: url)
     let model = PolishModel(url: url, image: src)
+    let pasteboard = NSPasteboard(name: .init("polish-exports-" + UUID().uuidString))
+    defer { pasteboard.releaseGlobally() }
+    model.pasteboard = pasteboard
     let plain = PolishPreset.builtIn[0].style
     model.doc.style = plain
     var box = Mark(.redact, [CGPoint(x: 0, y: 0), CGPoint(x: 800, y: 160)])
@@ -71,7 +74,7 @@ private func editorExports(_ dir: URL) throws {
     model.doc.marks = [box]
     model.copyText()
     let ocrFinished = editorUntil { model.busy == nil }
-    let copiedText = NSPasteboard.general.string(forType: .string) ?? ""
+    let copiedText = pasteboard.string(forType: .string) ?? ""
     check(ocrFinished && copiedText.contains("Visible heading") && !copiedText.contains("hidden@example.com"),
           "Copy Text reads only the visible line")
     model.doc.marks = []
@@ -84,7 +87,6 @@ private func editorExports(_ dir: URL) throws {
     let oldInk = model.ink
     model.ink = ink
     defer { model.ink = oldInk }
-    let pasteboard = NSPasteboard.general
     let beforeCopy = pasteboard.changeCount
     var shared: URL?
     model.autoRedact()
@@ -148,6 +150,117 @@ private func editorExports(_ dir: URL) throws {
     model.copyAndClose()
     editorPump(0.35)
     check(!closed, "Return keeps the editor open when Copy fails")
+}
+
+private func editorCropBadgeChecks(_ dir: URL) throws {
+    let defaults = UserDefaults.standard
+    let previous = defaults.object(forKey: "polish.export1x")
+    defer { defaults.set(previous, forKey: "polish.export1x") }
+    let url = dir.appendingPathComponent("badge.png"), source = editorImage()
+    try editorPNG(source).write(to: url)
+    let model = PolishModel(url: url, image: source)
+    model.doc.style = PolishPreset.builtIn[0].style
+    let drafts = [CGRect(x: 10.4, y: 11.6, width: 317.2, height: 109.6),
+                  CGRect(x: 0.8, y: 52.3, width: 233.6, height: 121.2),
+                  CGRect(x: 700.5, y: 250.5, width: 100.8, height: 80.3)]
+    for retina in [true, false] {
+        defaults.set(!retina, forKey: "polish.export1x")
+        for draft in drafts {
+            model.tool = .crop
+            model.cropDraft = draft
+            let badge = model.cropBadgeText
+            model.tool = .select
+            let png = PolishRenderer.png(model.doc, retina: retina).flatMap { NSBitmapImageRep(data: $0) }
+            let expected = png.map { "\($0.pixelsWide) × \($0.pixelsHigh)" }
+            check(expected == badge, "fractional crop badge matches PNG size at \(retina ? "2×" : "1×"): \(badge)")
+        }
+    }
+}
+
+private func editorThumbnailChecks(_ dir: URL) {
+    let model = PolishModel(url: dir.appendingPathComponent("thumbnail.png"), image: editorImage())
+    func shade(_ x: Int) -> CGFloat {
+        guard let data = model.thumbs["None"]?.tiffRepresentation, let rep = NSBitmapImageRep(data: data) else { return -1 }
+        return rep.colorAt(x: x, y: rep.pixelsHigh / 2)?.usingColorSpace(.sRGB)?.redComponent ?? -1
+    }
+    check(editorUntil { shade(10) > 0.95 }, "None thumbnail displays the source")
+    var box = Mark(.redact, [.zero, CGPoint(x: 300, y: 320)])
+    box.redaction = .solid
+    box.color = .black
+    model.doc.marks = [box]
+    check(editorUntil { (0...0.05).contains(shade(10)) }, "adding a redaction refreshes the thumbnail")
+    model.history.record(model.doc)
+    model.doc.marks[0] = box.moved(by: CGSize(width: 500, height: 0))
+    check(editorUntil { shade(10) > 0.95 && (0...0.05).contains(shade(115)) }, "moving the redaction refreshes the thumbnail")
+    model.undo()
+    check(editorUntil { (0...0.05).contains(shade(10)) }, "undo restores the thumbnail redaction")
+    model.doc.marks.removeAll()
+    check(editorUntil { shade(10) > 0.95 && shade(115) > 0.95 }, "deleting the redaction refreshes the thumbnail")
+}
+
+func editorZoomChecks(_ model: PolishModel, _ window: EditorWindow) {
+    let prior = model.zoom
+    defer { model.zoom = prior }
+    let keys: [(UInt16, String, String, NSEvent.ModifierFlags)] = [
+        (24, "=", "=", .command), (24, "+", "+", .command),
+        (24, "=", "=", [.command, .shift]), (24, "+", "=", [.command, .shift]),
+        (69, "+", "+", [.command, .numericPad])
+    ]
+    for (code, chars, ignored, mods) in keys {
+        let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: mods, timestamp: 0,
+                                 windowNumber: window.windowNumber, context: nil, characters: chars,
+                                 charactersIgnoringModifiers: ignored, isARepeat: false, keyCode: code)!
+        model.zoom = 1
+        let handled = window.performKeyEquivalent(with: e) && model.zoom == 1.25
+        model.zoom = 1
+        window.sendEvent(e)
+        check(handled && model.zoom == 1.25, "zoom key \(code) \(chars)\(mods.contains(.shift) ? " with Shift" : "") in both event paths")
+    }
+}
+
+func editorRotationChecks(_ model: PolishModel, _ canvas: PolishCanvas) {
+    let box = Mark(.rect, [CGPoint(x: 250, y: 100), CGPoint(x: 420, y: 190)])
+    let r = box.rect
+    model.doc.marks = [box]
+    model.history = DocHistory()
+    model.tool = .select
+    model.selection = box.id
+    canvas.sync()
+    let knob = CGPoint(x: r.midX, y: r.minY - 18 / (canvas.geometry?.layout.scale ?? 1))
+    func turned(_ p: CGPoint, by degrees: CGFloat) -> CGPoint {
+        var rotated = box
+        rotated.rotation = degrees * .pi / 180
+        return p.applying(rotated.rotationTransform)
+    }
+    func drag(_ start: CGPoint, through points: [CGPoint], shift: Bool = false) {
+        let mods: NSEvent.ModifierFlags = shift ? .shift : []
+        editorMouse(.leftMouseDown, start, on: canvas, mods: mods)
+        for p in points { editorMouse(.leftMouseDragged, p, on: canvas, mods: mods) }
+        if let last = points.last { editorMouse(.leftMouseUp, last, on: canvas, mods: mods) }
+    }
+    func atAngle(_ degrees: CGFloat) -> Bool {
+        abs((model.mark(box.id)?.rotation ?? -.pi) - degrees * .pi / 180) < 0.001
+    }
+    drag(knob, through: [10, 20, 30].map { turned(knob, by: $0) })
+    check(atAngle(30) && model.history.undos.count == 1, "rotation drag reaches 30° in one undo step")
+    drag(turned(knob, by: 30), through: [34, 39, 43].map { turned(knob, by: $0) }, shift: true)
+    check(atAngle(45) && model.history.undos.count == 2, "Shift snaps a second rotation drag to 45°")
+    let originalCorner = CGPoint(x: r.maxX, y: r.maxY)
+    let larger = CGPoint(x: r.maxX + 55, y: r.maxY + 20)
+    drag(turned(originalCorner, by: 45), through: [turned(larger, by: 45)])
+    let resized = model.mark(box.id)
+    let fixed = turned(r.origin, by: 45)
+    let resizedAnchor = resized.map { $0.rect.origin.applying($0.rotationTransform) } ?? .zero
+    check(atAngle(45) && abs((resized?.rect.width ?? 0) - (r.width + 55)) < 1
+          && abs((resized?.rect.height ?? 0) - (r.height + 20)) < 1
+          && hypot(fixed.x - resizedAnchor.x, fixed.y - resizedAnchor.y) < 1,
+          "resizing a rotated box keeps its opposite corner fixed")
+    model.undo()
+    check(atAngle(45) && model.mark(box.id)?.rect == r, "one undo restores the rotated box size")
+    model.undo()
+    check(atAngle(30), "one undo restores the previous rotation")
+    model.redo()
+    check(atAngle(45), "redo restores the snapped rotation")
 }
 
 func polishEditorInteractions(_ model: PolishModel, _ canvas: PolishCanvas, _ window: EditorWindow) {
@@ -215,6 +328,8 @@ func polishEditorInteractions(_ model: PolishModel, _ canvas: PolishCanvas, _ wi
     editorKey("Z", kVK_ANSI_Z, in: window, mods: [.command, .shift])
     check(typing != nil && undone && typing?.string == "Retype" && canvas.isEditingText, "Shift-Command-Z redoes typing in the text view")
     canvas.endTextEdit(commit: false)
+    editorRotationChecks(model, canvas)
+    editorZoomChecks(model, window)
 }
 
 private func editorPreviewCheck(_ dir: URL) {
@@ -368,6 +483,8 @@ func polishEditorTests() {
     do {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try editorExports(dir)
+        try editorCropBadgeChecks(dir)
+        editorThumbnailChecks(dir)
         editorPreviewCheck(dir)
         editorBaseKeyChecks(dir)
         try editorWindowChecks(dir)

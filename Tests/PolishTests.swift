@@ -156,6 +156,7 @@ func polishTests() {
     steps.marks = [Mark(.step, [.zero])]
     steps.marks[0].number = 3
     check(steps.nextStep == 4, "the next step follows the highest")
+    rotationTests(url)
 
     // Redaction matching.
     func kinds(_ s: String) -> [Redactor.Kind] { Redactor.matches(in: s).map(\.kind) }
@@ -221,6 +222,50 @@ func polishTests() {
     check(d == d1 && h.canRedo, "redo goes forward again")
     h.record(d); d.marks.removeAll()
     check(!h.canRedo, "a new change drops the redo trail")
+}
+
+private func rotationTests(_ url: URL) {
+    let source = makeImage(width: 400, height: 260) { ctx in
+        ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: 400, height: 260))
+    }
+    var doc = PolishDoc(source: url, size: CGSize(width: 400, height: 260), style: PolishPreset.builtIn[0].style)
+    for kind in [Mark.Kind.rect, .ellipse, .text] {
+        var mark = Mark(kind, [CGPoint(x: 140, y: 100), CGPoint(x: 260, y: 140)])
+        mark.color = RGBA(0, 0, 1)
+        mark.fill = .fill
+        mark.text = "Rotate it"
+        mark.pill = true
+        mark.rotation = .pi / 2
+        let r = mark.unrotatedBounds
+        // Sample the text pill before its first glyph.
+        let rise = kind == .text ? r.width / 2 - 5 : r.width * 0.38
+        let x = Int(r.midX), y = Int(r.midY - rise)
+        let hit = CGPoint(x: x, y: y)
+        check(mark.hit(hit, slop: 0) && !r.contains(hit), "a rotated \(kind.rawValue) is hit in its rotated frame")
+
+        doc.marks = [mark]
+        let live = makeImage(width: 400, height: 260) { ctx in
+            MarkPainter.draw(doc.marks, doc: doc, source: source, layout: PolishLayout(doc: doc), in: ctx)
+        }
+        let export = PolishRenderer.render(doc, source: source)
+        let livePixel = pixel(live, x, y), exportedPixel = export.map { pixel($0, x, y) }
+        check(livePixel.b > 240 && livePixel.r < 40 && (exportedPixel?.b ?? 0) > 240 && (exportedPixel?.r ?? 255) < 40,
+              "live and export paint the rotated \(kind.rawValue)")
+        check(export.map { pixel($0, Int(r.minX + 12), Int(r.midY)).r > 240 } == true,
+              "the original \(kind.rawValue) footprint is clear after rotation")
+    }
+    let encoded = try! JSONEncoder().encode(doc.marks[0])
+    check((try? JSONDecoder().decode(Mark.self, from: encoded)) == doc.marks[0], "rotation round-trips as radians")
+    var legacy = try! JSONSerialization.jsonObject(with: encoded) as! [String: Any]
+    let storedAngle = legacy.removeValue(forKey: "rotation") as? Double
+    let legacyData = try! JSONSerialization.data(withJSONObject: legacy)
+    check(storedAngle == .pi / 2 && (try? JSONDecoder().decode(Mark.self, from: legacyData))?.rotation == 0,
+          "legacy mark JSON with no rotation decodes upright")
+    var redaction = Mark(.redact, [.zero, CGPoint(x: 30, y: 80)])
+    redaction.rotation = .pi / 4
+    check(!redaction.canRotate && redaction.rotationTransform.isIdentity && redaction.bounds == redaction.rect,
+          "redactions keep axis-aligned coverage")
 }
 
 private func renderRegressionTests(in dir: URL) {

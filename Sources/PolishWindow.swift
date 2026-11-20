@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import ImageIO
 import SwiftUI
 import UniformTypeIdentifiers
@@ -31,7 +32,15 @@ final class PolishModel: ObservableObject {
     let preview: CGImage
     let name: String
 
-    @Published var doc: PolishDoc
+    @Published var doc: PolishDoc {
+        didSet {
+            let redactions = doc.marks.lazy.filter { $0.kind == .redact }
+            let previous = oldValue.marks.lazy.filter { $0.kind == .redact }
+            let changed = !redactions.elementsEqual(previous)
+            if changed { thumbs.removeAll() }
+            if changed || doc.crop != oldValue.crop { makeThumbs(delay: 0.15) }
+        }
+    }
     @Published var tool: PolishTool = .select {
         didSet {
             guard tool != oldValue else { return }
@@ -66,6 +75,11 @@ final class PolishModel: ObservableObject {
     var onClose: () -> Void = {}
     var onSaved: (URL) -> Void = { _ in }
     var focusInspector: () -> Void = {}
+    var pasteboard = NSPasteboard.general
+
+    private static let thumbnailQueue = DispatchQueue(label: "polish.thumbnails", qos: .userInitiated)
+    private var thumbnailWork: DispatchWorkItem?
+    private var thumbnailRequest = UUID()
 
     enum Pane: String, CaseIterable { case style = "Style", markup = "Markup" }
 
@@ -85,6 +99,8 @@ final class PolishModel: ObservableObject {
         cropDraft = d.crop
         makeThumbs()
     }
+
+    deinit { thumbnailWork?.cancel() }
 
     static func scaled(_ img: CGImage, _ k: CGFloat) -> CGImage? {
         let w = max(1, Int(CGFloat(img.width) * k)), h = max(1, Int(CGFloat(img.height) * k))
@@ -202,11 +218,17 @@ final class PolishModel: ObservableObject {
         return r.width >= 4 && r.height >= 4 ? r : nil
     }
 
+    var cropBadgeText: String {
+        var draft = doc
+        draft.crop = validCropDraft ?? doc.crop
+        let size = PolishLayout(doc: draft, scale: exportScale).canvas
+        return "\(Int(size.width)) × \(Int(size.height))"
+    }
+
     func applyCrop() {
         guard let r = validCropDraft, r != doc.crop else { return }
         edit("crop") { $0.crop = r }
         lastCoalesce = nil
-        makeThumbs()
     }
 
     func cancelCrop() {
@@ -220,36 +242,53 @@ final class PolishModel: ObservableObject {
     }
 
     /// Small renders of each preset with this screenshot, for the preset strip.
-    func makeThumbs() {
-        let doc = self.doc, src = preview, k = CGFloat(preview.width) / CGFloat(source.width), list = presets
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+    private func makeThumbs(delay: TimeInterval = 0) {
+        thumbnailWork?.cancel()
+        let request = UUID()
+        thumbnailRequest = request
+        let doc = self.doc, src = preview, list = presets
+        let kx = CGFloat(src.width) / CGFloat(source.width), ky = CGFloat(src.height) / CGFloat(source.height)
+        let work = DispatchWorkItem { [weak self] in
             var d = doc
-            d.marks = []
-            d.source = doc.source
-            d.crop = CGRect(x: doc.crop.minX * k, y: doc.crop.minY * k, width: doc.crop.width * k, height: doc.crop.height * k).integral
+            let transform = CGAffineTransform(scaleX: kx, y: ky)
+            d.crop = doc.crop.applying(transform).integral
+            d.marks = doc.marks.compactMap { mark in
+                guard mark.kind == .redact, !mark.rect.isEmpty else { return nil }
+                var scaled = mark
+                let rect = mark.rect.integral.applying(transform)
+                scaled.points = [rect.origin, CGPoint(x: rect.maxX, y: rect.maxY)]
+                return scaled
+            }
             var out: [String: NSImage] = [:]
             for p in list {
                 d.style = p.style
                 // About 130 px across: sharp at 2× in a 66-point chip.
                 let one = PolishLayout(doc: d, scale: 1).canvas
-                if let img = PolishRenderer.render(d, source: src, scale: 130 / max(one.width, one.height), marks: false) {
+                if let img = PolishRenderer.render(d, source: src, scale: 130 / max(one.width, one.height), marks: true) {
                     out[p.name] = NSImage(cgImage: img, size: NSSize(width: img.width, height: img.height))
                 }
             }
-            DispatchQueue.main.async { self?.thumbs = out }
+            DispatchQueue.main.async {
+                guard let self, self.thumbnailRequest == request else { return }
+                self.thumbnailWork = nil
+                self.thumbs = out
+            }
         }
+        thumbnailWork = work
+        Self.thumbnailQueue.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     // MARK: Out
 
-    private var retina: Bool { !UserDefaults.standard.bool(forKey: "polish.export1x") }
+    var exportScale: CGFloat {
+        doc.style.size.pixels != nil || !UserDefaults.standard.bool(forKey: "polish.export1x") ? 1 : 0.5
+    }
 
     private func png() -> Data? {
         guard !findingRedactions else { return nil }
         if tool == .crop { tool = .select }
         PolishPreset.last = doc.style
-        let scale: CGFloat = retina || doc.style.size.pixels != nil ? 1 : 0.5
-        guard let image = PolishRenderer.render(doc, source: source, scale: scale, marks: true) else { return nil }
+        guard let image = PolishRenderer.render(doc, source: source, scale: exportScale, marks: true) else { return nil }
         let data = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil) else { return nil }
         CGImageDestinationAddImage(destination, image, nil)
@@ -270,7 +309,7 @@ final class PolishModel: ObservableObject {
 
     private func copy(closeAfter: Bool) {
         exportWhenReady { model, data in
-            let pb = NSPasteboard.general
+            let pb = model.pasteboard
             pb.clearContents()
             guard pb.setData(data, forType: .png) else {
                 model.say("Couldn't copy the image", "exclamationmark.triangle")
@@ -394,7 +433,8 @@ final class PolishModel: ObservableObject {
                 guard let self else { return }
                 self.activity = nil
                 guard !text.isEmpty else { self.say("No text found", "text.viewfinder"); return }
-                Board.writeText(text)
+                self.pasteboard.clearContents()
+                self.pasteboard.setString(text, forType: .string)
                 let lines = text.split(separator: "\n").count
                 self.say("Copied \(lines) \(lines == 1 ? "line" : "lines") of text", "text.viewfinder")
             }
@@ -549,12 +589,14 @@ final class EditorWindow: NSWindow {
     private var typing: Bool { firstResponder is NSTextView }
 
     override func sendEvent(_ e: NSEvent) {
+        if zoomIn(with: e) { return }
         if e.type == .keyDown, !typing, let c = canvas, c.handleKey(e) { return }
         super.sendEvent(e)
     }
 
     override func performKeyEquivalent(with e: NSEvent) -> Bool {
         guard e.type == .keyDown, let m = canvas?.model else { return super.performKeyEquivalent(with: e) }
+        if zoomIn(with: e) { return true }
         let mods = e.modifierFlags.intersection([.command, .shift, .option, .control])
         let key = e.charactersIgnoringModifiers?.lowercased() ?? ""
         if let text = firstResponder as? NSTextView {
@@ -575,11 +617,20 @@ final class EditorWindow: NSWindow {
         case (.command, "z"): m.undo(); return true
         case ([.command, .shift], "z"): m.redo(); return true
         case (.command, "0"): m.zoom = 1; m.pan = .zero; return true
-        case (.command, "="), (.command, "+"): m.zoom = min(8, m.zoom * 1.25); return true
         case (.command, "-"): m.zoom = max(0.25, m.zoom / 1.25); if m.zoom <= 1 { m.pan = .zero }; return true
         case ([.command, .shift], "r"): m.autoRedact(); return true
         default: return super.performKeyEquivalent(with: e)
         }
+    }
+
+    private func zoomIn(with e: NSEvent) -> Bool {
+        guard e.type == .keyDown, let model = canvas?.model else { return false }
+        let mods = e.modifierFlags.intersection([.command, .shift, .option, .control])
+        guard mods == .command || mods == [.command, .shift] else { return false }
+        let key = e.charactersIgnoringModifiers
+        guard e.keyCode == kVK_ANSI_Equal || e.keyCode == kVK_ANSI_KeypadPlus || key == "=" || key == "+" else { return false }
+        model.zoom = min(8, model.zoom * 1.25)
+        return true
     }
 }
 
@@ -909,7 +960,7 @@ private struct StylePane: View {
     }
 
     private var sizeLine: String {
-        let c = PolishLayout(doc: model.doc, scale: model.doc.style.size.pixels == nil && UserDefaults.standard.bool(forKey: "polish.export1x") ? 0.5 : 1).canvas
+        let c = PolishLayout(doc: model.doc, scale: model.exportScale).canvas
         return "Exports at \(Int(c.width)) × \(Int(c.height)) px"
     }
 }
@@ -972,8 +1023,10 @@ private struct Chip: View {
 }
 
 private struct MarkupPane: View {
+    @Environment(\.colorScheme) private var colorScheme
     @ObservedObject var model: PolishModel
 
+    private var hintColor: Color { Color(white: colorScheme == .dark ? 0.78 : 0.33) }
     /// What the controls apply to: the selected mark, or the tool's next one.
     private var kind: Mark.Kind? { model.selected?.kind ?? model.tool.kind }
 
@@ -1033,7 +1086,7 @@ private struct MarkupPane: View {
                 Text("Covered pixels are replaced in the exported image, not just hidden.").font(.system(size: 11)).foregroundStyle(.tertiary)
             }
             if kind == .highlight {
-                Text("Everything outside the box is dimmed. Draw several to spotlight more than one thing.").font(.system(size: 11)).foregroundStyle(.tertiary)
+                Text("Everything outside the box is dimmed. Draw several to spotlight more than one thing.").font(.system(size: 11)).foregroundStyle(hintColor)
             }
             if kind == .measure {
                 Text("Shows the distance in the screenshot's own pixels. Hold Shift for straight lines.").font(.system(size: 11)).foregroundStyle(.tertiary)
@@ -1065,7 +1118,7 @@ private struct MarkupPane: View {
             }
             .controlSize(.small)
             Text("Text is read on this Mac. Check the result: anything missed can be covered with the Redact tool.")
-                .font(.system(size: 11)).foregroundStyle(.tertiary)
+                .font(.system(size: 11)).foregroundStyle(hintColor)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }

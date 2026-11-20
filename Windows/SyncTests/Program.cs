@@ -365,7 +365,7 @@ static class Program
         Prefs.Set("sync.hosts", new[] { "fakehost" });
         e.Post(e.ReconcileLinks);
         Check(WaitFor(() => State() is { Kind: "needs-key" }), "no key: " + State()?.Text);
-        Check(State()!.Text == "Needs SSH key login", "said plainly");
+        Check(State()!.Text.StartsWith("rohit@host wasn't let in"), "says who wasn't let in: " + State()!.Text);
         Prefs.Set("sync.hosts", Array.Empty<string>());
         e.Post(e.ReconcileLinks);
         Environment.SetEnvironmentVariable("FAKE_SSH", null);

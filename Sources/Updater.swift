@@ -30,6 +30,7 @@ final class Updater: ObservableObject {
 
     nonisolated static let current = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
     nonisolated static let releases = URL(string: "https://github.com/rohit3a/clipbubble/releases/latest")!
+    nonisolated static let relaunchArgument = "-clipbubble-update-relaunch"
     private nonisolated static let latest = URL(string: "https://api.github.com/repos/rohit3a/clipbubble/releases/latest")!
 
     /// An ad hoc build can't prove the update came from the same developer, and macOS treats it as a new app.
@@ -182,7 +183,8 @@ final class Updater: ObservableObject {
     private static func reopen(_ app: URL) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = ["-c", #"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done; open "$2""#, "sh", String(getpid()), app.path]
+        p.arguments = ["-c", #"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open -g "$2" --args "$3""#,
+                       "sh", String(getpid()), app.path, relaunchArgument]
         try? p.run()
         NSApp.terminate(nil)
     }

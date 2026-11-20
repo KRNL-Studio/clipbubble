@@ -1,5 +1,6 @@
 import Foundation
 
+isolateTestDefaults()
 signal(SIGPIPE, SIG_IGN)
 let child = ProcessInfo.processInfo.environment["CLIPBUBBLE_CHILD"] != nil
 // Every test gets throwaway data: point Paths at a temp folder before anything touches it.
@@ -37,6 +38,8 @@ shortcutTests()
 bubbleTests()
 polishTests()
 polishEditorTests()
+windowTests()
+folderWatcherTests()
 
 try? FileManager.default.removeItem(at: testHome)
 print("\(ran) checks, \(failures) failed")

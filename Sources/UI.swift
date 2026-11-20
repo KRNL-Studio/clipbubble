@@ -1,5 +1,5 @@
 import AppKit
-import Carbon.HIToolbox
+import Carbon
 import ServiceManagement
 import SwiftUI
 import UniformTypeIdentifiers
@@ -43,8 +43,7 @@ final class Model: ObservableObject {
     @Published var recordingShortcut = false { didSet { bubbleModeChanged() } }
     @Published var shortcutNote: String?
     let db = DB()
-    var pick: (Clip, _ paste: Bool) -> Void = { _, _ in }
-    var dismiss: () -> Void = {}
+    var pickClip: (Clip, _ paste: Bool) -> Bool = { _, _ in false }
     var hoverChanged: () -> Void = {}
     var prefsChanged: () -> Void = {}
     var bubbleModeChanged: () -> Void = {}
@@ -55,13 +54,24 @@ final class Model: ObservableObject {
 
     var selected: Clip? { clips.first { $0.id == selection } ?? clips.first }
 
+    @discardableResult
+    func pick(_ clip: Clip, _ paste: Bool) -> Bool { pickClip(clip, paste) }
+
     func reload() {
         let kind = ["text", "image", "file"].contains(filter) ? filter : nil
         let source = ["iphone": "iPhone", "shots": "Screenshot", "downloads": "Downloads"][filter]
         clips = db.clips(kind: kind, source: source, query: query)
-        if clips.contains(where: { !$0.origin.isEmpty }) { devices = db.deviceNames() }
+        if clips.contains(where: { !$0.origin.isEmpty }) { refreshDeviceNames() }
         if !clips.contains(where: { $0.id == selection }) { selection = clips.first?.id }
         Thumbs.prewarm(clips.prefix(40))
+    }
+
+    @discardableResult
+    func refreshDeviceNames() -> Bool {
+        let names = db.deviceNames()
+        guard names != devices else { return false }
+        devices = names
+        return true
     }
 
     func reloadRecent() {
@@ -100,6 +110,7 @@ final class Model: ObservableObject {
         clips.removeAll { $0.id == c.id }
         if selection == c.id { selection = clips.isEmpty ? nil : clips[min(i, clips.count - 1)].id }
         reloadRecent()
+        historyChanged()
     }
 }
 
@@ -182,14 +193,17 @@ struct Thumb: View {
     }
 
     var body: some View {
-        Group {
-            if let image {
-                Image(nsImage: image).resizable().interpolation(.high).aspectRatio(contentMode: fit ? .fit : .fill)
-            } else {
-                Color.white.opacity(0.06)
+        // Let the tile set the size, even when an aspect-filled image is much wider or taller.
+        Color.clear
+            .overlay {
+                if let image {
+                    Image(nsImage: image).resizable().interpolation(.high).aspectRatio(contentMode: fit ? .fit : .fill)
+                } else {
+                    Color.white.opacity(0.06)
+                }
             }
-        }
-        .onAppear { if image == nil { Thumbs.load(path, px) { image = $0 } } }
+            .clipped()
+            .onAppear { if image == nil { Thumbs.load(path, px) { image = $0 } } }
     }
 }
 
@@ -292,6 +306,7 @@ final class BubbleView: NSView {
     private var downAt = NSPoint.zero
     private var startOrigin = NSPoint.zero
     private var moved = false
+    private var contextClick = false
 
     override func hitTest(_ p: NSPoint) -> NSView? { frame.contains(p) ? self : nil }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -310,6 +325,8 @@ final class BubbleView: NSView {
     override func mouseExited(with e: NSEvent) { onHover(false) }
 
     override func mouseDown(with e: NSEvent) {
+        contextClick = e.modifierFlags.contains(.control)
+        if contextClick { rightMouseDown(with: e); return }
         downAt = NSEvent.mouseLocation
         startOrigin = window?.frame.origin ?? .zero
         moved = false
@@ -317,6 +334,7 @@ final class BubbleView: NSView {
     }
 
     override func mouseDragged(with e: NSEvent) {
+        guard !contextClick else { return }
         let p = NSEvent.mouseLocation
         if !moved {
             guard hypot(p.x - downAt.x, p.y - downAt.y) > 3 else { return }
@@ -327,6 +345,7 @@ final class BubbleView: NSView {
     }
 
     override func mouseUp(with e: NSEvent) {
+        guard !contextClick else { contextClick = false; return }
         onPress(false)
         moved ? onDragEnd() : onClick()
     }
@@ -652,7 +671,7 @@ struct PanelView: View {
                 }
                 .scrollIndicators(.never)
                 .onChange(of: model.selection) { _, id in if let id { proxy.scrollTo(id) } }
-                .onChange(of: model.shown) { if let id = model.clips.first?.id { proxy.scrollTo(id, anchor: .top) } }
+                .onChange(of: model.shown) { if let id = model.selected?.id { proxy.scrollTo(id, anchor: .top) } }
             }
         }
     }
@@ -661,14 +680,14 @@ struct PanelView: View {
 
     private var footer: some View {
         HStack(spacing: 14) {
-            Button { model.dismiss(); model.openApp(.general) } label: {
+            Button { model.openApp(.general) } label: {
                 Image(systemName: "gearshape.fill").font(.system(size: 12)).foregroundStyle(.secondary)
                     .overlay(alignment: .topTrailing) {
                         if case .available = updater.state { Circle().fill(Color.accentColor).frame(width: 6, height: 6).offset(x: 3, y: -2) }
                     }
             }
             .buttonStyle(.plain).help(updateAvailable ? "Settings: an update is available" : "Settings")
-            Button { model.dismiss(); model.openApp(.history) } label: {
+            Button { model.openApp(.history) } label: {
                 Image(systemName: "macwindow").font(.system(size: 12)).foregroundStyle(.secondary)
             }
             .buttonStyle(.plain).help("Open ClipBubble")
@@ -795,20 +814,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hideWork: DispatchWorkItem?
     private var hiding = false
     private var dragging = false
+    private var resumePanel = false
     private var askedForAccessibility = false
     /// Puts a clip on the clipboard and returns the change it made, or nil if it couldn't.
     /// Tests swap it so they never touch the real clipboard.
-    var putOnClipboard: (Clip) -> Int? = { Board.write($0) ? NSPasteboard.general.changeCount : nil }
+    var putOnClipboard: (Clip) -> Int? = { clip in
+        let board = NSPasteboard.general
+        let type: NSPasteboard.PasteboardType = clip.kind == "text" ? .string : clip.kind == "image" ? .png : .fileURL
+        guard Board.write(clip), board.availableType(from: [type]) != nil else { return nil }
+        return board.changeCount
+    }
     var displays: () -> [Display] = { Display.real }
     var pointer: () -> NSPoint = { NSEvent.mouseLocation }
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        let launch = NSAppleEventManager.shared().currentAppleEvent
         setUpWindows()
         startServices()
-        // The first time, show the window so ClipBubble's settings are easy to find.
-        if !UserDefaults.standard.bool(forKey: "shownAppWindow") {
-            UserDefaults.standard.set(true, forKey: "shownAppWindow")
-            appWindow.show(.general)
+        guard launch?.eventClass == AEEventClass(kCoreEventClass), launch?.eventID == AEEventID(kAEOpenApplication),
+              launch?.paramDescriptor(forKeyword: AEKeyword(keyAELaunchedAsLogInItem)) == nil,
+              !CommandLine.arguments.contains(Updater.relaunchArgument) else { return }
+        DispatchQueue.main.async { [weak self] in
+            // Launch Services can hide the app just after it finishes launching.
+            guard let self, !NSApp.isHidden, !NSRunningApplication.current.isHidden, self.appWindow.window == nil else { return }
+            let first = !UserDefaults.standard.bool(forKey: "shownAppWindow")
+            if first { UserDefaults.standard.set(true, forKey: "shownAppWindow") }
+            self.appWindow.show(first ? .general : .history)
         }
     }
 
@@ -861,11 +892,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         peekGlass.addSubview(peekHost)
         peek.contentView = peekGlass
 
-        model.pick = { [weak self] c, paste in self?.pick(c, paste: paste) }
-        model.dismiss = { [weak self] in self?.hidePanel() }
+        model.pickClip = { [weak self] c, paste in self?.pick(c, paste: paste) ?? false }
         model.hoverChanged = { [weak self] in self?.updatePeek() }
         model.bubbleModeChanged = { [weak self] in self?.bubbleModeChanged() }
-        model.openApp = { [weak self] in self?.appWindow.show($0) }
+        model.openApp = { [weak self] page in
+            guard let self else { return }
+            self.resumePanel = self.panel.isVisible
+            self.hidePanel()
+            self.appWindow.show(page)
+        }
         model.historyChanged = { [weak self] in self?.appWindow.historyChanged() }
         view.onMenu = { [weak self] in self?.bubbleMenu() ?? NSMenu() }
         model.polish = { [weak self] in self?.polish($0) }
@@ -873,7 +908,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         shotCard.onPolish = { [weak self] in self?.polish(file: $0) }
         shotCard.onCopy = { [weak self] url in
             guard let self, let c = self.model.db.clip(hash: "f:" + sha(url.path)) else { return }
-            self.pick(c, paste: false)
+            self.model.pick(c, false)
         }
         shotCard.onHidden = { [weak self] in self?.restBubble() }
     }
@@ -937,7 +972,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.model.loadMascots()
             self?.model.pulseTicks += 1
         }
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in self?.handleKey(e) ?? e }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            guard let self else { return e }
+            return self.handleKey(e)
+        }
         registerHotKey()
     }
 
@@ -949,6 +987,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sync.onStatus = { [weak self] in
             self?.model.links = sync.statuses
             self?.model.linked = sync.linked
+            if self?.model.refreshDeviceNames() == true { self?.model.historyChanged() }
             SyncStatus.write(sync.statuses, paused: self?.model.syncPaused ?? false, openAtLogin: LoginItem.describe())
         }
         sync.onTransfers = { [weak self] in self?.transfersChanged($0) }
@@ -1005,20 +1044,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Backfills the last 7 days of screenshots and downloads. Cheap and idempotent, so it also reruns after access is granted.
     private func importFolders() {
-        let (shots, dls) = (screenshots, downloads)
-        // Listing a big Downloads folder and reading every file's dates is slow: do it off the main thread.
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let found = (shots?.existing(days: 7) ?? []).map { ($0, $1, "Screenshot") }
-                + (dls?.existing(days: 7) ?? []).map { ($0, $1, "Downloads") }
-            DispatchQueue.main.async {
-                guard let self else { return }
-                for (url, date, source) in found {
-                    self.model.db.insertIfMissing(kind: "file", text: url.path, source: source, hash: "f:" + sha(url.path), created: date)
-                }
-                self.model.reload()
-                self.model.reloadRecent()
-            }
+        screenshots?.existing(days: 7) { [weak self] in self?.importFiles($0, source: "Screenshot") }
+        downloads?.existing(days: 7) { [weak self] in self?.importFiles($0, source: "Downloads") }
+        if screenshots == nil, downloads == nil { refreshLists() }
+    }
+
+    private func importFiles(_ found: [(URL, Date)], source: String) {
+        for (url, date) in found {
+            if source == "Screenshot", polishedPaths.contains(url.resolvingSymlinksInPath().standardizedFileURL.path) { continue }
+            model.db.insertIfMissing(kind: "file", text: url.path, source: source, hash: "f:" + sha(url.path), created: date)
         }
+        model.reload()
+        model.reloadRecent()
+        model.historyChanged()
     }
 
     private func hosted<V: View>(_ view: V, size: NSSize, radius: CGFloat) -> NSView {
@@ -1033,9 +1071,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Picking
 
     /// Puts the clip on the clipboard and, unless copying only, pastes it into the app underneath.
-    private func pick(_ c: Clip, paste: Bool) {
+    @discardableResult
+    private func pick(_ c: Clip, paste: Bool) -> Bool {
         // Still on another device: fetch it, as Get does.
-        if c.remote { SyncEngine.shared.get(c.hash); return }
+        if c.remote { SyncEngine.shared.get(c.hash); return false }
         let change = putOnClipboard(c)
         if let change {
             // It's already in history, so it moves up and keeps its source. Captured again, a file would become a second item.
@@ -1045,15 +1084,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hidePanel()
         hidePeek()
         // Its image or files are gone: say so rather than paste whatever was copied before.
-        guard change != nil else { NSSound.beep(); return }
+        guard change != nil else { NSSound.beep(); return false }
         refreshLists()
-        guard paste, UserDefaults.standard.object(forKey: "autoPaste") as? Bool ?? true else { return }
+        guard paste, UserDefaults.standard.object(forKey: "autoPaste") as? Bool ?? true else { return true }
         guard AXIsProcessTrusted() else {
             if !askedForAccessibility {
                 askedForAccessibility = true
                 AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
             }
-            return
+            return true
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             let src = CGEventSource(stateID: .combinedSessionState)
@@ -1063,6 +1102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 e?.post(tap: .cghidEventTap)
             }
         }
+        return true
     }
 
     private func recordShortcut(_ e: NSEvent) {
@@ -1076,7 +1116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func handleKey(_ e: NSEvent) -> NSEvent? {
         // Settings records a new shortcut in the ClipBubble window.
         if model.recordingShortcut, e.window != nil, e.window === appWindow.window { recordShortcut(e); return nil }
-        guard panel.isKeyWindow else { return e }
+        guard panel.isKeyWindow else { return appWindow.handleKey(e) }
         if model.recordingShortcut { recordShortcut(e); return nil }
         let cmd = e.modifierFlags.contains(.command), opt = e.modifierFlags.contains(.option)
         switch Int(e.keyCode) {
@@ -1280,11 +1320,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showBubble()
         hidePeek()
         shotCard.hide()
-        model.query = ""
-        model.filter = "all"
+        if !resumePanel {
+            model.query = ""
+            model.filter = "all"
+            model.selection = nil
+        }
+        resumePanel = false
         model.previewing = false
         model.reload()
-        model.selection = model.clips.first?.id
         model.unseen = 0
         let b = bubble.frame
         let area = bubbleDisplay?.visible ?? .zero

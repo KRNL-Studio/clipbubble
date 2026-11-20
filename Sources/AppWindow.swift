@@ -1,4 +1,6 @@
 import AppKit
+import Combine
+import SQLite3
 import SwiftUI
 
 // MARK: - Pages
@@ -69,13 +71,19 @@ enum AppPage: String, CaseIterable, Identifiable {
 }
 
 final class AppNav: ObservableObject {
-    @Published var page: AppPage? = .history
+    @Published var page: AppPage = .history
+    let windowVisibility = CurrentValueSubject<Bool, Never>(false)
+
+    var sidebarSelection: Binding<AppPage?> {
+        Binding(get: { self.page }, set: { self.page = $0 ?? self.page })
+    }
 }
 
 // MARK: - Window
 
 /// The ClipBubble window: history and settings, like any other Mac app. ClipBubble stays out of the Dock otherwise.
 final class AppWindow: NSObject, NSWindowDelegate {
+    private static let frameName = "ClipBubbleWindow"
     let model: Model
     let nav = AppNav()
     let history: HistoryBrowser
@@ -94,8 +102,8 @@ final class AppWindow: NSObject, NSWindowDelegate {
         if nav.page == .history { history.reload() }
         let w = window ?? make()
         Presence.opened(w)
-        if !w.isVisible { w.center() ; w.setFrameUsingName("ClipBubbleWindow") }
         w.makeKeyAndOrderFront(nil)
+        if !nav.windowVisibility.value { nav.windowVisibility.send(true) }
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -103,6 +111,15 @@ final class AppWindow: NSObject, NSWindowDelegate {
     func historyChanged() {
         guard isVisible, nav.page == .history else { return }
         history.reload()
+    }
+
+    func handleKey(_ e: NSEvent) -> NSEvent? {
+        guard e.window != nil, e.window === window, nav.page == .history,
+              e.modifierFlags.intersection([.command, .control, .option, .shift]) == .command,
+              e.charactersIgnoringModifiers?.lowercased() == "c" else { return e }
+        let responder = window?.firstResponder
+        if responder is NSText || responder is NSTextField { return e }
+        return history.copySelected() ? nil : e
     }
 
     private func make() -> NSWindow {
@@ -115,17 +132,29 @@ final class AppWindow: NSObject, NSWindowDelegate {
         w.isReleasedWhenClosed = false
         w.minSize = NSSize(width: 760, height: 500)
         w.toolbarStyle = .unified
-        w.contentViewController = NSHostingController(rootView: AppRootView(model: model, nav: nav, history: history))
+        w.contentViewController = NSHostingController(rootView: AppRootView(model: model, nav: nav, history: history).environmentObject(nav))
         w.setContentSize(NSSize(width: 1020, height: 660))
         w.delegate = self
-        w.setFrameAutosaveName("ClipBubbleWindow")
+        if !w.setFrameUsingName(Self.frameName) { w.center() }
+        w.setFrameAutosaveName(Self.frameName)
         window = w
         return w
     }
 
     func windowWillClose(_ n: Notification) {
-        if model.recordingShortcut { model.recordingShortcut = false }
+        cancelRecording()
+        nav.windowVisibility.send(false)
         if let w = n.object as? NSWindow { Presence.closed(w) }
+    }
+
+    func windowDidResignKey(_ n: Notification) { cancelRecording() }
+    func windowWillMiniaturize(_ n: Notification) { cancelRecording() }
+    func windowDidDeminiaturize(_ n: Notification) {
+        if nav.page == .history { history.reload() }
+    }
+
+    private func cancelRecording() {
+        if model.recordingShortcut { model.recordingShortcut = false }
     }
 }
 
@@ -219,7 +248,7 @@ struct AppRootView: View {
                 .navigationSplitViewColumnWidth(min: 190, ideal: 210, max: 260)
         } detail: {
             Group {
-                switch nav.page ?? .history {
+                switch nav.page {
                 case .history: HistoryPage(model: model, browser: history)
                 case .general: GeneralPage(model: model)
                 case .capture: CapturePage(model: model)
@@ -237,6 +266,7 @@ struct AppRootView: View {
         }
         .animation(.easeOut(duration: 0.12), value: nav.page)
         .onChange(of: nav.page) { _, p in if p == .history { history.reload() } }
+        .onChange(of: model.prefsTick) { history.reload() }
     }
 }
 
@@ -247,7 +277,7 @@ struct Sidebar: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            List(selection: $nav.page) {
+            List(selection: nav.sidebarSelection) {
                 ForEach(Array(AppPage.groups.enumerated()), id: \.offset) { _, group in
                     Section {
                         ForEach(group.1) { page in
@@ -276,15 +306,14 @@ struct Sidebar: View {
 
     /// How sync is doing, at a glance, under the pages.
     private var status: some View {
-        let live = model.links.values.filter(\.ok).count
-        let total = SyncEngine.enabledHosts.count + model.linked.filter { h in !model.links.keys.contains(h.device) }.count
+        let live = Set(model.linked.map(\.device)).count
+        let connecting = !SyncEngine.enabledHosts.isEmpty
         let text = model.syncPaused ? "Sync paused"
-            : total == 0 ? "No devices linked"
-            : live == 0 ? "Connecting to your devices…"
-            : "\(live) \(live == 1 ? "device" : "devices") linked"
+            : live > 0 ? "\(live) \(live == 1 ? "device" : "devices") linked"
+            : connecting ? "Connecting to your devices…" : "No devices linked"
         return Button { nav.page = .devices } label: {
             HStack(spacing: 8) {
-                Circle().fill(model.syncPaused || total == 0 ? Color.gray : live > 0 ? Color.green : Color.orange)
+                Circle().fill(model.syncPaused ? Color.gray : live > 0 ? Color.green : connecting ? Color.orange : Color.gray)
                     .frame(width: 7, height: 7)
                 Text(text).font(.system(size: 11.5)).foregroundStyle(.secondary)
                 Spacer()
@@ -300,23 +329,106 @@ struct Sidebar: View {
 
 /// The History page's own search, filter and selection, so it never fights the panel over them.
 final class HistoryBrowser: ObservableObject {
+    private static let pageSize = 100
     let model: Model
-    @Published var clips: [Clip] = []
-    @Published var query = "" { didSet { if query != oldValue { reload() } } }
-    @Published var filter = "all" { didSet { if filter != oldValue { reload() } } }
-    @Published var selection: Int64?
+    @Published private(set) var clips: [Clip] = []
+    @Published private(set) var count = 0
+    @Published var query = "" { didSet { if query != oldValue { reload(resetPages: true) } } }
+    @Published var filter = "all" { didSet { if filter != oldValue { reload(resetPages: true) } } }
+    @Published var selection: Int64? { didSet { if selection != oldValue { clearCopyFeedback() } } }
+    @Published private(set) var copyFeedback: Bool?
+    private var copyFeedbackReset: DispatchWorkItem?
+    private var matchingIDs: [Int64] = []
+    private var loadedCount = 0
 
     init(model: Model) { self.model = model }
 
-    var selected: Clip? { clips.first { $0.id == selection } }
+    var selected: Clip? {
+        guard let selection else { return nil }
+        return clips.first { $0.id == selection } ?? model.db.clip(id: selection)
+    }
 
-    func reload() {
-        let kind = ["text", "image", "file"].contains(filter) ? filter : nil
-        let source = ["iphone": "iPhone", "shots": "Screenshot", "downloads": "Downloads"][filter]
-        clips = model.db.clips(limit: 500, kind: kind, source: source, query: query)
-        if clips.contains(where: { !$0.origin.isEmpty }), model.devices.isEmpty { model.devices = model.db.deviceNames() }
-        if selection != nil, !clips.contains(where: { $0.id == selection }) { selection = nil }
+    func reload(resetPages: Bool = false) {
+        model.refreshDeviceNames()
+        guard let ids = matchingClipIDs() else { return }
+        matchingIDs = ids
+        count = ids.count
+        loadedCount = min(ids.count, resetPages ? Self.pageSize : max(Self.pageSize, loadedCount))
+        clips = ids.prefix(loadedCount).compactMap { model.db.clip(id: $0) }
+        if let selection, !ids.contains(selection) { self.selection = nil }
         Thumbs.prewarm(clips.prefix(60))
+    }
+
+    func loadMore(after id: Int64) {
+        guard id == clips.last?.id, loadedCount < count else { return }
+        let end = min(loadedCount + Self.pageSize, count)
+        let rows = matchingIDs[loadedCount..<end].compactMap { model.db.clip(id: $0) }
+        loadedCount = end
+        clips += rows
+    }
+
+    /// Keep the count and page boundaries from the same query without loading every clip's contents.
+    private func matchingClipIDs() -> [Int64]? {
+        var db: OpaquePointer?
+        defer { sqlite3_close(db) }
+        guard sqlite3_open_v2(Paths.db.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return nil }
+        sqlite3_busy_timeout(db, 3000)
+
+        // Match the filters in DB.clips so History and the panel agree.
+        var sql = "SELECT id FROM clips WHERE created >= ?"
+        var args: [String] = []
+        let kind = ["text", "image", "file"].contains(filter) ? filter : nil
+        if kind == "image" {
+            sql += " AND (kind = 'image' OR (kind = 'file' AND (" +
+                imageExts.map { "text LIKE '%.\($0)'" }.joined(separator: " OR ") + ")))"
+        } else if let kind {
+            sql += " AND kind = ?"
+            args.append(kind)
+        }
+        if let source = ["iphone": "iPhone", "shots": "Screenshot", "downloads": "Downloads"][filter] {
+            sql += " AND (source = ? COLLATE NOCASE OR origin IN (SELECT id FROM devices WHERE name = ? COLLATE NOCASE))"
+            args += [source, source]
+        }
+        if !query.isEmpty {
+            let text = "%" + query.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_") + "%"
+            sql += " AND (text LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\')"
+            args += [text, text]
+        }
+        sql += Prefs.hiddenSQL + " ORDER BY created DESC, id DESC"
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        sqlite3_bind_double(statement, 1, Date().timeIntervalSince1970 - DB.retention)
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        for (index, value) in args.enumerated() { sqlite3_bind_text(statement, Int32(index + 2), value, -1, transient) }
+        var ids: [Int64] = []
+        var result = sqlite3_step(statement)
+        while result == SQLITE_ROW {
+            ids.append(sqlite3_column_int64(statement, 0))
+            result = sqlite3_step(statement)
+        }
+        return result == SQLITE_DONE ? ids : nil
+    }
+
+    /// Returns whether the keyboard shortcut had a selected item to copy.
+    @discardableResult
+    func copySelected() -> Bool {
+        guard let clip = selected, !clip.remote else { return false }
+        let feedback = model.pick(clip, false)
+        clearCopyFeedback()
+        copyFeedback = feedback
+        let reset = DispatchWorkItem { [weak self] in self?.clearCopyFeedback() }
+        copyFeedbackReset = reset
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: reset)
+        return true
+    }
+
+    private func clearCopyFeedback() {
+        copyFeedbackReset?.cancel()
+        copyFeedbackReset = nil
+        if copyFeedback != nil { copyFeedback = nil }
     }
 
     func delete(_ c: Clip) {
@@ -366,7 +478,7 @@ struct HistoryPage: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 4) { chips }
                 }
-                Text("\(browser.clips.count) \(browser.clips.count == 1 ? "item" : "items")").font(.system(size: 11)).foregroundStyle(.tertiary)
+                Text("\(browser.count) \(browser.count == 1 ? "item" : "items")").font(.system(size: 11)).foregroundStyle(.tertiary)
                     .fixedSize()
             }
         }
@@ -404,6 +516,7 @@ struct HistoryPage: View {
                             .simultaneousGesture(TapGesture().onEnded { browser.selection = c.id })
                             .onDrag { dragItem(c) }
                             .contextMenu { HistoryActions(clip: c, model: model, browser: browser) }
+                            .onAppear { browser.loadMore(after: c.id) }
                     }
                 }
                 .padding(20)
@@ -517,7 +630,6 @@ struct HistoryInspector: View {
     let clip: Clip
     let model: Model
     let browser: HistoryBrowser
-    @State private var copied = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -543,14 +655,12 @@ struct HistoryInspector: View {
                     Button { SyncEngine.shared.get(clip.hash) } label: { Label("Get", systemImage: "arrow.down.circle").frame(maxWidth: .infinity) }
                         .controlSize(.large).buttonStyle(.borderedProminent)
                 } else {
-                    Button {
-                        model.pick(clip, false)
-                        copied = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copied = false }
-                    } label: {
-                        Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc").frame(maxWidth: .infinity)
+                    Button { browser.copySelected() } label: {
+                        let feedback = browser.copyFeedback
+                        Label(feedback.map { $0 ? "Copied" : "Couldn't copy" } ?? "Copy",
+                              systemImage: feedback.map { $0 ? "checkmark" : "exclamationmark.circle" } ?? "doc.on.doc").frame(maxWidth: .infinity)
                     }
-                    .controlSize(.large).buttonStyle(.borderedProminent).keyboardShortcut("c", modifiers: .command)
+                    .controlSize(.large).buttonStyle(.borderedProminent)
                     if clip.polishPath != nil {
                         Button { model.polish(clip) } label: { Label("Polish", systemImage: "sparkles") }
                             .controlSize(.large).keyboardShortcut("e", modifiers: .command).help("Open in the editor  ⌘E")
@@ -569,7 +679,7 @@ struct HistoryInspector: View {
 
     @ViewBuilder private var preview: some View {
         if let p = clip.imagePath {
-            Thumb(path: p, px: 900, fit: true).padding(8)
+            Thumb(path: p, px: 900, fit: true).id(p).padding(8)
         } else if let p = clip.paths.first {
             VStack(spacing: 8) {
                 Image(nsImage: NSWorkspace.shared.icon(forFile: p)).resizable().frame(width: 64, height: 64)

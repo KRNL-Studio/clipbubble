@@ -39,11 +39,16 @@ func runChild() -> Never {
             DB().upsert(kind: "file", text: f, file: nil, source: "Finder", hash: "f:" + sha(f))
         }
     }
-    if let t = env["DELETE_TEXT"] {
-        DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
-            let d = DB()
-            for c in d.clips(limit: 500) where c.text.hasPrefix(t) { d.delete(id: c.id) }
+    if let prefix = env["DELETE_TEXT"], let count = env["DELETE_COUNT"].flatMap(Int.init) {
+        // The peer can only delete clips after the handshake and reconciliation deliver them.
+        let deleteWhenReady = {
+            let clips = db.clips(kind: "text", query: prefix).filter { $0.text.hasPrefix(prefix) }
+            guard clips.count >= count else { return }
+            SyncEngine.shared.onReceived = {}
+            for clip in clips { db.delete(id: clip.id) }
         }
+        SyncEngine.shared.onReceived = deleteWhenReady
+        deleteWhenReady()
     }
     dispatchMain()
 }
@@ -116,6 +121,28 @@ private func receivedFileTests() {
     db.delete(hash: "f:" + sha(original.path))
 }
 
+private func sessionCloseTests() {
+    let engine = SyncEngine.shared
+    let hello = Hello(proto: Sync.proto, device: "probe", name: "Probe", os: "macos", version: "test", clock: 0)
+
+    let input = Pipe(), output = Pipe()
+    let session = Session(input: input.fileHandleForReading, output: output.fileHandleForWriting, engine: engine)
+    engine.queue.sync { session.start(hello: hello, summary: []) }
+    let queuedRead = input.fileHandleForReading.readabilityHandler
+    engine.queue.sync { session.close() }
+    // A callback already in flight can still be invoked after close removes the handler.
+    queuedRead?(input.fileHandleForReading)
+    check(queuedRead != nil && engine.queue.sync { session.closed }, "a queued read after close leaves the session closed")
+
+    let otherInput = Pipe(), broken = Pipe()
+    try? broken.fileHandleForReading.close()
+    let disconnected = Session(input: otherInput.fileHandleForReading, output: broken.fileHandleForWriting, engine: engine)
+    let closed = DispatchSemaphore(value: 0)
+    disconnected.onClose = { closed.signal() }
+    engine.queue.sync { disconnected.start(hello: hello, summary: []) }
+    check(closed.wait(timeout: .now() + 3) == .success, "a broken output pipe ends the session")
+}
+
 func linkTests() {
     check(safeFileName("../../.ssh/authorized_keys") == "_.._.ssh_authorized_keys", "names can't climb out of their folder")
     check(safeFileName("...hidden") == "hidden", "names can't hide")
@@ -123,6 +150,7 @@ func linkTests() {
     let long = String(repeating: "shot (2) ", count: 30) + "end.png"
     check(safeFileName(long).count == 200 && safeFileName(long).hasSuffix(".png"), "a long name is cut before its extension")
     receivedFileTests()
+    sessionCloseTests()
 
     let peerHome = testHome.appendingPathComponent("peer")
     try? FileManager.default.createDirectory(at: peerHome, withIntermediateDirectories: true)
@@ -344,8 +372,9 @@ func syncBadgeTests() {
     func unlink(_ l: (Process, Pipe)) { unlinkPeer(l) }
 
     // A delete on the other device changes the list and nothing else.
-    for i in 0..<5 { db.upsert(kind: "text", text: "doomed \(i)", file: nil, source: "Notes", hash: "t:" + sha("doomed \(i)")) }
-    let doomed = link(["DELETE_TEXT": "doomed"])
+    let doomedCount = 5
+    for i in 0..<doomedCount { db.upsert(kind: "text", text: "doomed \(i)", file: nil, source: "Notes", hash: "t:" + sha("doomed \(i)")) }
+    let doomed = link(["DELETE_TEXT": "doomed", "DELETE_COUNT": String(doomedCount)])
     check(waitFor("deletes arrive") { !db.clips(limit: 500).contains { $0.text.hasPrefix("doomed") } }, "the peer's deletes arrive")
     check(waitFor("lists refresh") { refreshes > 0 }, "they refresh the lists")
     check(news == 0, "but aren't news, got \(news)")

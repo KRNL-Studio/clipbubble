@@ -127,6 +127,7 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
 
     // What's on screen. `shown` animates toward the target when the style changes.
     private var shown: Geometry?
+    var geometry: Geometry? { shown }
     private var anim: (from: Geometry, to: Geometry, start: CFTimeInterval)?
     private var base: CGImage?, oldBase: CGImage?, fadeStart: CFTimeInterval = 0
     private var baseKey: BaseKey?, wantedKey: BaseKey?
@@ -592,7 +593,9 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
             let h = g.view(CGPoint(x: r.midX + CGFloat(dx) * r.width / 2, y: r.midY + CGFloat(dy) * r.height / 2))
             if hypot(h.x - v.x, h.y - v.y) <= 12 { drag = .cropHandle(dx, dy); return }
         } }
-        if r.contains(p) { drag = .cropMove(p); return }
+        // Inside a crop that's already been drawn, a drag moves it. Over the whole image, it draws a new one.
+        let whole = r.size == CGSize(width: m.source.width, height: m.source.height)
+        if r.contains(p) && !whole { drag = .cropMove(p); return }
         let start = CGPoint(x: min(max(0, p.x), CGFloat(m.source.width)), y: min(max(0, p.y), CGFloat(m.source.height)))
         drag = .cropNew(start)
     }
@@ -762,4 +765,9 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
         window?.makeFirstResponder(self)
         needsDisplay = true
     }
+}
+
+extension PolishCanvas {
+    /// Where a source pixel is in this view, for tests driving the canvas with events.
+    func viewPoint(_ p: CGPoint) -> CGPoint { geometry?.view(p) ?? p }
 }

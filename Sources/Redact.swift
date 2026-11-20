@@ -32,7 +32,7 @@ enum Redactor {
     private static let cardRun = rx(#"(?<![\d-])\d++(?:[ -]\d++)*(?![\d-])"#)
     private static let digitGroup = rx(#"\d+"#)
     private static let phone = rx(#"(?<![\w.])\+?\(?\d[\d ().-]{7,18}\d(?![\w:])"#)
-    private static let telephoneLabel = rx(#"(?i)(?<!\w)tel:$"#)
+    private static let timestampLabel = rx(#"(?<!\w)(?:(?i:ts|time|timestamp|created|updated|date|epoch|exp|iat|nbf)|\w+_at|[a-z]\w*At)[=:]$"#)
     private static let ipv4 = rx(#"(?<![\p{L}\d.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?![\d.])"#)
     // Try a bare address first so a leading hextet isn't consumed as a label.
     private static let ipv6 = rx(#"(?<![\w:.])(?:[\p{L}_]\w*:)??([0-9A-Fa-f]*:[0-9A-Fa-f:.]*:(?:[0-9A-Fa-f:.]*[0-9A-Fa-f:])?)(?![\w:]|\.[\w.])"#)
@@ -70,7 +70,7 @@ enum Redactor {
         add(.phone, phone) { m in
             let number = ns.substring(with: m.range)
             let count = digits(number).count
-            if count == m.range.length, timestamp(m.range, in: s, text: ns) { return false }
+            if count == m.range.length, timestamp(m.range, in: s) { return false }
             // A date and time reads like a long number too.
             return (10...15).contains(count) &&
                 number.range(of: #"^\d{4}[-./]\d{1,2}[-./]\d{1,2}"#, options: .regularExpression) == nil &&
@@ -89,11 +89,9 @@ enum Redactor {
         return kept
     }
 
-    private static func timestamp(_ range: NSRange, in s: String, text: NSString) -> Bool {
+    private static func timestamp(_ range: NSRange, in s: String) -> Bool {
         guard range.length == 10 || range.length == 13, range.location > 0 else { return false }
-        let delimiter = text.substring(with: NSRange(location: range.location - 1, length: 1))
-        guard delimiter == "=" || delimiter == ":" else { return false }
-        return telephoneLabel.firstMatch(in: s, range: NSRange(location: 0, length: range.location)) == nil
+        return timestampLabel.firstMatch(in: s, range: NSRange(location: 0, length: range.location)) != nil
     }
 
     private static func cardSpans(in s: String, range: NSRange) -> [NSRange] {
@@ -111,7 +109,6 @@ enum Redactor {
                     candidate += numbers[end]
                     guard luhn(candidate) else { continue }
                     let span = NSRange(location: first, length: NSMaxRange(groups[end]) - first)
-                    if span.length == candidate.count, timestamp(span, in: s, text: ns) { continue }
                     // One valid window can start inside another and extend beyond it.
                     if let last = spans.last, NSIntersectionRange(last, span).length > 0 {
                         spans[spans.count - 1] = NSUnionRange(last, span)

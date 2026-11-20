@@ -175,6 +175,8 @@ func polishTests() {
     check(kinds("4000-0566-5566-5556") == [.card], "with dashes too")
     check(found("card 4242 4242 4242 4242 12/29") == ["4242 4242 4242 4242"], "card span ends before expiry")
     check(found("12 4242 4242 4242 4242 12/29") == ["4242 4242 4242 4242"], "card span can start inside a grouped run")
+    check(kinds("card:4222222222222") == [.card] && found("card:4222222222222") == ["4222222222222"],
+          "a labeled 13-digit Luhn-valid card is hidden")
     check(found("2022 4242 4242 4242 4242 12/29") == ["2022 4242 4242 4242 4242"],
           "overlapping card spans cover every valid window")
     check(!kinds("4242 4242 4242 4241").contains(.card), "a number that fails the check digit isn't a card")
@@ -190,7 +192,19 @@ func polishTests() {
     check(kinds("v1.2.3.4 V1.2.3.4 build1.2.3.4").isEmpty, "skips letter-prefixed IPv4 versions")
     check(kinds("clock:14:22:01 mac:aa:bb:cc:dd:ee:ff aa:bb:cc:dd:ee:ff").isEmpty, "timestamps and MAC addresses aren't IPs")
     check(kinds("time=1712345678 time:1712345678").isEmpty, "skips bare Unix timestamps as phones")
-    check(kinds("ts=1712345678000 ts:1712345678006").isEmpty, "skips bare millisecond timestamps")
+    check(kinds("ts=1712345678000").isEmpty, "skips bare millisecond timestamps")
+    check(kinds("ts:1712345678006") == [.card], "a timestamp label cannot suppress a Luhn-valid card")
+    let timeLabels = ["TS", "time", "timestamp", "created", "updated", "date", "epoch", "exp", "iat", "nbf", "sent_at", "sentAt"]
+    check(timeLabels.allSatisfy { Redactor.matches(in: "\($0)=1712345678000", kinds: [.phone]).isEmpty },
+          "timestamp labels and suffixes suppress only phone matches")
+    check(found("office:4155550132") == ["4155550132"], "non-timestamp labels do not suppress phones")
+    for label in ["chat", "seat"] {
+        let text = "\(label):4155550132"
+        check(kinds(text) == [.phone] && found(text) == ["4155550132"], "\(label) does not suppress a phone")
+    }
+    for text in ["created_at=1712345678", "updatedAt:1712345678000", "ts=1712345678"] {
+        check(kinds(text).isEmpty, "\(text) is a timestamp, not a phone")
+    }
     check(found("tel:4155550132 TEL:4155550132") == ["4155550132", "4155550132"], "accepts phones directly after tel:")
     check(found("phone: 415-555-0132") == ["415-555-0132"], "accepts formatted phones after a label and space")
     check(found("call: 4155550132") == ["4155550132"], "accepts bare phones after a space")

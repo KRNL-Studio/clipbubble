@@ -545,13 +545,15 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
             drag = .handle(mk, h, p)
             return
         }
-        let slop = 6 / g.layout.scale
-        // Reverse the paint order so a covering redaction gets the click.
+        // Check direct hits before letting nearby marks use click tolerance.
         let marks = m.doc.marks
-        let hit = marks.last { $0.kind == .redact && $0.redaction == .solid && $0.hit(p, slop: slop) }
-            ?? marks.last { $0.kind == .redact && $0.redaction != .solid && $0.hit(p, slop: slop) }
-            ?? marks.last { $0.kind != .redact && $0.kind != .highlight && $0.hit(p, slop: slop) }
-            ?? marks.last { $0.kind == .highlight && $0.hit(p, slop: slop) }
+        func hitInPaintOrder(slop: CGFloat) -> Mark? {
+            marks.last { $0.kind == .redact && $0.redaction == .solid && $0.hit(p, slop: slop) }
+                ?? marks.last { $0.kind == .redact && $0.redaction != .solid && $0.hit(p, slop: slop) }
+                ?? marks.last { $0.kind != .redact && $0.kind != .highlight && $0.hit(p, slop: slop) }
+                ?? marks.last { $0.kind == .highlight && $0.hit(p, slop: slop) }
+        }
+        let hit = hitInPaintOrder(slop: 0) ?? hitInPaintOrder(slop: 6 / g.layout.scale)
 
         switch m.tool {
         case .select:

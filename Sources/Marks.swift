@@ -120,8 +120,9 @@ struct Mark: Codable, Equatable, Identifiable {
     /// Whether a click at `p` lands on this mark. `slop` is how far off it can be, in source pixels.
     func hit(_ point: CGPoint, slop: CGFloat) -> Bool {
         let p = rotation == 0 ? point : point.applying(rotationTransform.inverted())
-        let near = max(slop, width)
+        let near = slop == 0 ? width / 2 : max(slop, width)
         switch kind {
+        case .redact: return !rect.isEmpty && rect.integral.insetBy(dx: -slop, dy: -slop).contains(p)
         case .line, .measure: return Mark.distance(p, a, b) <= near
         case .arrow:
             guard let c = bend else { return Mark.distance(p, a, b) <= near }

@@ -817,6 +817,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var shotCard = ShotCard()
     private var polishedPaths: [String: PolishedFile] = [:]
     var polishedFileAt: (URL) -> PolishedFile? = PolishedFile.read
+    var screenshotClipboardChangeCount: () -> Int = { NSPasteboard.general.changeCount }
     private static let screenshotIdentityQueue = DispatchQueue(label: "clipbubble.screenshotIdentity", qos: .userInitiated)
     private var localClickMonitor: Any?
     private var capture: Capture!
@@ -1015,7 +1016,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Every screenshot lands in history; copying it to the clipboard as well is optional.
-    private func syncScreenshots() {
+    func syncScreenshots() {
         let folder = FolderWatcher.screenshotFolder
         guard Prefs.on("screenshots") else { screenshots?.stop(); screenshots = nil; return }
         guard screenshots?.folder != folder else { return }
@@ -1030,20 +1031,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func screenshotAdded(_ url: URL, at date: Date) {
-        guard !polishedPaths.isEmpty else { announceScreenshot(url, at: date, file: nil); return }
+        guard Prefs.on("screenshots") else { return }
+        let watcher = screenshots
+        let clipboardChange = screenshotClipboardChangeCount()
+        guard !polishedPaths.isEmpty else {
+            announceScreenshot(url, at: date, file: nil, clipboardChange: clipboardChange)
+            return
+        }
         let read = polishedFileAt
         Self.screenshotIdentityQueue.async { [weak self] in
             let file = read(url)
-            DispatchQueue.main.async { self?.announceScreenshot(url, at: date, file: file) }
+            DispatchQueue.main.async {
+                guard let self, self.screenshots === watcher, Prefs.on("screenshots") else { return }
+                self.announceScreenshot(url, at: date, file: file, clipboardChange: clipboardChange)
+            }
         }
     }
 
-    private func announceScreenshot(_ url: URL, at date: Date, file: PolishedFile?) {
+    private func announceScreenshot(_ url: URL, at date: Date, file: PolishedFile?, clipboardChange: Int) {
         guard let hash = recordScreenshot(url, at: date, file: file) else { return }
         // A copy to the clipboard is announced when capture saves it, unless copied files aren't saved.
-        let copy = UserDefaults.standard.bool(forKey: "copyScreenshots")
-        if !copy || !Prefs.on("files") { captured() }
-        if copy, let c = model.db.clip(hash: hash) { _ = putOnClipboard(c) }
+        if UserDefaults.standard.bool(forKey: "copyScreenshots"), let c = model.db.clip(hash: hash),
+           screenshotClipboardChangeCount() == clipboardChange {
+            _ = putOnClipboard(c)
+            if !Prefs.on("files") { captured() }
+        } else { captured() }
         offerPolish(url)
     }
 
@@ -1083,8 +1095,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func importFiles(_ found: [(URL, Date)], source: String) {
+        let watcher = source == "Screenshot" ? screenshots : nil
         let apply: ([(URL, Date, PolishedFile?)]) -> Void = { [weak self] files in
             guard let self else { return }
+            guard source != "Screenshot" || (self.screenshots === watcher && Prefs.on("screenshots")) else { return }
             for (url, date, file) in files {
                 if source == "Screenshot" {
                     _ = self.recordScreenshot(url, at: date, file: file)

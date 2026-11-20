@@ -169,8 +169,9 @@ private func editorExports(_ dir: URL) throws {
 private func editorHandoffIsolation() throws {
     let fm = FileManager.default
     let root = PolishHandoffs.root
-    func makeFolder(pid: pid_t, age: TimeInterval) throws -> URL {
-        let folder = root.appendingPathComponent("\(pid)-\(UUID())", isDirectory: true)
+    func makeFolder(pid: pid_t? = nil, age: TimeInterval) throws -> URL {
+        let name = (pid.map { "\($0)-" } ?? "") + UUID().uuidString
+        let folder = root.appendingPathComponent(name, isDirectory: true)
         try fm.createDirectory(at: folder, withIntermediateDirectories: true)
         let file = folder.appendingPathComponent("handoff.png")
         try Data([1]).write(to: file)
@@ -180,12 +181,16 @@ private func editorHandoffIsolation() throws {
     let live = try makeFolder(pid: getpid(), age: 3601)
     let young = try makeFolder(pid: Int32.max, age: 0)
     let stale = try makeFolder(pid: Int32.max, age: 3601)
+    let legacy = try makeFolder(age: 3601)
+    let youngLegacy = try makeFolder(age: 0)
     defer {
-        for file in [live, young, stale] { try? fm.removeItem(at: file.deletingLastPathComponent()) }
+        for file in [live, young, stale, legacy, youngLegacy] { try? fm.removeItem(at: file.deletingLastPathComponent()) }
     }
     let own = try PolishHandoffs.write(Data([2]), name: "mine.png")
     check(fm.fileExists(atPath: live.path) && fm.fileExists(atPath: young.path) && !fm.fileExists(atPath: stale.path),
           "handoff startup removes only expired files from dead processes")
+    check(!fm.fileExists(atPath: legacy.path) && fm.fileExists(atPath: youngLegacy.path),
+          "handoff startup removes only expired legacy folders")
     PolishHandoffs.clear()
     check(!fm.fileExists(atPath: own.path) && fm.fileExists(atPath: live.path) && fm.fileExists(atPath: young.path),
           "handoff quit clears only this launch's files")
@@ -240,6 +245,7 @@ private func editorThinCropChecks(_ model: PolishModel, _ canvas: PolishCanvas, 
         editorMouse(.leftMouseUp, end, on: canvas)
         check(model.cropDraft == draft && abs(g.view(draft).width - w) < 0.01
               && abs(g.view(draft).height - h) < 0.01, "thin crop \(w) × \(h) remains visible after dragging")
+        if h == 0 { invalidCropExportChecks(model, window, draft) }
         editorKey("\r", kVK_Return, in: window)
         if draft.width >= 1 && draft.height >= 1 {
             check(model.tool == .select && model.doc.crop == draft.integral, "a six-point crop applies")
@@ -254,6 +260,51 @@ private func editorThinCropChecks(_ model: PolishModel, _ canvas: PolishCanvas, 
     canvas.sync()
     check(model.zoom == 1 && canvas.geometry?.layout.scale.isFinite == true, "invalid zoom keeps the canvas layout finite")
     model.zoom = zoom
+}
+
+private func invalidCropExportChecks(_ model: PolishModel, _ window: EditorWindow, _ draft: CGRect) {
+    let defaults = UserDefaults.standard
+    let folder = defaults.object(forKey: "polish.folder")
+    let originalBoard = model.pasteboard, onSaved = model.onSaved, onClose = model.onClose
+    let board = NSPasteboard(name: .init("polish-invalid-crop-" + UUID().uuidString))
+    let committed = model.doc.crop, undos = model.history.undos.count
+    var saved = false, shared = false, dragged = false, closed = false
+    defaults.set(model.doc.source.deletingLastPathComponent().path, forKey: "polish.folder")
+    model.pasteboard = board
+    model.onSaved = { _ in saved = true }
+    model.onClose = { closed = true }
+    defer {
+        model.tool = .crop
+        model.cropDraft = draft
+        model.pasteboard = originalBoard
+        model.onSaved = onSaved
+        model.onClose = onClose
+        defaults.set(folder, forKey: "polish.folder")
+        board.releaseGlobally()
+    }
+    board.setString("keep this", forType: .string)
+    let change = board.changeCount
+    let attempts: [(String, () -> Void)] = [
+        ("⌘C", { editorKey("c", kVK_ANSI_C, in: window, mods: .command) }),
+        ("Save", { model.save() }),
+        ("Drag", { dragged = model.exportFile() != nil }),
+        ("Share", { model.share { _ in shared = true } }),
+        ("Return", { editorKey("\r", kVK_Return, in: window) }),
+        ("Copy and Close", { model.copyAndClose() }),
+        ("Copy Text", { model.copyText() })
+    ]
+    for (name, attempt) in attempts {
+        model.tool = .crop
+        model.cropDraft = draft
+        model.toast = nil
+        attempt()
+        check(model.tool == .crop && model.cropDraft == draft && model.doc.crop == committed
+              && model.history.undos.count == undos && model.toast?.text == "Crop too small — adjust or reset it",
+              "\(name) refuses the invalid crop and leaves it open")
+    }
+    editorPump(0.35)
+    check(board.changeCount == change && !saved && !shared && !dragged && !closed,
+          "an invalid draft exports nothing and never closes the editor")
 }
 
 @MainActor private func inspectorHintChecks() {
@@ -407,13 +458,22 @@ func polishEditorInteractions(_ model: PolishModel, _ canvas: PolishCanvas, _ wi
     let oldDoc = model.doc, oldHistory = model.history, oldTool = model.tool, oldSelection = model.selection
     defer { model.tool = oldTool; model.doc = oldDoc; model.history = oldHistory; model.selection = oldSelection; canvas.sync() }
 
-    let mask = Mark(.redact, [CGPoint(x: 80, y: 80), CGPoint(x: 180, y: 180)])
+    var mask = Mark(.redact, [CGPoint(x: 80, y: 80), CGPoint(x: 180, y: 180)])
+    mask.redaction = .solid
     let line = Mark(.line, [CGPoint(x: 90, y: 130), CGPoint(x: 170, y: 130)])
     model.doc.marks = [mask, line]
     model.tool = .select
     model.selection = nil
     click(130, 130)
     check(model.selection == mask.id, "click selects the redaction over a hidden later annotation")
+    let visible = Mark(.line, [CGPoint(x: 90, y: 184), CGPoint(x: 170, y: 184)])
+    model.doc.marks = [mask, visible]
+    model.selection = nil
+    click(130, 184)
+    check(model.selection == visible.id, "a direct hit on a visible line beats nearby redaction tolerance")
+    model.selection = nil
+    click(83, 184)
+    check(model.selection == mask.id, "redaction tolerance still applies when nothing was hit directly")
 
     model.doc.marks = []
     model.tool = .rect
@@ -575,6 +635,7 @@ private func editorCardChecks(_ dir: URL) throws {
     let first = NSRect(x: x, y: 0, width: 1300, height: 900)
     let second = first.offsetBy(dx: 1400, dy: 0)
     let app = AppDelegate()
+    app.screenshotClipboardChangeCount = { 0 }
     app.displays = { [Display(id: 801, frame: first, visible: first), Display(id: 802, frame: second, visible: second)] }
     var pointer = CGPoint(x: second.midX, y: second.midY)
     app.pointer = { pointer }
@@ -654,6 +715,85 @@ private func editorCardChecks(_ dir: URL) throws {
 
     app.toggleBubble()
     check(editorUntil(0.75) { !bubble.isVisible && !app.shotCard.isVisible }, "the hide-bubble shortcut hides the card and bubble together")
+    try editorScreenshotLookupChecks(app, dir)
+}
+
+private func editorScreenshotLookupChecks(_ app: AppDelegate, _ dir: URL) throws {
+    let defaults = UserDefaults.standard
+    let savedFolder = defaults.object(forKey: "screenshotFolder")
+    let savedPref = defaults.object(forKey: "save.screenshots")
+    let board = NSPasteboard(name: .init("polish-screenshot-lookup-" + UUID().uuidString))
+    let clipboardChange = app.screenshotClipboardChangeCount, putOnClipboard = app.putOnClipboard
+    let folder = dir.appendingPathComponent("watch"), replacement = dir.appendingPathComponent("watch replacement")
+    for url in [folder, replacement] { try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true) }
+    let read = app.polishedFileAt
+    defer {
+        Prefs.set("screenshots", false)
+        app.syncScreenshots()
+        defaults.set(savedFolder, forKey: "screenshotFolder")
+        defaults.set(savedPref, forKey: "save.screenshots")
+        app.polishedFileAt = read
+        app.screenshotClipboardChangeCount = clipboardChange
+        app.putOnClipboard = putOnClipboard
+        app.shotCard.hide(animated: false)
+        board.releaseGlobally()
+    }
+    defaults.set(folder.path, forKey: "screenshotFolder")
+    Prefs.set("screenshots", true)
+    app.syncScreenshots()
+    app.screenshotClipboardChangeCount = { board.changeCount }
+    app.putOnClipboard = { clip in
+        board.clearContents()
+        return board.setString(clip.text, forType: .string) ? board.changeCount : nil
+    }
+    let png = editorPNG(editorImage())
+    let sentinel = dir.appendingPathComponent("lookup sentinel.png")
+    try png.write(to: sentinel)
+    app.polishedSaved(sentinel)
+
+    func lookup(_ name: String, interrupt: () -> Void) throws -> Bool {
+        let url = dir.appendingPathComponent("\(name).png")
+        try png.write(to: url)
+        let entered = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
+        let drained = DispatchSemaphore(value: 0)
+        app.polishedFileAt = { candidate in
+            if candidate == url { entered.signal(); _ = resume.wait(timeout: .now() + 4) }
+            if candidate == sentinel { drained.signal() }
+            return read(candidate)
+        }
+        app.screenshotAdded(url, at: Date())
+        app.screenshotAdded(sentinel, at: Date())
+        let blocked = entered.wait(timeout: .now() + 2) == .success
+        interrupt()
+        resume.signal()
+        let finished = drained.wait(timeout: .now() + 2) == .success
+        // The serial queue posts the first result to main before starting the sentinel lookup.
+        editorPump(0.15)
+        check(blocked && finished, "in-flight screenshot lookup completes for \(name)")
+        return app.model.db.clip(hash: "f:" + sha(url.path))?.source == "Screenshot"
+    }
+
+    board.setString("keep this", forType: .string)
+    let disabled = try lookup("capture disabled") { Prefs.set("screenshots", false) }
+    check(!disabled && board.string(forType: .string) == "keep this", "disabled capture drops an in-flight screenshot")
+    Prefs.set("screenshots", true)
+    let stopped = try lookup("watcher stopped") {
+        Prefs.set("screenshots", false)
+        app.syncScreenshots()
+        Prefs.set("screenshots", true)
+    }
+    check(!stopped && board.string(forType: .string) == "keep this", "a stopped watcher drops its in-flight screenshot")
+    app.syncScreenshots()
+    let replaced = try lookup("watcher replaced") {
+        defaults.set(replacement.path, forKey: "screenshotFolder")
+        app.syncScreenshots()
+    }
+    check(!replaced && board.string(forType: .string) == "keep this", "a replaced watcher drops its in-flight screenshot")
+    let recorded = try lookup("clipboard advanced") {
+        board.clearContents()
+        board.setString("newer copy", forType: .string)
+    }
+    check(recorded && board.string(forType: .string) == "newer copy", "a slow screenshot is recorded without replacing a newer clipboard copy")
 }
 
 func polishEditorTests() {

@@ -53,6 +53,7 @@ private final class Rig {
         panel = windows.first { $0.frame.width == 420 }!
         view = bubble.contentView as! BubbleView
         d.pointer = { [unowned self] in pointer }
+        d.screenshotClipboardChangeCount = { [board] in board.changeCount }
         d.putOnClipboard = { [board] c in
             board.clearContents()
             switch c.kind {

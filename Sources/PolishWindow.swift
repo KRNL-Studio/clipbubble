@@ -240,11 +240,16 @@ final class PolishModel: ObservableObject {
         lastCoalesce = nil
     }
 
-    func finishCrop() {
-        guard validCropDraft != nil else {
-            say("Crop must be at least 1 × 1 pixel", "exclamationmark.triangle")
-            return
+    private func canUseCropDraft() -> Bool {
+        guard tool != .crop || validCropDraft != nil else {
+            say("Crop too small — adjust or reset it", "exclamationmark.triangle")
+            return false
         }
+        return true
+    }
+
+    func finishCrop() {
+        guard canUseCropDraft() else { return }
         tool = .select
     }
 
@@ -314,14 +319,17 @@ final class PolishModel: ObservableObject {
 
     private func exportWhenReady(_ action: @escaping (PolishModel, Data) -> Void) {
         let run: (PolishModel) -> Void = { model in
+            // Find and Hide can finish after the draft has changed.
+            guard model.canUseCropDraft() else { return }
             guard let data = model.png() else {
                 model.say("Couldn't make the image", "exclamationmark.triangle")
                 return
             }
             action(model, data)
         }
-        if findingRedactions { queuedExports.append(run) }
-        else { run(self) }
+        if findingRedactions {
+            if canUseCropDraft() { queuedExports.append(run) }
+        } else { run(self) }
     }
 
     private func copy(closeAfter: Bool) {
@@ -360,7 +368,7 @@ final class PolishModel: ObservableObject {
 
     /// Drag must produce its item immediately. The drag control is disabled during detection.
     func exportFile() -> URL? {
-        guard !findingRedactions else { return nil }
+        guard canUseCropDraft(), !findingRedactions else { return nil }
         guard let data = png() else {
             say("Couldn't make the image", "exclamationmark.triangle")
             return nil
@@ -446,7 +454,7 @@ final class PolishModel: ObservableObject {
     }
 
     func copyText() {
-        guard busy == nil else { return }
+        guard canUseCropDraft(), busy == nil else { return }
         if tool == .crop { tool = .select }
         activity = .reading
         let src = source, doc = self.doc
@@ -486,11 +494,14 @@ enum PolishHandoffs {
         guard let entries = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: Array(keys)) else { return }
         let stale = Date().addingTimeInterval(-lifetime)
         for entry in entries {
-            let name = entry.lastPathComponent.split(separator: "-", maxSplits: 1)
-            guard name.count == 2, let pid = pid_t(name[0]), pid > 0, UUID(uuidString: String(name[1])) != nil,
-                  let values = try? entry.resourceValues(forKeys: keys), values.isDirectory == true,
-                  values.isSymbolicLink == false, let date = values.contentModificationDate, date < stale,
-                  kill(pid, 0) == -1, errno == ESRCH else { continue }
+            guard let values = try? entry.resourceValues(forKeys: keys), values.isDirectory == true,
+                  values.isSymbolicLink == false, let date = values.contentModificationDate, date < stale else { continue }
+            let name = entry.lastPathComponent.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+            if name.count == 2, let pid = pid_t(name[0]), pid > 0, String(pid) == name[0],
+               UUID(uuidString: String(name[1])) != nil {
+                guard kill(pid, 0) == -1, errno == ESRCH else { continue }
+            }
+            // Older versions put individual handoffs here without a process prefix.
             try? fm.removeItem(at: entry)
         }
     }

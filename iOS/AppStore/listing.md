@@ -54,7 +54,12 @@ With a computer: install ClipBubble from https://clipbubble.krnl.studio on a Mac
 
 Local Network is used only to reach the user's own computer. Full Access is used only to read the local history and link to the user's computers.
 
+## New 6.9-inch screenshots
+
+- ClipBubble keyboard in Messages (`screenshots/6-keyboard.png`).
+- ClipBubble Share card in Photos (`screenshots/7-share.png`).
+
 ## Still to make
 
 - A sync video recorded on a real iPhone and computer: linking, the Local Network prompt, a copy each way, Share and the keyboard.
-- Screenshots at 6.9 inches: Recent while linked, Library, an item's detail, Add, the keyboard in Messages and the Share card.
+- Screenshots at 6.9 inches: Recent while linked, Library, an item's detail and Add.

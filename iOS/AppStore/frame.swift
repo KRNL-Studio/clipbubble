@@ -1,4 +1,4 @@
-// App Store screenshot frame: swiftc frame.swift -o frame && ./frame <raw.png> <out.png> "<headline>" "<subline>"
+// App Store screenshot frame: swiftc frame.swift -o frame && ./frame <raw.png> <out.png> "<headline>" "<subline>" [--show-bottom]
 // Raw shots come from a debug build on the 6.9-inch simulator, launched with -demo YES (see Model.init).
 import AppKit
 
@@ -29,9 +29,12 @@ func draw(_ s: String, size: CGFloat, weight: NSFont.Weight, color: NSColor, top
 let h1 = draw(a[3], size: 104, weight: .bold, color: .white, top: 170)
 _ = draw(a[4], size: 50, weight: .regular, color: NSColor.white.withAlphaComponent(0.72), top: 170 + h1 + 36)
 
-// The screenshot, scaled into a rounded phone-shaped card with a shadow, bleeding off the bottom.
-let sw: CGFloat = 1050, sh = sw * H / W
-let rect = NSRect(x: (W - sw) / 2, y: H - 760 - sh, width: sw, height: sh)
+// Keep bottom controls in view for the keyboard and Share card.
+let showBottom = a.dropFirst(5).contains("--show-bottom")
+let sw: CGFloat = showBottom ? 1000 : 1050
+let top: CGFloat = showBottom ? 650 : 760
+let sh = sw * H / W
+let rect = NSRect(x: (W - sw) / 2, y: H - top - sh, width: sw, height: sh)
 let path = NSBezierPath(roundedRect: rect, xRadius: 110, yRadius: 110)
 NSGraphicsContext.saveGraphicsState()
 let shadow = NSShadow(); shadow.shadowColor = NSColor.black.withAlphaComponent(0.6); shadow.shadowBlurRadius = 80; shadow.shadowOffset = NSSize(width: 0, height: -20)

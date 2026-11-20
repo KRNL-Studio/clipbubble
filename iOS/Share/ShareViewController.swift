@@ -31,6 +31,16 @@ final class ShareViewController: UIViewController {
         }
     }
 
+    override func viewIsAppearing(_ animated: Bool) {
+        super.viewIsAppearing(animated)
+        // Keep the sharing app visible behind the card when UIKit adds an opaque extension container.
+        var container: UIView? = view
+        while let current = container {
+            current.backgroundColor = .clear
+            container = current.superview
+        }
+    }
+
     private func close() {
         guard !state.closed else { return }
         state.closed = true

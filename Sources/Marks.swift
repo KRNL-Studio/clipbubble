@@ -168,27 +168,51 @@ struct Mark: Codable, Equatable, Identifiable {
 // MARK: - Painting
 
 enum MarkPainter {
-    /// Draws marks into a top-down context laid out by `L`. Redactions go first, from the source pixels,
-    /// then the highlight dimming, then everything else in the order it was drawn.
+    /// Draws live marks into a top-down context, with redactions above all the other marks.
     static func draw(_ marks: [Mark], doc: PolishDoc, source: CGImage, layout L: PolishLayout, in ctx: CGContext) {
+        drawAnnotations(marks, crop: doc.crop, layout: L, excluding: [], in: ctx)
+        let masks = redactions(marks, in: doc.crop, source: source)
+        guard !masks.isEmpty else { return }
         let map = { (p: CGPoint) in L.toCanvas(p, crop: doc.crop) }
         ctx.saveGState()
+        defer { ctx.restoreGState() }
         ctx.clip(to: L.image)
-        for m in marks where m.kind == .redact { redact(m, source: source, map: map, scale: L.scale, in: ctx) }
+        for mask in masks { paint(mask, source: source, in: rectOnCanvas(mask.rect, map), ctx: ctx) }
+    }
+
+    /// On export the masks are baked into the source. Leave those pixels untouched by annotations.
+    static func drawAnnotations(_ marks: [Mark], crop: CGRect, layout L: PolishLayout, excluding masks: [Redaction], in ctx: CGContext) {
+        guard marks.contains(where: { $0.kind != .redact }) else { return }
+        let map = { (p: CGPoint) in L.toCanvas(p, crop: crop) }
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.clip(to: L.image)
+        for mask in masks {
+            let path = CGPath(rect: rectOnCanvas(mask.rect, map), transform: nil)
+            clipOutside(path, image: L.image, in: ctx)
+        }
         let lights = marks.filter { $0.kind == .highlight && $0.rect.width > 0 && $0.rect.height > 0 }
         if !lights.isEmpty {
-            let path = CGMutablePath()
-            path.addRect(L.image)
+            ctx.saveGState()
+            // Intersect the areas outside each spotlight so overlapping lights stay bright.
             for m in lights {
                 let r = rectOnCanvas(m.rect, map)
-                path.addRoundedRect(in: r, cornerWidth: min(r.width, r.height, 12 * L.scale) / 2, cornerHeight: min(r.width, r.height, 12 * L.scale) / 2)
+                let corner = min(r.width, r.height, 12 * L.scale) / 2
+                let path = CGPath(roundedRect: r, cornerWidth: corner, cornerHeight: corner, transform: nil)
+                clipOutside(path, image: L.image, in: ctx)
             }
-            ctx.addPath(path)
             ctx.setFillColor(gray: 0, alpha: 0.5)
-            ctx.fillPath(using: .evenOdd)
+            ctx.fill(L.image)
+            ctx.restoreGState()
         }
-        ctx.restoreGState()
         for m in marks where m.kind != .redact && m.kind != .highlight { draw(m, map: map, scale: L.scale, in: ctx) }
+    }
+
+    private static func clipOutside(_ path: CGPath, image: CGRect, in ctx: CGContext) {
+        ctx.beginPath()
+        ctx.addRect(image)
+        ctx.addPath(path)
+        ctx.clip(using: .evenOdd)
     }
 
     static func rectOnCanvas(_ r: CGRect, _ map: (CGPoint) -> CGPoint) -> CGRect {
@@ -343,27 +367,96 @@ enum MarkPainter {
 
     // MARK: Redaction
 
-    private static let cache = NSCache<NSString, CGImage>()
+    struct Redaction: Hashable {
+        let rect: CGRect
+        let mode: Mark.Redaction
+        let color: RGBA?
+    }
 
-    /// Covers a region with pixels made from the source, so nothing of what was under it survives the export.
-    private static func redact(_ m: Mark, source: CGImage, map: (CGPoint) -> CGPoint, scale: CGFloat, in ctx: CGContext) {
-        let r = m.rect.integral.intersection(CGRect(x: 0, y: 0, width: source.width, height: source.height))
-        guard r.width >= 1, r.height >= 1 else { return }
-        let dest = rectOnCanvas(r, map)
-        if m.redaction == .solid {
-            ctx.setFillColor(m.color.cg)
+    private enum RedactionWork: Hashable {
+        case patch(CGRect, Mark.Redaction)
+        case crop(CGRect, [Redaction])
+    }
+
+    private final class ImageKey: NSObject {
+        // Retain the image while cached so its identity cannot be reused.
+        let source: CGImage
+        let work: RedactionWork
+
+        init(_ source: CGImage, _ work: RedactionWork) {
+            self.source = source
+            self.work = work
+        }
+
+        override var hash: Int {
+            var hasher = Hasher()
+            hasher.combine(ObjectIdentifier(source))
+            hasher.combine(work)
+            return hasher.finalize()
+        }
+
+        override func isEqual(_ object: Any?) -> Bool {
+            guard let other = object as? ImageKey else { return false }
+            return source === other.source && work == other.work
+        }
+    }
+
+    private static let cache: NSCache<ImageKey, CGImage> = {
+        let cache = NSCache<ImageKey, CGImage>()
+        cache.countLimit = 64
+        cache.totalCostLimit = 128 * 1024 * 1024
+        return cache
+    }()
+
+    private static func cachedImage(_ source: CGImage, _ work: RedactionWork, make: () -> CGImage?) -> CGImage? {
+        let key = ImageKey(source, work)
+        if let image = cache.object(forKey: key) { return image }
+        guard let image = make() else { return nil }
+        cache.setObject(image, forKey: key, cost: source.bytesPerRow * source.height + image.bytesPerRow * image.height)
+        return image
+    }
+
+    static func redactions(_ marks: [Mark], in crop: CGRect, source: CGImage) -> [Redaction] {
+        let bounds = crop.intersection(CGRect(x: 0, y: 0, width: source.width, height: source.height))
+        return marks.compactMap { mark in
+            guard mark.kind == .redact, !mark.rect.isEmpty else { return nil }
+            let rect = mark.rect.integral.intersection(bounds)
+            guard !rect.isEmpty else { return nil }
+            return Redaction(rect: rect, mode: mark.redaction, color: mark.redaction == .solid ? mark.color.alpha(1) : nil)
+        }
+    }
+
+    static func redactedCrop(_ cropped: CGImage, source: CGImage, bounds: CGRect, redactions: [Redaction]) -> CGImage? {
+        guard !redactions.isEmpty else { return cropped }
+        return cachedImage(source, .crop(bounds, redactions)) {
+            guard let ctx = CGContext(data: nil, width: cropped.width, height: cropped.height, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            else { return nil }
+            ctx.translateBy(x: -bounds.minX, y: bounds.maxY)
+            ctx.scaleBy(x: 1, y: -1)
+            ctx.interpolationQuality = .none
+            PolishRenderer.drawImage(cropped, in: bounds, ctx: ctx)
+            for mask in redactions { paint(mask, source: source, in: mask.rect, ctx: ctx) }
+            return ctx.makeImage()
+        }
+    }
+
+    private static func paint(_ mask: Redaction, source: CGImage, in dest: CGRect, ctx: CGContext) {
+        if let color = mask.color {
+            ctx.setFillColor(color.cg)
             ctx.fill(dest)
             return
         }
-        let key = "\(m.redaction.rawValue) \(r) \(ObjectIdentifier(source))" as NSString
-        let img = cache.object(forKey: key) ?? {
-            let made = redacted(source, r, m.redaction)
-            if let made { cache.setObject(made, forKey: key) }
-            return made
-        }()
-        guard let img else { ctx.setFillColor(gray: 0.2, alpha: 1); ctx.fill(dest); return }
+        // Sample only whole source pixels inside the crop, even on a fractional edge.
+        let x = ceil(mask.rect.minX), y = ceil(mask.rect.minY)
+        let r = CGRect(x: x, y: y, width: max(0, floor(mask.rect.maxX) - x), height: max(0, floor(mask.rect.maxY) - y))
+        guard !r.isEmpty, let img = cachedImage(source, .patch(r, mask.mode), make: { redacted(source, r, mask.mode) }) else {
+            ctx.setFillColor(gray: 0.2, alpha: 1)
+            ctx.fill(dest)
+            return
+        }
         ctx.saveGState()
-        ctx.interpolationQuality = m.redaction == .pixelate ? .none : .high
+        ctx.interpolationQuality = mask.mode == .pixelate ? .none : .high
         PolishRenderer.drawImage(img, in: dest, ctx: ctx)
         ctx.restoreGState()
     }
@@ -378,15 +471,20 @@ enum MarkPainter {
             let block = max(10, min(r.width, r.height) / 2)
             let w = max(1, Int((r.width / block).rounded(.up))), h = max(1, Int((r.height / block).rounded(.up)))
             guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
-                                      space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                                      space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
             else { return nil }
             ctx.interpolationQuality = .medium
-            ctx.draw(crop, in: CGRect(x: 0, y: 0, width: w, height: h))
+            let dest = CGRect(x: 0, y: 0, width: w, height: h)
+            // An opaque matte stops the original from showing through the patch.
+            ctx.setFillColor(gray: 0.2, alpha: 1)
+            ctx.fill(dest)
+            ctx.draw(crop, in: dest)
             return ctx.makeImage()
         case .blur:
             let img = CIImage(cgImage: crop)
             let sigma = max(8, min(r.width, r.height) * 0.45)
-            let out = img.clampedToExtent().applyingGaussianBlur(sigma: sigma).cropped(to: img.extent)
+            let matte = CIImage(color: CIColor(red: 0.2, green: 0.2, blue: 0.2))
+            let out = img.clampedToExtent().applyingGaussianBlur(sigma: sigma).composited(over: matte).cropped(to: img.extent)
             return PolishRenderer.ci.createCGImage(out, from: img.extent)
         }
     }

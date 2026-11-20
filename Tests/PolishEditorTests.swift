@@ -169,8 +169,11 @@ private func editorExports(_ dir: URL) throws {
 private func editorHandoffIsolation() throws {
     let fm = FileManager.default
     let root = PolishHandoffs.root
-    func makeFolder(pid: pid_t? = nil, age: TimeInterval) throws -> URL {
-        let name = (pid.map { "\($0)-" } ?? "") + UUID().uuidString
+    let defaults = UserDefaults.standard
+    let previous = defaults.object(forKey: "polish.folder")
+    defer { defaults.set(previous, forKey: "polish.folder") }
+    func makeFolder(pid: pid_t? = nil, name: String = UUID().uuidString, age: TimeInterval) throws -> URL {
+        let name = (pid.map { "\($0)-" } ?? "") + name
         let folder = root.appendingPathComponent(name, isDirectory: true)
         try fm.createDirectory(at: folder, withIntermediateDirectories: true)
         let file = folder.appendingPathComponent("handoff.png")
@@ -183,14 +186,31 @@ private func editorHandoffIsolation() throws {
     let stale = try makeFolder(pid: Int32.max, age: 3601)
     let legacy = try makeFolder(age: 3601)
     let youngLegacy = try makeFolder(age: 0)
+    let project = try makeFolder(name: "Project exports", age: 3601)
+    let protected = try makeFolder(age: 3601)
+    let protectedFolder = protected.deletingLastPathComponent()
+    let saveFolder = protectedFolder.appendingPathComponent("Chosen save folder")
+    try fm.createDirectory(at: saveFolder, withIntermediateDirectories: false)
+    let savedPNG = saveFolder.appendingPathComponent("project polished.png")
+    try editorPNG(editorImage()).write(to: savedPNG)
+    try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-3601)], ofItemAtPath: protectedFolder.path)
+    defaults.set(saveFolder.path, forKey: "polish.folder")
     defer {
-        for file in [live, young, stale, legacy, youngLegacy] { try? fm.removeItem(at: file.deletingLastPathComponent()) }
+        for file in [live, young, stale, legacy, youngLegacy, project, protected] {
+            try? fm.removeItem(at: file.deletingLastPathComponent())
+        }
     }
     let own = try PolishHandoffs.write(Data([2]), name: "mine.png")
     check(fm.fileExists(atPath: live.path) && fm.fileExists(atPath: young.path) && !fm.fileExists(atPath: stale.path),
           "handoff startup removes only expired files from dead processes")
     check(!fm.fileExists(atPath: legacy.path) && fm.fileExists(atPath: youngLegacy.path),
           "handoff startup removes only expired legacy folders")
+    check(fm.fileExists(atPath: project.path), "handoff cleanup keeps aged Project exports")
+    check(fm.fileExists(atPath: savedPNG.path), "handoff cleanup keeps an aged UUID folder containing the save location")
+    defaults.set(own.deletingLastPathComponent().path, forKey: "polish.folder")
+    PolishHandoffs.clear()
+    check(fm.fileExists(atPath: own.path), "handoff quit preserves the current save location")
+    defaults.set(saveFolder.path, forKey: "polish.folder")
     PolishHandoffs.clear()
     check(!fm.fileExists(atPath: own.path) && fm.fileExists(atPath: live.path) && fm.fileExists(atPath: young.path),
           "handoff quit clears only this launch's files")
@@ -475,6 +495,15 @@ func polishEditorInteractions(_ model: PolishModel, _ canvas: PolishCanvas, _ wi
     click(83, 184)
     check(model.selection == mask.id, "redaction tolerance still applies when nothing was hit directly")
 
+    var underArrow = Mark(.rect, [CGPoint(x: 240, y: 110), CGPoint(x: 320, y: 180)])
+    underArrow.fill = .fill
+    var arrow = Mark(.arrow, [CGPoint(x: 180, y: 150), CGPoint(x: 300, y: 150)])
+    arrow.width = 10
+    model.doc.marks = [underArrow, arrow]
+    model.selection = nil
+    click(270, 162)
+    check(model.selection == arrow.id, "clicking the painted arrowhead selects it over the box")
+
     model.doc.marks = []
     model.tool = .rect
     model.history = DocHistory()
@@ -742,7 +771,9 @@ private func editorScreenshotLookupChecks(_ app: AppDelegate, _ dir: URL) throws
     Prefs.set("screenshots", true)
     app.syncScreenshots()
     app.screenshotClipboardChangeCount = { board.changeCount }
+    var copiedShots: [String] = []
     app.putOnClipboard = { clip in
+        copiedShots.append(clip.text)
         board.clearContents()
         return board.setString(clip.text, forType: .string) ? board.changeCount : nil
     }
@@ -789,6 +820,26 @@ private func editorScreenshotLookupChecks(_ app: AppDelegate, _ dir: URL) throws
         app.syncScreenshots()
     }
     check(!replaced && board.string(forType: .string) == "keep this", "a replaced watcher drops its in-flight screenshot")
+
+    let first = dir.appendingPathComponent("burst first.png"), second = dir.appendingPathComponent("burst second.png")
+    try png.write(to: first)
+    let firstLookup = DispatchSemaphore(value: 0), resumeFirst = DispatchSemaphore(value: 0)
+    app.polishedFileAt = { candidate in
+        if candidate == first { firstLookup.signal(); _ = resumeFirst.wait(timeout: .now() + 4) }
+        return read(candidate)
+    }
+    copiedShots.removeAll()
+    app.screenshotAdded(first, at: Date())
+    let firstBlocked = firstLookup.wait(timeout: .now() + 2) == .success
+    editorPump(0.12)
+    try png.write(to: second)
+    app.screenshotAdded(second, at: Date())
+    resumeFirst.signal()
+    check(firstBlocked && editorUntil {
+        [first, second].allSatisfy { app.model.db.clip(hash: "f:" + sha($0.path))?.source == "Screenshot" }
+    } && copiedShots == [first.path, second.path] && board.string(forType: .string) == second.path,
+          "screenshots 120 ms apart copy in arrival order and leave the newest on the clipboard")
+
     let recorded = try lookup("clipboard advanced") {
         board.clearContents()
         board.setString("newer copy", forType: .string)

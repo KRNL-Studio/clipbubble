@@ -149,6 +149,20 @@ func polishTests() {
     // Marks: hit testing, moves and the Shift snaps.
     let line = Mark(.line, [CGPoint(x: 0, y: 0), CGPoint(x: 100, y: 0)])
     check(line.hit(CGPoint(x: 50, y: 3), slop: 4) && !line.hit(CGPoint(x: 50, y: 20), slop: 4), "a line is hit near it, not far off")
+    var wideArrow = Mark(.arrow, [CGPoint(x: 40, y: 80), CGPoint(x: 140, y: 80)])
+    wideArrow.width = 10
+    check(wideArrow.hit(CGPoint(x: 110, y: 92), slop: 0) && !wideArrow.hit(CGPoint(x: 110, y: 99), slop: 0),
+          "a direct hit includes the painted arrowhead wing")
+    wideArrow.doubleHead = true
+    check(wideArrow.hit(CGPoint(x: 70, y: 92), slop: 0), "a direct hit includes the second arrowhead")
+    wideArrow.points.append(CGPoint(x: 90, y: 105))
+    check(wideArrow.hit(CGPoint(x: 127.3, y: 109.7), slop: 0), "a bent arrowhead follows the painted tangent")
+    var narrowArrow = Mark(.arrow, Array(wideArrow.points.prefix(2)))
+    narrowArrow.width = 2
+    let arrowDoc = PolishDoc(source: url, size: CGSize(width: 400, height: 200), style: PolishPreset.builtIn[0].style)
+    let zoomedOut = PolishLayout(doc: arrowDoc, scale: 0.5)
+    check(narrowArrow.hit(CGPoint(x: 124, y: 86.5), slop: 0, in: (zoomedOut, arrowDoc.crop)),
+          "arrowhead hit testing uses the zoomed-out minimum head size")
     let frame = Mark(.rect, [CGPoint(x: 0, y: 0), CGPoint(x: 100, y: 100)])
     check(frame.hit(CGPoint(x: 1, y: 50), slop: 4) && !frame.hit(CGPoint(x: 50, y: 50), slop: 4), "an empty box is grabbed by its edge")
     var filled = frame; filled.fill = .fill

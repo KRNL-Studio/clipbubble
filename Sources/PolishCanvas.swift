@@ -550,7 +550,7 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
         func hitInPaintOrder(slop: CGFloat) -> Mark? {
             marks.last { $0.kind == .redact && $0.redaction == .solid && $0.hit(p, slop: slop) }
                 ?? marks.last { $0.kind == .redact && $0.redaction != .solid && $0.hit(p, slop: slop) }
-                ?? marks.last { $0.kind != .redact && $0.kind != .highlight && $0.hit(p, slop: slop) }
+                ?? marks.last { $0.kind != .redact && $0.kind != .highlight && $0.hit(p, slop: slop, in: (g.layout, g.crop)) }
                 ?? marks.last { $0.kind == .highlight && $0.hit(p, slop: slop) }
         }
         let hit = hitInPaintOrder(slop: 0) ?? hitInPaintOrder(slop: 6 / g.layout.scale)

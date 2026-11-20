@@ -118,13 +118,20 @@ struct Mark: Codable, Equatable, Identifiable {
     var bounds: CGRect { unrotatedBounds.applying(rotationTransform) }
 
     /// Whether a click at `p` lands on this mark. `slop` is how far off it can be, in source pixels.
-    func hit(_ point: CGPoint, slop: CGFloat) -> Bool {
+    func hit(_ point: CGPoint, slop: CGFloat, in canvas: (layout: PolishLayout, crop: CGRect)? = nil) -> Bool {
         let p = rotation == 0 ? point : point.applying(rotationTransform.inverted())
         let near = slop == 0 ? width / 2 : max(slop, width)
         switch kind {
         case .redact: return !rect.isEmpty && rect.integral.insetBy(dx: -slop, dy: -slop).contains(p)
         case .line, .measure: return Mark.distance(p, a, b) <= near
         case .arrow:
+            let map: (CGPoint) -> CGPoint = { point in
+                guard let canvas else { return point }
+                return canvas.layout.toCanvas(point, crop: canvas.crop)
+            }
+            let headPoint = map(p)
+            if let arrow = ArrowGeometry(self, map: map, width: width * (canvas?.layout.scale ?? 1)),
+               arrow.endHead.contains(headPoint) || arrow.startHead?.contains(headPoint) == true { return true }
             guard let c = bend else { return Mark.distance(p, a, b) <= near }
             let pts = Mark.curve(a, c, b)
             return pts.indices.dropLast().contains { Mark.distance(p, pts[$0], pts[$0 + 1]) <= near }
@@ -201,6 +208,47 @@ struct Mark: Codable, Equatable, Identifiable {
         return [out[0]] + (1..<(out.count - 1)).map { i in
             CGPoint(x: (out[i - 1].x + out[i].x * 2 + out[i + 1].x) / 4, y: (out[i - 1].y + out[i].y * 2 + out[i + 1].y) / 4)
         } + [out.last!]
+    }
+}
+
+/// Shared by the painter and hit-testing so the arrowheads match at any zoom.
+private struct ArrowGeometry {
+    let control: CGPoint?
+    let shaftStart: CGPoint
+    let shaftEnd: CGPoint
+    let startHead: CGPath?
+    let endHead: CGPath
+
+    init?(_ mark: Mark, map: (CGPoint) -> CGPoint, width: CGFloat) {
+        let a = map(mark.a), b = map(mark.b)
+        let len = hypot(b.x - a.x, b.y - a.y)
+        guard len > 0.5 else { return nil }
+        let head = min(max(width * 3.6, 10), len * 0.6)
+        let k = mark.bend.map { Mark.control(a, map($0), b) }
+        control = k
+        // The head points along the curve's direction at each end.
+        let inEnd = k ?? a, inStart = k ?? b
+        let endAngle = atan2(b.y - inEnd.y, b.x - inEnd.x), startAngle = atan2(a.y - inStart.y, a.x - inStart.x)
+        // Stop the shaft inside the head, so its round cap doesn't poke out of the tip.
+        let back = head * 0.6
+        shaftEnd = CGPoint(x: b.x - cos(endAngle) * back, y: b.y - sin(endAngle) * back)
+        shaftStart = mark.doubleHead ? CGPoint(x: a.x - cos(startAngle) * back, y: a.y - sin(startAngle) * back) : a
+        endHead = Self.head(at: b, angle: endAngle, size: head)
+        startHead = mark.doubleHead ? Self.head(at: a, angle: startAngle, size: head) : nil
+    }
+
+    private static func head(at tip: CGPoint, angle: CGFloat, size: CGFloat) -> CGPath {
+        let spread: CGFloat = 0.45
+        let p1 = CGPoint(x: tip.x - cos(angle - spread) * size, y: tip.y - sin(angle - spread) * size)
+        let p2 = CGPoint(x: tip.x - cos(angle + spread) * size, y: tip.y - sin(angle + spread) * size)
+        let notch = CGPoint(x: tip.x - cos(angle) * size * 0.78, y: tip.y - sin(angle) * size * 0.78)
+        let path = CGMutablePath()
+        path.move(to: tip)
+        path.addLine(to: p1)
+        path.addLine(to: notch)
+        path.addLine(to: p2)
+        path.closeSubpath()
+        return path
     }
 }
 
@@ -349,33 +397,16 @@ enum MarkPainter {
     }
 
     private static func arrow(_ m: Mark, map: (CGPoint) -> CGPoint, w: CGFloat, in ctx: CGContext) {
-        let a = map(m.a), b = map(m.b)
-        let len = hypot(b.x - a.x, b.y - a.y)
-        guard len > 0.5 else { return }
-        let head = min(max(w * 3.6, 10), len * 0.6)
-        let k = m.bend.map { Mark.control(a, map($0), b) }
-        // The head points along the curve's direction at each end.
-        let inEnd = k ?? a, inStart = k ?? b
-        let endAngle = atan2(b.y - inEnd.y, b.x - inEnd.x), startAngle = atan2(a.y - inStart.y, a.x - inStart.x)
-        // Stop the shaft inside the head, so its round cap doesn't poke out of the tip.
-        let back = head * 0.6
-        let shaftEnd = CGPoint(x: b.x - cos(endAngle) * back, y: b.y - sin(endAngle) * back)
-        let shaftStart = m.doubleHead ? CGPoint(x: a.x - cos(startAngle) * back, y: a.y - sin(startAngle) * back) : a
-        ctx.move(to: shaftStart)
-        if let k { ctx.addQuadCurve(to: shaftEnd, control: k) } else { ctx.addLine(to: shaftEnd) }
+        guard let arrow = ArrowGeometry(m, map: map, width: w) else { return }
+        ctx.move(to: arrow.shaftStart)
+        if let k = arrow.control { ctx.addQuadCurve(to: arrow.shaftEnd, control: k) } else { ctx.addLine(to: arrow.shaftEnd) }
         ctx.strokePath()
-        arrowHead(at: b, angle: endAngle, size: head, in: ctx)
-        if m.doubleHead { arrowHead(at: a, angle: startAngle, size: head, in: ctx) }
-    }
-
-    private static func arrowHead(at tip: CGPoint, angle: CGFloat, size: CGFloat, in ctx: CGContext) {
-        let spread: CGFloat = 0.45
-        let p1 = CGPoint(x: tip.x - cos(angle - spread) * size, y: tip.y - sin(angle - spread) * size)
-        let p2 = CGPoint(x: tip.x - cos(angle + spread) * size, y: tip.y - sin(angle + spread) * size)
-        // A slight notch in the back of the head reads as an arrow, not a triangle.
-        let notch = CGPoint(x: tip.x - cos(angle) * size * 0.78, y: tip.y - sin(angle) * size * 0.78)
-        ctx.move(to: tip); ctx.addLine(to: p1); ctx.addLine(to: notch); ctx.addLine(to: p2); ctx.closePath()
+        ctx.addPath(arrow.endHead)
         ctx.fillPath()
+        if let head = arrow.startHead {
+            ctx.addPath(head)
+            ctx.fillPath()
+        }
     }
 
     private static func measure(_ m: Mark, map: (CGPoint) -> CGPoint, s: CGFloat, in ctx: CGContext) {

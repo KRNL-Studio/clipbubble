@@ -486,7 +486,21 @@ enum PolishHandoffs {
 
     static func prepare() { _ = startup }
 
-    static func clear() { try? FileManager.default.removeItem(at: directory) }
+    static func clear() { removeHandoff(directory) }
+
+    private static func removeHandoff(_ folder: URL) {
+        if let path = UserDefaults.standard.string(forKey: "polish.folder"), !path.isEmpty {
+            let destination = URL(fileURLWithPath: path, isDirectory: true)
+            func containsSaveFolder(_ parent: URL, _ child: URL) -> Bool {
+                child.standardizedFileURL.pathComponents.starts(with: parent.standardizedFileURL.pathComponents) {
+                    $0.caseInsensitiveCompare($1) == .orderedSame
+                }
+            }
+            if containsSaveFolder(folder, destination) ||
+                containsSaveFolder(folder.resolvingSymlinksInPath(), destination.resolvingSymlinksInPath()) { return }
+        }
+        try? FileManager.default.removeItem(at: folder)
+    }
 
     private static func removeExpiredProcesses() {
         let fm = FileManager.default
@@ -500,9 +514,10 @@ enum PolishHandoffs {
             if name.count == 2, let pid = pid_t(name[0]), pid > 0, String(pid) == name[0],
                UUID(uuidString: String(name[1])) != nil {
                 guard kill(pid, 0) == -1, errno == ESRCH else { continue }
+            } else if UUID(uuidString: entry.lastPathComponent) == nil {
+                continue
             }
-            // Older versions put individual handoffs here without a process prefix.
-            try? fm.removeItem(at: entry)
+            removeHandoff(entry)
         }
     }
 
@@ -515,7 +530,7 @@ enum PolishHandoffs {
         let entries = try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey])
         for entry in entries {
             if let date = try? entry.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate, date < stale {
-                try? fm.removeItem(at: entry)
+                removeHandoff(entry)
             }
         }
 
@@ -529,10 +544,10 @@ enum PolishHandoffs {
             try file.write(contentsOf: data)
             try file.close()
         } catch {
-            try? fm.removeItem(at: folder)
+            removeHandoff(folder)
             throw error
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + lifetime) { try? fm.removeItem(at: folder) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + lifetime) { removeHandoff(folder) }
         return url
     }
 }

@@ -817,6 +817,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setUpWindows()
         startServices()
         guard launch?.eventClass == AEEventClass(kCoreEventClass), launch?.eventID == AEEventID(kAEOpenApplication),
+              launch?.paramDescriptor(forKeyword: AEKeyword(keyAEPropData))?.enumCodeValue != OSType(keyAELaunchedAsLogInItem),
               launch?.paramDescriptor(forKeyword: AEKeyword(keyAELaunchedAsLogInItem)) == nil,
               !CommandLine.arguments.contains(Updater.relaunchArgument) else { return }
         DispatchQueue.main.async { [weak self] in
@@ -875,12 +876,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.pickClip = { [weak self] c, paste in self?.pick(c, paste: paste) ?? false }
         model.hoverChanged = { [weak self] in self?.updatePeek() }
         model.bubbleModeChanged = { [weak self] in self?.bubbleModeChanged() }
-        model.openApp = { [weak self] page in
-            guard let self else { return }
-            self.resumePanel = self.panel.isVisible
-            self.hidePanel()
-            self.appWindow.show(page)
-        }
+        model.openApp = { [weak self] page in self?.openAppWindow(page) }
         model.historyChanged = { [weak self] in self?.appWindow.historyChanged() }
         view.onMenu = { [weak self] in self?.bubbleMenu() ?? NSMenu() }
     }
@@ -1227,9 +1223,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Opening ClipBubble again, from Finder, Spotlight or the Dock, opens its window. The panel stays on its shortcut.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        hidePanel()
-        appWindow.show()
+        openAppWindow()
         return false
+    }
+
+    private func openAppWindow(_ page: AppPage? = nil) {
+        // A click on the Dock or Finder may already have dismissed the panel.
+        resumePanel = true
+        hidePanel()
+        appWindow.show(page)
     }
 
     /// Right-clicking the bubble.
@@ -1237,7 +1239,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let m = NSMenu()
         let items: [(String, AppPage?)] = [("Open ClipBubble", .history), ("Settings…", .general)]
         for (title, page) in items {
-            let i = MenuAction.item(title) { [weak self] in self?.hidePanel(); self?.appWindow.show(page) }
+            let i = MenuAction.item(title) { [weak self] in self?.openAppWindow(page) }
             m.addItem(i)
         }
         m.addItem(.separator())

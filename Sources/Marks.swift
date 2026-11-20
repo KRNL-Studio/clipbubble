@@ -173,9 +173,15 @@ struct Mark: Codable, Equatable, Identifiable {
     /// A curve through `c` (not just pulled toward it), sampled for hit testing.
     static func curve(_ a: CGPoint, _ c: CGPoint, _ b: CGPoint, steps: Int = 24) -> [CGPoint] {
         let k = control(a, c, b)
-        return (0...steps).map { i in
-            let t = CGFloat(i) / CGFloat(steps), u = 1 - t
-            return CGPoint(x: u * u * a.x + 2 * u * t * k.x + t * t * b.x, y: u * u * a.y + 2 * u * t * k.y + t * t * b.y)
+        return (0...steps).map { (i: Int) -> CGPoint in
+            let t: CGFloat = CGFloat(i) / CGFloat(steps)
+            let u: CGFloat = 1 - t
+            let startWeight: CGFloat = u * u
+            let controlWeight: CGFloat = 2 * u * t
+            let endWeight: CGFloat = t * t
+            let x: CGFloat = startWeight * a.x + controlWeight * k.x + endWeight * b.x
+            let y: CGFloat = startWeight * a.y + controlWeight * k.y + endWeight * b.y
+            return CGPoint(x: x, y: y)
         }
     }
 
@@ -205,9 +211,15 @@ struct Mark: Codable, Equatable, Identifiable {
         if out.last != pts.last { out.append(pts.last!) }
         // One pass of neighbour averaging takes the jitter out of a trackpad stroke.
         guard out.count > 2 else { return out }
-        return [out[0]] + (1..<(out.count - 1)).map { i in
-            CGPoint(x: (out[i - 1].x + out[i].x * 2 + out[i + 1].x) / 4, y: (out[i - 1].y + out[i].y * 2 + out[i + 1].y) / 4)
-        } + [out.last!]
+        var smoothed = [out[0]]
+        for i in 1..<(out.count - 1) {
+            let previous = out[i - 1], current = out[i], next = out[i + 1]
+            let x: CGFloat = (previous.x + current.x * 2 + next.x) / 4
+            let y: CGFloat = (previous.y + current.y * 2 + next.y) / 4
+            smoothed.append(CGPoint(x: x, y: y))
+        }
+        smoothed.append(out.last!)
+        return smoothed
     }
 }
 

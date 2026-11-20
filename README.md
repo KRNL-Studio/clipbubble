@@ -27,7 +27,8 @@
 
 - **A floating bubble with a pet.** It stays translucent in a screen corner until you need it. Drag it anywhere and it magnet-snaps to the nearest corner. When it catches a copy, the mascot hops and a badge counts up. Rather not see it all day? On Mac and Windows, switch on **Hide bubble until needed** in Settings: it stays out of sight until you copy something or press <kbd>⌃⌥B</kbd>, and leaves again after a few idle seconds.
 - **Remembers 7 days of everything.** Text, images, files, **every screenshot** (even the ones you never copied), **recent downloads**, and copies from your iPhone through Universal Clipboard.
-- **You choose what shows up.** Settings (⚙ in the panel) has a switch for each kind. Off means it isn't saved and is hidden everywhere, your agents included.
+- **A real window when you want one.** Open ClipBubble from Finder, Spotlight or the Dock, click ⚙ in the panel, or right-click the bubble. It shows your whole history as cards you can search, filter, copy, open or send, and every setting, with ClipBubble in the Dock only while it's open. When macOS starts ClipBubble at login, it runs in the background.
+- **You choose what shows up.** Settings → **Capture** has a switch for each kind. Off means it isn't saved and is hidden everywhere, your agents included.
 - **Paste without hunting.** Press <kbd>⌃⌥V</kbd> anywhere, type to search, and press <kbd>↩</kbd>: it pastes straight into the app you were in. Or drag any item out into Slack, Figma or a browser upload.
 - **Hover to peek** at your last three copies; one click pastes.
 - **Built-in MCP server.** Claude Code, Codex, Cursor and Claude Desktop can read your clipboard history (and actually see the images), put things on your clipboard, and design new mascots for you.
@@ -45,9 +46,9 @@ git clone https://github.com/rohit3a/clipbubble && cd clipbubble && ./build.sh
 
 `build.sh` compiles the app, installs it to `~/Applications` and launches it. Requires macOS 14 or later.
 
-**Updates:** ClipBubble checks GitHub for a new version every few hours. When there is one, a dot appears on ⚙, and **Settings → General → Update** installs it and reopens the app. `ClipBubble --update` does the same from a terminal.
+**Updates:** ClipBubble checks GitHub for a new version every few hours. When there is one, a dot appears on ⚙, and **Settings → General → Update** (on a Mac, in the ClipBubble window) installs it and reopens the app. `ClipBubble --update` does the same from a terminal.
 
-**Permissions:** Settings (⚙ in the panel) → **Folders & permissions** shows each one live, with a switch and a **Fix** button that opens the right page in System Settings:
+**Permissions:** the **Capture** and **Screenshots** pages of the ClipBubble window show each one live, with a switch and a **Fix** button that opens the right page in System Settings:
 - **Screenshots:** ClipBubble watches the folder from your macOS screenshot setting (⌘⇧5 → Options → Save to), and notices when you change it. You can also pick a different folder.
 - **Recent downloads:** your Downloads folder.
 - **Auto-paste:** needs Accessibility access. Without it (or with it switched off), picking an item just copies it.
@@ -148,7 +149,7 @@ Settings → Sync over SSH lists the hosts in your `~/.ssh/config`, with a switc
   <img src="Assets/press/mascot-robot-idle.png" width="64">
 </p>
 
-The blob family blinks, wiggles when you hover, squishes when you click and grins when it catches a copy. Switch mascots from the ⚙ menu in the panel, or add your own image (PNG, GIF, JPG or SVG; GIFs play while you interact with it).
+The blob family blinks, wiggles when you hover, squishes when you click and grins when it catches a copy. Switch mascots on the **Mascot** page of the ClipBubble window (Settings on Windows), or add your own image (PNG, GIF, JPG or SVG; GIFs play while you interact with it).
 
 Custom mascots are small JSON files in `~/Library/Application Support/ClipBubble/mascots/`:
 
@@ -162,7 +163,7 @@ Custom mascots are small JSON files in `~/Library/Application Support/ClipBubble
 
 ## MCP for AI agents
 
-The app binary doubles as a stdio MCP server. The easiest way to connect an agent: open the panel, click ⚙ → **AI agents (MCP)** → **Copy setup prompt**, and paste it into Claude Code, Codex, Cursor or any other agent. It registers ClipBubble itself, using the exact path of your copy of the app, and checks that it works.
+The app binary doubles as a stdio MCP server. The easiest way to connect an agent: open the ClipBubble window → **AI Agents** → **Copy setup prompt** (on Windows, ⚙ → **AI agents (MCP)**), and paste it into Claude Code, Codex, Cursor or any other agent. It registers ClipBubble itself, using the exact path of your copy of the app, and checks that it works.
 
 Or register it by hand (adjust the path if the app is in `/Applications`):
 

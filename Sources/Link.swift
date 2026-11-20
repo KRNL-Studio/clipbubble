@@ -765,8 +765,7 @@ final class Session {
 
     func start(hello: Hello, summary: [Stamp]) {
         input.readabilityHandler = { [weak self] h in
-            let d = h.availableData
-            guard let self else { return }
+            guard let self, let d = self.readReady(h) else { return }
             self.engine.queue.async {
                 guard !self.closed else { return }
                 if d.isEmpty { self.close(); return }
@@ -777,6 +776,19 @@ final class Session {
         }
         send(.hello(hello))
         send(.summary(summary))
+    }
+
+    private func readReady(_ handle: FileHandle) -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed else { return nil }
+        // Read once: FileHandle's throwing read can wait to fill the buffer, and availableData raises on error.
+        var data = Data(count: 64 * 1024)
+        let n = data.withUnsafeMutableBytes { read(handle.fileDescriptor, $0.baseAddress, $0.count) }
+        if n < 0, errno == EINTR || errno == EAGAIN { return nil }
+        if n <= 0 { return Data() }
+        data.count = n
+        return data
     }
 
     /// Seconds since anything arrived, not counting sleep. Read on the engine's queue.

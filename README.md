@@ -27,7 +27,7 @@
 
 - **A floating bubble with a pet.** It stays translucent in a screen corner until you need it. Drag it anywhere and it magnet-snaps to the nearest corner. When it catches a copy, the mascot hops and a badge counts up. Rather not see it all day? On Mac and Windows, switch on **Hide bubble until needed** in Settings: it stays out of sight until you copy something or press <kbd>⌃⌥B</kbd>, and leaves again after a few idle seconds.
 - **Remembers 7 days of everything.** Text, images, files, **every screenshot** (even the ones you never copied), **recent downloads**, and copies from your iPhone through Universal Clipboard.
-- **A real window when you want one.** Open ClipBubble again from Finder or Spotlight, click ⚙ in the panel, or right-click the bubble. It shows your whole history as cards you can search, filter, copy, open or send, and every setting, with ClipBubble in the Dock only while it's open.
+- **A real window when you want one.** Open ClipBubble from Finder, Spotlight or the Dock, click ⚙ in the panel, or right-click the bubble. It shows your whole history as cards you can search, filter, copy, open or send, and every setting, with ClipBubble in the Dock only while it's open. When macOS starts ClipBubble at login, it runs in the background.
 - **You choose what shows up.** Settings → **Capture** has a switch for each kind. Off means it isn't saved and is hidden everywhere, your agents included.
 - **Paste without hunting.** Press <kbd>⌃⌥V</kbd> anywhere, type to search, and press <kbd>↩</kbd>: it pastes straight into the app you were in. Or drag any item out into Slack, Figma or a browser upload.
 - **Hover to peek** at your last three copies; one click pastes.

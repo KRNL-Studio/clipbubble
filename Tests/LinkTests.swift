@@ -116,6 +116,28 @@ private func receivedFileTests() {
     db.delete(hash: "f:" + sha(original.path))
 }
 
+private func sessionCloseTests() {
+    let engine = SyncEngine.shared
+    let hello = Hello(proto: Sync.proto, device: "probe", name: "Probe", os: "macos", version: "test", clock: 0)
+
+    let input = Pipe(), output = Pipe()
+    let session = Session(input: input.fileHandleForReading, output: output.fileHandleForWriting, engine: engine)
+    engine.queue.sync { session.start(hello: hello, summary: []) }
+    let queuedRead = input.fileHandleForReading.readabilityHandler
+    engine.queue.sync { session.close() }
+    // A callback already in flight can still be invoked after close removes the handler.
+    queuedRead?(input.fileHandleForReading)
+    check(queuedRead != nil && engine.queue.sync { session.closed }, "a queued read after close leaves the session closed")
+
+    let otherInput = Pipe(), broken = Pipe()
+    try? broken.fileHandleForReading.close()
+    let disconnected = Session(input: otherInput.fileHandleForReading, output: broken.fileHandleForWriting, engine: engine)
+    let closed = DispatchSemaphore(value: 0)
+    disconnected.onClose = { closed.signal() }
+    engine.queue.sync { disconnected.start(hello: hello, summary: []) }
+    check(closed.wait(timeout: .now() + 3) == .success, "a broken output pipe ends the session")
+}
+
 func linkTests() {
     check(safeFileName("../../.ssh/authorized_keys") == "_.._.ssh_authorized_keys", "names can't climb out of their folder")
     check(safeFileName("...hidden") == "hidden", "names can't hide")
@@ -123,6 +145,7 @@ func linkTests() {
     let long = String(repeating: "shot (2) ", count: 30) + "end.png"
     check(safeFileName(long).count == 200 && safeFileName(long).hasSuffix(".png"), "a long name is cut before its extension")
     receivedFileTests()
+    sessionCloseTests()
 
     let peerHome = testHome.appendingPathComponent("peer")
     try? FileManager.default.createDirectory(at: peerHome, withIntermediateDirectories: true)

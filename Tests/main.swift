@@ -35,6 +35,7 @@ updaterTests()
 syncBadgeTests()
 shortcutTests()
 bubbleTests()
+windowTests()
 
 try? FileManager.default.removeItem(at: testHome)
 print("\(ran) checks, \(failures) failed")

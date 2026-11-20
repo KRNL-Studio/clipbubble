@@ -274,6 +274,7 @@ struct IdentityCheck: View {
 /// Settings → Sync over SSH → iPhone: shows a QR code for the ClipBubble iPhone app to scan, and the address and code
 /// another computer types into Add a computer.
 struct PhonePairing: View {
+    @EnvironmentObject private var nav: AppNav
     @State private var server: PairingServer?
     @State private var qr: NSImage?
     @State private var note: String?
@@ -312,6 +313,7 @@ struct PhonePairing: View {
         }
         .padding(.vertical, 5)
         .onAppear { phones = AuthorizedKeys.phones() }
+        .onReceive(nav.windowVisibility) { if !$0 { stop() } }
         .onDisappear(perform: stop)
     }
 
@@ -608,6 +610,7 @@ struct GeneralPage: View {
 
 struct CapturePage: View {
     @ObservedObject var model: Model
+    @EnvironmentObject private var nav: AppNav
     @StateObject private var access = Access()
     @State private var autoPaste = UserDefaults.standard.object(forKey: "autoPaste") as? Bool ?? true
 
@@ -630,7 +633,7 @@ struct CapturePage: View {
                               ok: autoPaste ? access.accessibility : nil, isOn: $autoPaste, fix: Access.openAccessibilitySettings) { EmptyView() }
             }
         }
-        .onAppear { access.start() }
+        .onReceive(nav.windowVisibility) { $0 ? access.start() : access.stop() }
         .onDisappear { access.stop() }
         .onChange(of: model.prefsTick) { access.refresh() }
         .onChange(of: autoPaste) { _, on in
@@ -656,6 +659,7 @@ struct CapturePage: View {
 
 struct ScreenshotsPage: View {
     @ObservedObject var model: Model
+    @EnvironmentObject private var nav: AppNav
     @StateObject private var access = Access()
     @State private var copyShots = UserDefaults.standard.bool(forKey: "copyScreenshots")
     private var customFolder: Bool { _ = model.prefsTick; return !(UserDefaults.standard.string(forKey: "screenshotFolder") ?? "").isEmpty }
@@ -689,7 +693,7 @@ struct ScreenshotsPage: View {
                 }
             }
         }
-        .onAppear { access.start() }
+        .onReceive(nav.windowVisibility) { $0 ? access.start() : access.stop() }
         .onDisappear { access.stop() }
         .onChange(of: model.prefsTick) { access.refresh() }
         .onChange(of: copyShots) { _, on in UserDefaults.standard.set(on, forKey: "copyScreenshots") }
@@ -792,6 +796,13 @@ struct MascotPage: View {
 
 struct AgentsPage: View {
     @State private var copied = false
+    private let command = Bundle.main.executablePath ?? "ClipBubble"
+    private let args = ["--mcp"]
+
+    private func json(_ value: Any) -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) else { return nil }
+        return String(decoding: data, as: UTF8.self)
+    }
 
     var body: some View {
         SettingsPage(page: .agents) {
@@ -799,7 +810,7 @@ struct AgentsPage: View {
                 SettingRow(icon: "sparkles", tint: .purple, title: "Connect an agent",
                            detail: "Agents can search your history, see your screenshots, put things on your clipboard and design mascots.") {
                     Button {
-                        Board.writeText(MCP.setupPrompt(binary: Bundle.main.executablePath ?? ""), transient: true)
+                        Board.writeText(MCP.setupPrompt(binary: command), transient: true)
                         copied = true
                         DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { copied = false }
                     } label: {
@@ -808,8 +819,20 @@ struct AgentsPage: View {
                 }
             }
             SettingsCard(title: "For your MCP config") {
-                SettingRow(icon: "terminal", tint: .gray, title: "Command", detail: "\(Bundle.main.executablePath ?? "ClipBubble") --mcp") {
-                    Button("Copy") { Board.writeText("\(Bundle.main.executablePath ?? "") --mcp", transient: true) }.controlSize(.small)
+                SettingRow(icon: "terminal", tint: .gray, title: "Command", detail: command) {
+                    Button("Copy command") { Board.writeText(command, transient: true) }.controlSize(.small)
+                }
+                RowDivider()
+                if let arguments = json(args) {
+                    SettingRow(icon: "list.bullet", tint: .gray, title: "Args", detail: arguments) {
+                        Button("Copy args") { Board.writeText(arguments, transient: true) }.controlSize(.small)
+                    }
+                }
+                RowDivider()
+                if let config = json(["mcpServers": ["clipbubble": ["command": command, "args": args]]]) {
+                    SettingRow(icon: "curlybraces", tint: .gray, title: "Full JSON config") {
+                        Button("Copy JSON") { Board.writeText(config, transient: true) }.controlSize(.small)
+                    }
                 }
             }
         }

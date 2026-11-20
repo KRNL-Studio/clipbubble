@@ -80,9 +80,10 @@ final class ShotCard {
         schedule(after: 6)
     }
 
-    func hide() {
+    func hide(animated: Bool = true) {
         hideWork?.cancel()
         guard panel.isVisible else { return }
+        guard animated else { finishHide(); return }
         let f = panel.frame
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.18
@@ -90,11 +91,16 @@ final class ShotCard {
             panel.animator().alphaValue = 0
             panel.animator().setFrame(f.offsetBy(dx: 0, dy: -8), display: true)
         }, completionHandler: { [weak self] in
-            guard let self, self.panel.alphaValue < 0.01 else { return }
-            self.panel.orderOut(nil)
-            self.state.url = nil
-            self.onHidden()
+            guard let self, self.panel.isVisible, self.panel.alphaValue < 0.01 else { return }
+            self.finishHide()
         })
+    }
+
+    private func finishHide() {
+        panel.orderOut(nil)
+        state.url = nil
+        hovering = false
+        onHidden()
     }
 
     private func schedule(after s: Double) {

@@ -131,6 +131,7 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
     private var anim: (from: Geometry, to: Geometry, start: CFTimeInterval)?
     private var base: CGImage?, oldBase: CGImage?, fadeStart: CFTimeInterval = 0
     private var baseKey: BaseKey?, wantedKey: BaseKey?
+    private var baseWork: DispatchWorkItem?
     private var generation = 0
     private var link: CADisplayLink?
     private var last: (style: PolishStyle, crop: CGRect, tool: PolishTool, zoom: CGFloat, pan: CGPoint)?
@@ -141,14 +142,15 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
     private enum Handle: Equatable { case point(Int), box(Int, Int) }
     private enum Drag {
         case none
-        case create(UUID, CGPoint)
+        case create(Mark, CGPoint)
         case move(UUID, CGPoint)
-        case handle(UUID, Handle)
+        case handle(UUID, Handle, CGRect)
         case pan(CGPoint)
-        case cropNew(CGPoint), cropMove(CGPoint), cropHandle(Int, Int)
+        case cropNew(CGPoint), cropMove(CGPoint), cropHandle(Int, Int, CGRect)
     }
     private var drag = Drag.none
     private var recorded = false
+    private var creationBefore: PolishDoc?
 
     // In-place text editing.
     private var editor: NSTextView?
@@ -221,31 +223,60 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
 
     // MARK: Base image
 
-    private func requestBase() {
-        guard let m = model, let t = target() else { return }
+    private func currentBaseKey() -> BaseKey? {
+        guard let m = model, let t = target() else { return nil }
         // Enough pixels for this screen, rounded up so a live resize doesn't re-render every frame.
         let backing = window?.backingScaleFactor ?? 2
         let wanted = t.layout.scale / max(PolishLayout(doc: m.doc, scale: 1).scale, 0.0001) * backing
         let scale = min(1, max(0.1, (wanted * 8).rounded(.up) / 8))
-        let key = BaseKey(style: m.doc.style, crop: m.doc.crop, scale: scale)
-        guard key != baseKey, key != wantedKey else { return }
-        wantedKey = key
+        return BaseKey(style: m.doc.style, crop: m.doc.crop, scale: scale)
+    }
+
+    private func cancelBaseRequest() {
+        baseWork?.cancel()
+        baseWork = nil
+        wantedKey = nil
         generation += 1
+    }
+
+    private func requestBase() {
+        guard let m = model, let key = currentBaseKey(), key != wantedKey else { return }
+        // Undo can land on the image we already have while another render is pending.
+        if wantedKey != nil { cancelBaseRequest() }
+        guard key != baseKey else { return }
+        wantedKey = key
         let gen = generation, doc = m.doc, src = m.source
-        PolishCanvas.renderQueue.async { [weak self] in
-            let img = PolishRenderer.render(doc, source: src, scale: scale, marks: false)
+        let work = DispatchWorkItem { [weak self] in
+            let img = PolishRenderer.render(doc, source: src, scale: key.scale, marks: false)
             DispatchQueue.main.async {
-                guard let self, gen == self.generation, let img else { return }
+                guard let self, gen == self.generation else { return }
+                self.baseWork = nil
+                self.wantedKey = nil
+                guard self.currentBaseKey() == key else { self.requestBase(); return }
+                guard let img else { return }
                 // A new style crossfades in; the same style at a new size just swaps.
                 let restyled = self.baseKey.map { $0.style != key.style || $0.crop != key.crop } ?? false
                 self.oldBase = restyled ? self.base : nil
                 self.base = img
                 self.baseKey = key
-                self.wantedKey = nil
                 if restyled { self.fadeStart = CACurrentMediaTime(); self.startLink() }
                 self.needsDisplay = true
             }
         }
+        baseWork = work
+        PolishCanvas.renderQueue.async(execute: work)
+    }
+
+    func detach() {
+        model = nil
+        cancelBaseRequest()
+        link?.invalidate()
+        link = nil
+        anim = nil
+        base = nil
+        oldBase = nil
+        baseKey = nil
+        creationBefore = nil
     }
 
     // MARK: Animation
@@ -459,13 +490,14 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
         guard let m = model, let g = shown else { return }
         let v = point(e), p = g.source(v)
         recorded = false
+        creationBefore = nil
         drag = .none
 
         if m.tool == .crop { cropDown(m, g, v, p); return }
 
         // The selected mark's handles come first, whatever the tool.
         if let id = m.selection, let mk = m.mark(id), let h = handle(at: v, for: mk, g) {
-            drag = .handle(id, h)
+            drag = .handle(id, h, mk.rect)
             return
         }
         let slop = 6 / g.layout.scale
@@ -489,7 +521,6 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
                 beginTextEdit(hit.id, new: false)
                 return
             }
-            record()
             var mk = m.newMark(.text, at: p)
             mk.points = [CGPoint(x: p.x, y: p.y - mk.size * 0.6)]
             m.doc.marks.append(mk)
@@ -506,11 +537,7 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
 
         default:
             guard let kind = m.tool.kind else { return }
-            record()
-            let mk = m.newMark(kind, at: p)
-            m.doc.marks.append(mk)
-            m.selection = mk.id
-            drag = .create(mk.id, p)
+            drag = .create(m.newMark(kind, at: p), p)
         }
     }
 
@@ -520,8 +547,14 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
         autoscroll(with: e)
         switch drag {
         case .none: return
-        case .create(let id, let start):
-            m.update(id) { mk in
+        case .create(let draft, let start):
+            if creationBefore == nil {
+                guard p != start else { return }
+                creationBefore = m.doc
+                m.doc.marks.append(draft)
+                m.selection = draft.id
+            }
+            m.update(draft.id) { mk in
                 switch mk.kind {
                 case .pen: mk.points.append(p)
                 case .rect, .ellipse, .highlight, .redact: mk.points = [start, shift ? Mark.square(start, p) : p]
@@ -533,12 +566,12 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
             m.update(id) { $0 = $0.moved(by: CGSize(width: p.x - from.x, height: p.y - from.y)) }
             drag = .move(id, p)
             NSCursor.closedHand.set()
-        case .handle(let id, let h):
+        case .handle(let id, let h, let rect):
             record()
             m.update(id) { mk in
                 switch h {
                 case .box(let dx, let dy):
-                    let r = PolishCanvas.resize(mk.rect, dx, dy, to: p, square: shift)
+                    let r = PolishCanvas.resize(rect, dx, dy, to: p, square: shift)
                     mk.points = [r.origin, CGPoint(x: r.maxX, y: r.maxY)]
                 case .point(2):
                     // Dragged back onto the straight line, the bend goes away.
@@ -548,7 +581,6 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
                 case .point(let i):
                     let other = mk.points[1 - i]
                     mk.points[i] = shift ? Mark.snap45(other, p) : p
-                default: break
                 }
             }
         case .pan(let from):
@@ -562,24 +594,28 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
             r.origin.y = min(max(0, r.minY + p.y - from.y), CGFloat(m.source.height) - r.height)
             m.cropDraft = r
             drag = .cropMove(p)
-        case .cropHandle(let dx, let dy):
-            m.cropDraft = clampCrop(m, PolishCanvas.resize(m.cropDraft, dx, dy, to: p, square: shift))
+        case .cropHandle(let dx, let dy, let rect):
+            m.cropDraft = clampCrop(m, PolishCanvas.resize(rect, dx, dy, to: p, square: shift))
         }
     }
 
     override func mouseUp(with e: NSEvent) {
-        defer { drag = .none; recorded = false; window?.invalidateCursorRects(for: self) }
+        defer { drag = .none; recorded = false; creationBefore = nil; window?.invalidateCursorRects(for: self) }
         guard let m = model, let g = shown else { return }
         switch drag {
-        case .create(let id, _):
-            guard let mk = m.mark(id) else { return }
-            if mk.kind == .pen { m.update(id) { $0.points = Mark.smooth($0.points, minGap: 1.5 / g.layout.scale) } }
-            // A click with a drawing tool draws nothing: take it back, undo record and all.
+        case .create(let draft, _):
+            let id = draft.id
+            guard let before = creationBefore else { m.selection = nil; return }
+            guard var mk = m.mark(id) else { return }
             let size = mk.kind == .pen ? max(mk.bounds.width, mk.bounds.height) : (mk.isBoxy ? min(mk.rect.width, mk.rect.height) : hypot(mk.b.x - mk.a.x, mk.b.y - mk.a.y))
             if size * g.layout.scale < 4 && !(mk.kind == .pen && mk.points.count > 1) {
                 m.doc.marks.removeAll { $0.id == id }
                 m.selection = nil
-                if recorded { m.history.cancel() }
+            } else {
+                // Keep redo until the drag has made a mark worth keeping.
+                m.history.record(before)
+                if mk.kind == .pen { mk.points = Mark.smooth(mk.points, minGap: 1.5 / g.layout.scale) }
+                m.update(id) { $0 = mk }
             }
         case .cropNew:
             if m.cropDraft.width < 4 || m.cropDraft.height < 4 { m.cropDraft = m.doc.crop }
@@ -591,7 +627,7 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
         let r = m.cropDraft
         for dy in -1...1 { for dx in -1...1 where dx != 0 || dy != 0 {
             let h = g.view(CGPoint(x: r.midX + CGFloat(dx) * r.width / 2, y: r.midY + CGFloat(dy) * r.height / 2))
-            if hypot(h.x - v.x, h.y - v.y) <= 12 { drag = .cropHandle(dx, dy); return }
+            if hypot(h.x - v.x, h.y - v.y) <= 12 { drag = .cropHandle(dx, dy, r); return }
         } }
         // Inside a crop that's already been drawn, a drag moves it. Over the whole image, it draws a new one.
         let whole = r.size == CGSize(width: m.source.width, height: m.source.height)
@@ -696,7 +732,6 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
 
     private func beginTextEdit(_ id: UUID, new: Bool) {
         guard let m = model, let mk = m.mark(id) else { return }
-        if !new { m.history.record(m.doc) }
         let tv = NSTextView(frame: .zero)
         tv.isRichText = false
         tv.drawsBackground = false
@@ -738,8 +773,11 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
 
     func textView(_ tv: NSTextView, doCommandBy sel: Selector) -> Bool {
         switch sel {
-        case #selector(NSResponder.insertNewline(_:)), #selector(NSResponder.cancelOperation(_:)):
+        case #selector(NSResponder.insertNewline(_:)):
             endTextEdit(commit: true)
+            return true
+        case #selector(NSResponder.cancelOperation(_:)):
+            endTextEdit(commit: false)
             return true
         case #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)), #selector(NSResponder.insertLineBreak(_:)):
             tv.insertText("\n", replacementRange: tv.selectedRange())
@@ -753,17 +791,24 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
         editor = nil
         editingID = nil
         tv.removeFromSuperview()
-        let text = tv.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        if text.isEmpty {
-            m.doc.marks.removeAll { $0.id == id }
-            m.selection = nil
-            if editingNew { m.history.cancel() }
-        } else {
-            m.update(id) { $0.text = tv.string }
-            if !editingNew && tv.string == editingBefore { m.history.cancel() }
-        }
         window?.makeFirstResponder(self)
         needsDisplay = true
+        guard let index = m.doc.marks.firstIndex(where: { $0.id == id }) else { return }
+
+        let text = commit ? tv.string : editingBefore
+        let empty = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if commit && (editingNew ? !empty : text != editingBefore) {
+            var before = m.doc
+            if editingNew { before.marks.remove(at: index) }
+            else { before.marks[index].text = editingBefore }
+            m.history.record(before)
+        }
+        if empty && (commit || editingNew) {
+            m.doc.marks.remove(at: index)
+            m.selection = nil
+        } else {
+            m.doc.marks[index].text = text
+        }
     }
 }
 

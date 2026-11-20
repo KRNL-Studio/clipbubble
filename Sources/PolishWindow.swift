@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -46,7 +47,15 @@ final class PolishModel: ObservableObject {
     @Published var ink = Ink.saved { didSet { Ink.saved = ink } }
     @Published var pane: Pane = .style
     @Published var toast: Toast?
-    @Published var busy: String?
+    @Published private var activity: Activity?
+    var busy: String? { activity?.rawValue }
+    var findingRedactions: Bool { activity == .finding }
+    private var queuedExports: [(PolishModel) -> Void] = []
+
+    private enum Activity: String {
+        case finding = "Looking for things to hide…"
+        case reading = "Reading text…"
+    }
     @Published var thumbs: [String: NSImage] = [:]
     @Published var presets = PolishPreset.all
     @Published var copied = false
@@ -136,13 +145,15 @@ final class PolishModel: ObservableObject {
     }
 
     func deleteSelection() {
-        guard let id = selection else { return }
+        guard let id = selection, let index = doc.marks.firstIndex(where: { $0.id == id }) else { return }
         history.record(doc)
-        doc.marks.removeAll { $0.id == id }
+        let deleted = doc.marks.remove(at: index)
         selection = nil
-        // Steps renumber, so removing step 2 of 3 leaves 1 and 2.
-        var n = 0
-        for i in doc.marks.indices where doc.marks[i].kind == .step { n += 1; doc.marks[i].number = n }
+        if deleted.kind == .step {
+            for i in index..<doc.marks.endIndex where doc.marks[i].kind == .step {
+                doc.marks[i].number = max(1, doc.marks[i].number - 1)
+            }
+        }
     }
 
     func undo() {
@@ -186,9 +197,13 @@ final class PolishModel: ObservableObject {
         presets = PolishPreset.all
     }
 
-    func applyCrop() {
+    private var validCropDraft: CGRect? {
         let r = cropDraft.integral.intersection(CGRect(x: 0, y: 0, width: source.width, height: source.height))
-        guard r.width >= 4, r.height >= 4, r != doc.crop else { return }
+        return r.width >= 4 && r.height >= 4 ? r : nil
+    }
+
+    func applyCrop() {
+        guard let r = validCropDraft, r != doc.crop else { return }
         edit("crop") { $0.crop = r }
         lastCoalesce = nil
         makeThumbs()
@@ -229,47 +244,90 @@ final class PolishModel: ObservableObject {
 
     private var retina: Bool { !UserDefaults.standard.bool(forKey: "polish.export1x") }
 
-    func png() -> Data? {
+    private func png() -> Data? {
+        guard !findingRedactions else { return nil }
+        if tool == .crop { tool = .select }
         PolishPreset.last = doc.style
-        return PolishRenderer.png(doc, retina: retina)
+        let scale: CGFloat = retina || doc.style.size.pixels != nil ? 1 : 0.5
+        guard let image = PolishRenderer.render(doc, source: source, scale: scale, marks: true) else { return nil }
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(destination, image, nil)
+        return CGImageDestinationFinalize(destination) ? data as Data : nil
     }
 
-    func copy() {
-        guard let d = png() else { say("Couldn't make the image", "exclamationmark.triangle"); return }
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setData(d, forType: .png)
-        copied = true
-        say("Copied", "checkmark")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { [weak self] in self?.copied = false }
+    private func exportWhenReady(_ action: @escaping (PolishModel, Data) -> Void) {
+        let run: (PolishModel) -> Void = { model in
+            guard let data = model.png() else {
+                model.say("Couldn't make the image", "exclamationmark.triangle")
+                return
+            }
+            action(model, data)
+        }
+        if findingRedactions { queuedExports.append(run) }
+        else { run(self) }
     }
 
-    func copyAndClose() {
-        copy()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in self?.close() }
-    }
-
-    func save() {
-        guard let d = png() else { say("Couldn't make the image", "exclamationmark.triangle"); return }
-        let url = PolishRenderer.saveURL(for: doc.source)
-        do {
-            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try d.write(to: url)
-            onSaved(url)
-            say("Saved as “\(url.lastPathComponent)”", "square.and.arrow.down")
-        } catch {
-            say("Couldn't save: \(error.localizedDescription)", "exclamationmark.triangle")
+    private func copy(closeAfter: Bool) {
+        exportWhenReady { model, data in
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            guard pb.setData(data, forType: .png) else {
+                model.say("Couldn't copy the image", "exclamationmark.triangle")
+                return
+            }
+            model.copied = true
+            model.say("Copied", "checkmark")
+            if closeAfter {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak model] in model?.close() }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { [weak model] in model?.copied = false }
         }
     }
 
-    /// A finished copy in a temporary folder, for dragging out and sharing.
-    func exportFile() -> URL? {
-        guard let d = png() else { return nil }
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ClipBubble Polish", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let url = dir.appendingPathComponent("\(name) polished.png")
-        return (try? d.write(to: url)) != nil ? url : nil
+    func copy() { copy(closeAfter: false) }
+    func copyAndClose() { copy(closeAfter: true) }
+
+    func save() {
+        exportWhenReady { model, data in
+            let url = PolishRenderer.saveURL(for: model.doc.source)
+            do {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try data.write(to: url, options: .withoutOverwriting)
+                model.onSaved(url)
+                model.say("Saved as “\(url.lastPathComponent)”", "square.and.arrow.down")
+            } catch {
+                model.say("Couldn't save: \(error.localizedDescription)", "exclamationmark.triangle")
+            }
+        }
     }
+
+    /// Drag must produce its item immediately. The drag control is disabled during detection.
+    func exportFile() -> URL? {
+        guard !findingRedactions else { return nil }
+        guard let data = png() else {
+            say("Couldn't make the image", "exclamationmark.triangle")
+            return nil
+        }
+        return handoff(data)
+    }
+
+    func share(_ show: @escaping (URL) -> Void) {
+        exportWhenReady { model, data in
+            if let url = model.handoff(data) { show(url) }
+        }
+    }
+
+    private func handoff(_ data: Data) -> URL? {
+        do {
+            return try PolishHandoffs.write(data, name: "\(name) polished.png")
+        } catch {
+            say("Couldn't prepare the image", "exclamationmark.triangle")
+            return nil
+        }
+    }
+
+    func cancelExports() { queuedExports.removeAll() }
 
     func close() { onClose() }
 
@@ -287,16 +345,18 @@ final class PolishModel: ObservableObject {
     /// Covers emails, numbers, keys and (if asked) faces. Replaces the last auto-redact, keeps hand-drawn ones.
     func autoRedact() {
         guard busy == nil else { return }
-        busy = "Looking for things to hide…"
-        let src = source, kinds = redactKinds, faces = redactFaces, crop = doc.crop
+        activity = .finding
+        let src = source, kinds = redactKinds, faces = redactFaces
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let found = Redactor.find(in: src, kinds: kinds, faces: faces).filter { crop.intersects($0.1) }
+            let detected = Redactor.find(in: src, kinds: kinds, faces: faces)
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.busy = nil
-                self.history.record(self.doc)
-                let before = self.doc.marks.filter(\.auto).count
-                self.doc.marks.removeAll(where: \.auto)
+                let crop = (self.tool == .crop ? self.validCropDraft : nil) ?? self.doc.crop
+                let found = detected.filter { crop.intersects($0.1) }
+                if !found.isEmpty || self.doc.marks.contains(where: \.auto) {
+                    self.history.record(self.doc)
+                    self.doc.marks.removeAll(where: \.auto)
+                }
                 for (_, r) in found {
                     var m = Mark(.redact, [r.origin, CGPoint(x: r.maxX, y: r.maxY)])
                     m.redaction = self.ink.redaction
@@ -304,11 +364,14 @@ final class PolishModel: ObservableObject {
                     m.auto = true
                     self.doc.marks.insert(m, at: 0)
                 }
-                if found.isEmpty && before == 0 { self.history.cancel() }
                 self.selection = nil
                 let n = found.count
                 self.say(n == 0 ? "Nothing sensitive found" : "Hid \(n) \(n == 1 ? "thing" : "things") · select one to remove it",
                          n == 0 ? "checkmark.shield" : "eye.slash")
+                self.activity = nil
+                let exports = self.queuedExports
+                self.queuedExports.removeAll()
+                for export in exports { export(self) }
             }
         }
     }
@@ -321,20 +384,65 @@ final class PolishModel: ObservableObject {
 
     func copyText() {
         guard busy == nil else { return }
-        busy = "Reading text…"
-        let src = source, crop = doc.crop
+        if tool == .crop { tool = .select }
+        activity = .reading
+        let src = source, doc = self.doc
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let img = src.cropping(to: crop) ?? src
-            let text = Redactor.text(in: img)
+            let image = PolishRenderer.render(doc, source: src, scale: 1, marks: true)
+            let text = image.map { Redactor.text(in: $0) } ?? ""
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.busy = nil
+                self.activity = nil
                 guard !text.isEmpty else { self.say("No text found", "text.viewfinder"); return }
                 Board.writeText(text)
                 let lines = text.split(separator: "\n").count
                 self.say("Copied \(lines) \(lines == 1 ? "line" : "lines") of text", "text.viewfinder")
             }
         }
+    }
+}
+
+enum PolishHandoffs {
+    private static let lifetime: TimeInterval = 3600
+    private static let directory: URL = {
+        // A second instance with its own data folder also has its own handoffs.
+        let suffix = ProcessInfo.processInfo.environment["CLIPBUBBLE_HOME"].map { "-" + sha($0) } ?? ""
+        return FileManager.default.temporaryDirectory.appendingPathComponent("ClipBubble Polish" + suffix, isDirectory: true)
+    }()
+    private static let startup: Void = clear()
+
+    static func prepare() { _ = startup }
+
+    static func clear() { try? FileManager.default.removeItem(at: directory) }
+
+    static func write(_ data: Data, name: String) throws -> URL {
+        prepare()
+        let fm = FileManager.default
+        let privateDirectory: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true, attributes: privateDirectory)
+        let stale = Date().addingTimeInterval(-lifetime)
+        let entries = try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey])
+        for entry in entries {
+            if let date = try? entry.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate, date < stale {
+                try? fm.removeItem(at: entry)
+            }
+        }
+
+        let folder = directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: false, attributes: privateDirectory)
+        let url = folder.appendingPathComponent(name)
+        do {
+            let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+            guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            try file.write(contentsOf: data)
+            try file.close()
+        } catch {
+            try? fm.removeItem(at: folder)
+            throw error
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + lifetime) { try? fm.removeItem(at: folder) }
+        return url
     }
 }
 
@@ -366,6 +474,7 @@ final class PolishWindow: NSObject, NSWindowDelegate {
             return true
         }
         guard let img = PolishRenderer.load(url) else { return false }
+        PolishHandoffs.prepare()
         let w = PolishWindow(url: url, image: img)
         open.append(w)
         w.show()
@@ -386,7 +495,7 @@ final class PolishWindow: NSObject, NSWindowDelegate {
         window.isReleasedWhenClosed = false
         window.minSize = NSSize(width: 860, height: 560)
         window.delegate = self
-        window.contentView = NSHostingView(rootView: PolishView(model: model, canvas: canvas))
+        window.contentView = NSHostingView(rootView: Optional(PolishView(model: model, canvas: canvas)))
         window.setContentSize(idealSize(for: image))
         model.onClose = { [weak self] in self?.window.performClose(nil) }
         model.onSaved = { PolishWindow.onSaved($0) }
@@ -419,6 +528,13 @@ final class PolishWindow: NSObject, NSWindowDelegate {
 
     func windowWillClose(_ n: Notification) {
         canvas.endTextEdit(commit: true)
+        model.cancelExports()
+        canvas.detach()
+        window.makeFirstResponder(nil)
+        window.canvas = nil
+        // SwiftUI can keep the detached hosting view around until the next update.
+        (window.contentView as? NSHostingView<PolishView?>)?.rootView = nil
+        window.contentView = nil
         ColorPanelLink.shared.detach()
         PolishPreset.last = model.doc.style
         Presence.closed(window)
@@ -441,7 +557,17 @@ final class EditorWindow: NSWindow {
         guard e.type == .keyDown, let m = canvas?.model else { return super.performKeyEquivalent(with: e) }
         let mods = e.modifierFlags.intersection([.command, .shift, .option, .control])
         let key = e.charactersIgnoringModifiers?.lowercased() ?? ""
-        if typing && mods == .command && ["c", "v", "x", "a", "z"].contains(key) { return super.performKeyEquivalent(with: e) }
+        if let text = firstResponder as? NSTextView {
+            switch (mods, key) {
+            case (.command, "z"): text.undoManager?.undo(); return true
+            case ([.command, .shift], "z"): text.undoManager?.redo(); return true
+            case (.command, "c"): text.copy(nil); return true
+            case (.command, "v"): text.paste(nil); return true
+            case (.command, "x"): text.cut(nil); return true
+            case (.command, "a"): text.selectAll(nil); return true
+            default: break
+            }
+        }
         switch (mods, key) {
         case (.command, "s"): m.save(); return true
         case (.command, "c"): m.copy(); return true
@@ -1108,11 +1234,13 @@ private struct DragOut: View {
             .frame(width: 28, height: 28)
             .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.primary.opacity(hover ? 0.08 : 0)))
             .onHover { hover = $0 }
-            .help("Drag the finished image anywhere")
             .onDrag {
                 guard let url = model.exportFile() else { return NSItemProvider() }
                 return NSItemProvider(contentsOf: url) ?? NSItemProvider()
             }
+            .disabled(model.findingRedactions)
+            .opacity(model.findingRedactions ? 0.45 : 1)
+            .help(model.findingRedactions ? "Drag available after Find and Hide finishes" : "Drag the finished image anywhere")
     }
 }
 
@@ -1120,11 +1248,13 @@ private struct ShareButton: NSViewRepresentable {
     @ObservedObject var model: PolishModel
 
     final class Coordinator: NSObject {
-        var model: PolishModel
+        weak var model: PolishModel?
         init(_ m: PolishModel) { model = m }
         @objc func share(_ b: NSButton) {
-            guard let url = model.exportFile() else { return }
-            NSSharingServicePicker(items: [url]).show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
+            model?.share { [weak b] url in
+                guard let b, b.window?.isVisible == true else { return }
+                NSSharingServicePicker(items: [url]).show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
+            }
         }
     }
 

@@ -780,6 +780,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var peekHost: NSView!
     private(set) var appWindow: AppWindow!
     private(set) var shotCard = ShotCard()
+    private var polishedPaths = Set<String>()
     private var localClickMonitor: Any?
     private var capture: Capture!
     private var screenshots: FolderWatcher?
@@ -811,6 +812,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func applicationWillTerminate(_ n: Notification) {
+        PolishHandoffs.clear()
+    }
+
     /// The bubble, panel and peek. Tests stop here, so they start no capture, sync or global shortcuts, and pass
     /// `keyable: false` so a run can't take the keyboard, or lose its panel to a click you make somewhere else.
     func setUpWindows(keyable: Bool = true) {
@@ -835,6 +840,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.dragging = true
             self.hidePanel()
             self.hidePeek()
+            self.shotCard.hide(animated: false)
             self.bubble.alphaValue = 1
         }
         view.onDragEnd = { [weak self] in self?.dragging = false; self?.snap(animated: true) }
@@ -888,6 +894,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// A saved copy joins history as Polished, not as a new screenshot.
     private func polishedSaved(_ url: URL) {
+        polishedPaths.insert(url.resolvingSymlinksInPath().standardizedFileURL.path)
         model.db.insertIfMissing(kind: "file", text: url.path, source: "Polished", hash: "f:" + sha(url.path), created: Date())
         refreshLists()
     }
@@ -895,8 +902,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The card by the bubble, for a screenshot just taken. Not for backfills, and not over the open panel.
     private func offerPolish(_ url: URL) {
         guard UserDefaults.standard.bool(forKey: "polishCard"), isImagePath(url.path), !panel.isVisible else { return }
-        // Hidden until needed, the bubble stays hidden: the card comes out of its corner on its own.
+        // A hidden bubble will reappear on the pointer's display if capture reveals it.
         if bubble.isVisible { bubble.animator().alphaValue = 1 }
+        else { snap(animated: false, on: pointerDisplay) }
         hidePeek()
         shotCard.show(url, beside: bubble.frame, in: bubbleDisplay?.visible ?? NSScreen.main?.visibleFrame ?? .zero)
     }
@@ -970,7 +978,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func screenshotAdded(_ url: URL, at date: Date) {
         // A polished copy saved into the screenshot folder is already in history, as Polished.
-        if PolishRenderer.isPolished(url) { return }
+        if polishedPaths.contains(url.resolvingSymlinksInPath().standardizedFileURL.path) { return }
         let hash = "f:" + sha(url.path)
         model.db.insertIfMissing(kind: "file", text: url.path, source: "Screenshot", hash: hash, created: date)
         // A copy to the clipboard is announced when capture saves it, unless copied files aren't saved.
@@ -1106,11 +1114,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return displays().max { overlap($0) < overlap($1) }
     }
 
+    private var pointerDisplay: Display? {
+        let p = pointer()
+        return displays().first { NSMouseInRect(p, $0.frame, false) }
+    }
+
     /// Moves the bubble to the nearest screen corner (or the saved one when not dragging), with a little overshoot.
     private func snap(animated: Bool, on chosen: Display? = nil) {
         let center = NSPoint(x: bubble.frame.midX, y: bubble.frame.midY)
         guard let display = chosen ?? bubbleDisplay else { return }
         let area = display.visible
+        if shotCard.isVisible && !display.frame.contains(shotCard.frame) { shotCard.hide(animated: false) }
         var corner = UserDefaults.standard.string(forKey: "corner") ?? "br"
         if animated {
             corner = (center.y > area.midY ? "t" : "b") + (center.x > area.midX ? "r" : "l")
@@ -1207,8 +1221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hideWork?.cancel()
         hiding = false
         guard !bubble.isVisible else { return }
-        let p = pointer()
-        snap(animated: false, on: displays().first { NSMouseInRect(p, $0.frame, false) })
+        snap(animated: false, on: pointerDisplay)
         bubble.alphaValue = 0
         bubble.orderFrontRegardless()
     }
@@ -1221,7 +1234,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The bubble's own shortcut. While it's showing, everything goes at once.
     func toggleBubble() {
         guard !dragging, !model.pressed else { return }
-        guard bubble.isVisible, !hiding else { return reveal() }
+        guard (bubble.isVisible && !hiding) || shotCard.isVisible else { return reveal() }
+        shotCard.hide(animated: false)
         hidePanel()
         hidePeek()
         model.bubbleHover = false

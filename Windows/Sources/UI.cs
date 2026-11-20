@@ -1747,7 +1747,8 @@ sealed class SettingsView : Grid
                 }
                 var p = new Pairing(name, note => Show(null, note));
                 Dispatcher.BeginInvoke(new Action(() => pairing = p));
-                Show(p.Link, "Scan with the iPhone's Camera, or in ClipBubble on the iPhone. It needs the same Wi-Fi as this PC.");
+                Show(p.Link, "Scan with the iPhone's Camera, or in ClipBubble on the iPhone. It needs the same Wi-Fi as this PC.\n\n" +
+                             $"Linking another computer instead? In its Add a computer…, enter {p.TypedAddress} and the code {p.ShortCodeShown}.");
             }
             catch (PairingException e) { Show(null, e.Message); }
         });
@@ -2294,7 +2295,9 @@ sealed class App : Application
         if (Prefs.On("downloads"))
         {
             if (downloads != null || FolderWatcher.DownloadsFolder is not { } dir) return;
-            downloads = new FolderWatcher(dir, null, p => !FolderWatcher.TempExts.Contains(Path.GetExtension(p).TrimStart('.').ToLowerInvariant()), (path, date) =>
+            // ClipBubble's own folder of received files isn't a download, as on the Mac and Linux.
+            downloads = new FolderWatcher(dir, null, p => !FolderWatcher.TempExts.Contains(Path.GetExtension(p).TrimStart('.').ToLowerInvariant())
+                && !string.Equals(Path.GetFileName(p), "ClipBubble", StringComparison.OrdinalIgnoreCase), (path, date) =>
                 capture.AddFiles("Downloads", () => new[] { (path, date) }, Captured));
         }
         else { downloads?.Dispose(); downloads = null; }

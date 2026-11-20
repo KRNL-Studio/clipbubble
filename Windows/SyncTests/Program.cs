@@ -165,6 +165,18 @@ static class Program
             }
         }),
 
+        ("link failures", () =>
+        {
+            // What OpenSSH prints for each way a link fails, in the order a connection goes.
+            Check(LinkState.Failure("ssh: Could not resolve hostname old-mac: No such host is known.", false)?.Kind == "unresolved", "unresolved");
+            Check(LinkState.Failure("ssh: connect to host 10.0.0.9 port 22: Connection refused", false)?.Kind == "refused", "refused");
+            Check(LinkState.Failure("No ED25519 host key is known for rog.\nHost key verification failed.", false)?.Kind == "unknown-host", "unknown host");
+            Check(LinkState.Failure("@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @\nHost key verification failed.", false)?.Kind == "host-key-changed", "changed key");
+            Check(LinkState.Failure("rohit@air: Permission denied (publickey).", false) is { Kind: "needs-key", Arg: "rohit@air" }, "names who was turned down");
+            Check(LinkState.Failure("ssh: connect to host rog port 22: Connection timed out", false) == null, "a timeout is just offline");
+            Check(new LinkState("refused").Transient && !new LinkState("host-key-changed").Transient, "only network trouble retries soon");
+        }),
+
         ("merge rules", () =>
         {
             var a = new Stamp("t:x", 10, false);
@@ -252,6 +264,36 @@ static class Program
             Check(Engine.SafeFileName("CON.txt") == "_CON.txt", "device names");
             Check(Engine.SafeFileName("...") == "file", "nothing left");
             Check(Engine.SafeFileName("ok name.pdf") == "ok name.pdf", "normal names stay");
+            var longName = string.Concat(Enumerable.Repeat("shot (2) ", 30)) + "end.png";
+            Check(Engine.SafeFileName(longName) is { Length: 200 } cut && cut.EndsWith(".png"), "a long name is cut before its extension");
+        }),
+
+        // One screenshot once landed on a Mac 68 times: Universal Clipboard bounced each received copy back as a new item.
+        ("a file arriving again keeps one copy", () =>
+        {
+            var dir = Path.Combine(Home, "unique");
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "shot.png"), "a");
+            Check(Path.GetFileName(Engine.UniquePath(dir, "shot.png")) == "shot (2).png", "a clash gets (2)");
+            File.WriteAllText(Path.Combine(dir, "shot (2).png"), "b");
+            Check(Path.GetFileName(Engine.UniquePath(dir, "shot (2).png")) == "shot (3).png", "a numbered name counts on instead of stacking (2)");
+            Check(Engine.Numbered("at 11.40.14 PM (4)") == ("at 11.40.14 PM", 4, ""), "an extension has no spaces");
+
+            var data = Enumerable.Range(0, 3000).Select(i => (byte)(i * 13)).ToArray();
+            Download Receive(string name, byte[] body)
+            {
+                var d = new Download("f:" + Guid.NewGuid(), "file", new() { name }, new() { "" }, new() { body.Length }, "Bouncer", true);
+                Check(d.Write(body, body.Length) == Step.Done, name + " arrives");
+                return d;
+            }
+            var first = Receive("Screenshot.png", data);
+            Check(!first.Bounced, "the first copy is new");
+            var (again, echoed) = (Receive("Screenshot.png", data), Receive("Screenshot (2).png", data));
+            Check(again.Paths.SequenceEqual(first.Paths) && echoed.Paths.SequenceEqual(first.Paths), "the same bytes again keep the one file");
+            Check(again.Bounced && echoed.Bounced, "a copy saved moments ago is a bounce");
+            var other = Receive("Screenshot.png", Enumerable.Reverse(data).ToArray());
+            Check(Path.GetFileName(other.Paths[0]) == "Screenshot (2).png" && !other.Bounced, "different bytes get their own file");
+            Check(Directory.GetFiles(Engine.ReceivedFolder("Bouncer")).Length == 2, "nothing else was saved");
         }),
 
         ("a peer reaches only what it was offered", Boundary.Run),

@@ -89,6 +89,16 @@ final class Model: ObservableObject {
     private var toastTask: Task<Void, Never>?
 
     init() {
+        #if DEBUG
+        // `-demo YES` (debug builds only): a linked MacBook Pro without a computer, for App Store screenshots.
+        if UserDefaults.standard.bool(forKey: "demo") {
+            let mac = "you@macbook-pro.local"
+            hosts = [mac]
+            statuses = [mac: .live(Hello(proto: 1, device: "demo-mac", name: "MacBook Pro", os: "macos", version: "1.6.2", clock: 0))]
+            reload()
+            return
+        }
+        #endif
         let engine = SyncEngine.shared
         engine.onReceived = { [weak self] in self?.reload() }
         engine.onStatus = { [weak self] in self?.statuses = engine.statuses; self?.reload() }
@@ -238,6 +248,7 @@ final class Model: ObservableObject {
         Task {
             do {
                 let (alias, name) = try await Pairing.pair(link)
+                HostRow.remember(name, for: alias)
                 add(alias)
                 Pairing.olderLinks(than: alias).forEach(remove)
                 SyncEngine.shared.redial(alias)
@@ -319,8 +330,10 @@ struct HistoryView: View {
                     VStack(alignment: .leading, spacing: 10) {
                         Image(systemName: "laptopcomputer.and.iphone").font(.title).foregroundStyle(.tint).accessibilityHidden(true)
                         Text("Copy on your iPhone, paste on your computer, and back.").font(.headline)
-                        Text("Link a Mac, Linux or Windows computer running ClipBubble.").font(.subheadline).foregroundStyle(.secondary)
-                        Button("Link a computer") { tab = .settings }.buttonStyle(.borderedProminent).padding(.top, 2)
+                        Text("Link a Mac, Windows PC or Linux computer running ClipBubble, and what you copy there shows up here. You can already add things with Add.")
+                            .font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        Button { tab = .settings } label: { Text("Link a computer").font(.body.weight(.semibold)).padding(.horizontal, 6) }
+                            .buttonStyle(.borderedProminent).buttonBorderShape(.capsule).padding(.top, 4)
                     }
                     .padding(.vertical, 8)
                 }
@@ -352,7 +365,8 @@ struct HistoryView: View {
         }
         .animation(.snappy, value: model.clips.map(\.hash))
         .overlay {
-            if model.clips.isEmpty {
+            // Before anything is linked, the card above already says what to do.
+            if model.clips.isEmpty && !(model.hosts.isEmpty && model.query.isEmpty) {
                 ContentUnavailableView {
                     Label {
                         Text(model.query.isEmpty ? "Nothing copied yet" : "No matches")
@@ -553,15 +567,17 @@ struct HostRow: View {
                 Text(name).font(.subheadline.weight(.semibold))
                 // On a timer because "retrying in 8 s" counts down with nothing else changing.
                 TimelineView(.periodic(from: .now, by: 1)) { _ in
-                    Text(state.map { if case .live = $0 { return "Linked" }; return $0.text } ?? "Connecting…")
+                    Text(state.map { if case .live = $0 { return "Linked" }; return $0.phoneText } ?? "Connecting…")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
             Spacer()
             if stuck { Button("Retry") { SyncEngine.shared.redial(alias) }.buttonStyle(.borderless).font(.caption) }
-            Circle().fill(state?.ok == true ? Color.green : Color.orange).frame(width: 8, height: 8)
+            Circle().fill(state?.ok == true ? Color.green : Color.orange).frame(width: 8, height: 8).accessibilityHidden(true)
         }
         .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+        .onChange(of: state) { if case .live(let h) = state { Self.remember(h.name, for: alias) } }
     }
 
     private var stuck: Bool {
@@ -573,8 +589,11 @@ struct HostRow: View {
 
     private var name: String {
         if case .live(let h) = state { return h.name }
-        return alias.split(separator: "@").last.map(String.init) ?? alias
+        return Platform.defaults.string(forKey: "sync.name.\(alias)") ?? alias.split(separator: "@").last.map(String.init) ?? alias
     }
+
+    /// The computer's own name, shown while it's offline instead of its address.
+    static func remember(_ name: String, for alias: String) { Platform.defaults.set(name, forKey: "sync.name.\(alias)") }
 }
 
 struct ClipRow: View {
@@ -615,7 +634,6 @@ struct ClipRow: View {
 
 struct SettingsView: View {
     @EnvironmentObject var model: Model
-    @State private var alias = ""
     @State private var scanning = false
     @State private var scanFailed = false
     @State private var confirmClear = false
@@ -625,42 +643,39 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                // What's linked comes first: it's what you check most often.
+                if !model.hosts.isEmpty {
+                    Section {
+                        ForEach(model.hosts, id: \.self) { h in HostRow(alias: h, state: model.statuses[h]) }
+                            .onDelete { removing = $0.first.map { model.hosts[$0] } }
+                    } header: { Text("Computers") } footer: {
+                        Text("Swipe left on a computer to remove it.")
+                    }
+                }
+
                 Section {
-                    Text("On your Mac, Windows PC or Linux computer, open ClipBubble → Settings → Sync over SSH → Link iPhone…, then scan the code with this iPhone's Camera.")
+                    step(1, "On your Mac, Windows PC or Linux computer, open ClipBubble → Settings → Sync over SSH → Link iPhone…")
+                    step(2, DataScannerViewController.isSupported ? "Tap Scan code below, or point this iPhone's Camera at the code."
+                         : "Point this iPhone's Camera at the code.")
                     if DataScannerViewController.isSupported {
-                        Button { scanning = true } label: { Label("Scan code", systemImage: "qrcode.viewfinder") }
+                        Button { scanning = true } label: { Label("Scan code", systemImage: "qrcode.viewfinder").font(.body.weight(.semibold)) }
                     }
                     if scanFailed {
-                        Text("The camera isn't available. Allow ClipBubble to use it in Settings, or link by hand below.")
+                        Text("The camera isn't available. Allow ClipBubble to use it in the Settings app, or use the Camera app instead.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                     if model.linking {
                         Label { Text("Linking…") } icon: { ProgressView() }
                     }
-                } header: { Text("Link a computer") }
-
-                if !model.hosts.isEmpty {
-                    Section("Computers") {
-                        ForEach(model.hosts, id: \.self) { h in
-                            HStack {
-                                HostRow(alias: h, state: model.statuses[h])
-                                Button("Remove", role: .destructive) { removing = h }.buttonStyle(.borderless).font(.caption)
-                            }
-                        }
-                    }
+                } header: { Text(model.hosts.isEmpty ? "Link a computer" : "Link another computer") } footer: {
+                    Text("Don't have ClipBubble on your computer yet? It's free at clipbubble.krnl.studio.")
                 }
 
                 Section {
-                    HStack {
-                        TextField("you@computer.local", text: $alias)
-                            .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
-                        Button("Add") { model.add(alias.trimmingCharacters(in: .whitespaces)); alias = "" }
-                            .disabled(SSHTarget(alias.trimmingCharacters(in: .whitespaces)) == nil)
-                    }
-                    Text(Keys.publicLine).font(.caption.monospaced()).lineLimit(1).truncationMode(.middle)
-                    Button("Copy this iPhone's key") { UIPasteboard.general.string = Keys.publicLine; model.say("Copied") }
-                } header: { Text("Linux, Windows, or by hand") } footer: {
-                    Text("Add the key as a line in ~/.ssh/authorized_keys on the computer, with SSH turned on there. A key added this way can do anything your account can, so link with the code when you can.")
+                    Text("In the Settings app: General → Keyboard → Keyboards → Add New Keyboard → ClipBubble. Then turn on Allow Full Access so it can reach your computers.")
+                    Button("Open the Settings app") { UIApplication.shared.open(URL(string: UIApplication.openSettingsURLString)!) }
+                } header: { Text("Clipboard keyboard") } footer: {
+                    Text("Your history in any app: tap an item to type it. Full Access is what lets it reach your computers; ClipBubble never records what you type.")
                 }
 
                 Section("Appearance") {
@@ -671,23 +686,17 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Text("Settings → General → Keyboard → Keyboards → Add New Keyboard → ClipBubble, then turn on Allow Full Access so it can reach your computers.")
-                    Button("Open Settings") { UIApplication.shared.open(URL(string: UIApplication.openSettingsURLString)!) }
-                } header: { Text("Clipboard keyboard") } footer: {
-                    Text("Your history in any app: tap an item to type it. Full Access is what lets it link to your computers; it never logs what you type.")
-                }
-
-                Section {
                     Button("Clear history", role: .destructive) { confirmClear = true }
                 } footer: {
                     Text("Removes everything ClipBubble has kept, here and on your linked devices.")
                 }
 
                 Section {
-                    Link(destination: URL(string: "https://clipbubble.krnl.studio/privacy")!) { Label("Privacy policy", systemImage: "hand.raised") }
+                    NavigationLink { ManualLink() } label: { Label("Link by hand with SSH", systemImage: "terminal") }
                     Link(destination: URL(string: "https://clipbubble.krnl.studio/support")!) { Label("Help and support", systemImage: "questionmark.circle") }
-                } footer: {
-                    Text("ClipBubble \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""). History stays on your devices for 7 days.")
+                    Link(destination: URL(string: "https://clipbubble.krnl.studio/privacy")!) { Label("Privacy policy", systemImage: "hand.raised") }
+                } header: { Text("More") } footer: {
+                    Text("ClipBubble \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""). History stays on your devices and is deleted after 7 days.")
                 }
             }
             .navigationTitle("Settings")
@@ -705,10 +714,70 @@ struct SettingsView: View {
                     Scanner(found: { url in scanning = false; model.open(url) },
                             failed: { scanning = false; scanFailed = true })
                         .ignoresSafeArea()
+                        .overlay(alignment: .bottom) {
+                            Text("Open Link iPhone… in ClipBubble on your computer, then point the camera at its code.")
+                                .font(.subheadline.weight(.medium)).multilineTextAlignment(.center)
+                                .padding(.horizontal, 18).padding(.vertical, 12)
+                                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                                .padding(20)
+                        }
+                        .navigationTitle("Scan code").navigationBarTitleDisplayMode(.inline)
                         .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { scanning = false } } }
                 }
             }
         }
+    }
+
+    private func step(_ n: Int, _ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text("\(n)").font(.subheadline.weight(.bold)).foregroundStyle(.white)
+                .frame(width: 24, height: 24).background(Circle().fill(Color.accentColor))
+                .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 5 }
+                .accessibilityHidden(true)
+            Text(text)
+        }
+    }
+}
+
+/// For a computer the QR code can't reach (a server, another network): this iPhone's key goes in its authorized_keys.
+struct ManualLink: View {
+    @EnvironmentObject var model: Model
+    @State private var alias = ""
+
+    var body: some View {
+        Form {
+            Section {
+                Text(Keys.publicLine).font(.caption.monospaced()).textSelection(.enabled)
+                Button { UIPasteboard.general.string = Keys.publicLine; model.say("Key copied") } label: {
+                    Label("Copy this iPhone's key", systemImage: "doc.on.doc")
+                }
+            } header: { Text("1. Add this key on the computer") } footer: {
+                Text("Add it as a line in ~/.ssh/authorized_keys, with SSH turned on there and ClipBubble installed. A key added this way can do anything your account can, so link with the code when you can.")
+            }
+            Section {
+                HStack {
+                    TextField("you@computer.local", text: $alias)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
+                        .onSubmit(add)
+                    Button("Link", action: add).disabled(SSHTarget(trimmed) == nil)
+                }
+            } header: { Text("2. Enter its user and address") } footer: {
+                Text("Most people don't need this: Link iPhone… on the computer does both steps for you.")
+            }
+        }
+        .navigationTitle("Link by hand")
+        .navigationBarTitleDisplayMode(.inline)
+        .toast(model.line)
+    }
+
+    private var trimmed: String { alias.trimmingCharacters(in: .whitespaces) }
+
+    private func add() {
+        guard SSHTarget(trimmed) != nil else { return }
+        model.add(trimmed)
+        SyncEngine.shared.redial(trimmed)
+        model.say("Linking with \(trimmed)…")
+        alias = ""
     }
 }
 

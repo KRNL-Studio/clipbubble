@@ -48,7 +48,7 @@ enum RemoteSetup {
     private static func ssh(_ alias: String, _ command: String) -> Process {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        p.arguments = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", alias, command]
+        p.arguments = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"] + (Peers.sshArguments(alias) ?? ["--", alias]) + [command]
         return p
     }
 

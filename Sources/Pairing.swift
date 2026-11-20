@@ -3,23 +3,42 @@ import CoreImage
 import Network
 import SystemConfiguration
 
-/// Links an iPhone without Terminal. The QR code carries this Mac's addresses and a one-time code; the phone sends its
-/// SSH key back over the local network, and the key goes into ~/.ssh/authorized_keys allowed to run only ClipBubble's relay.
+/// Links an iPhone or another computer without Terminal. The QR code carries this Mac's addresses and a one-time code; a
+/// computer types the address and a short code instead. The other side sends its SSH key back over the local network,
+/// and the key goes into ~/.ssh/authorized_keys allowed to run only ClipBubble's relay.
 final class PairingServer {
     private let code = (0..<16).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
+    /// The code a person types on another computer. Short, so a few wrong guesses end the listener.
+    let shortCode = LinkCode.make()
+    private var wrong = 0
+    static let maxWrong = 5
     private let queue = DispatchQueue(label: "clipbubble.pairing")
     private var listener: NWListener?
     /// Main thread: the link to put in the QR code, once the listener has a port.
     var onReady: (URL) -> Void = { _ in }
-    /// Main thread: a phone was added, with its name.
+    /// Main thread: a phone or computer was added, with its name.
     var onPaired: (String) -> Void = { _ in }
+    /// Main thread: too many wrong codes, so it stopped listening.
+    var onGaveUp: () -> Void = {}
+    private(set) var port: UInt16 = 0
 
-    func start() {
-        guard let l = try? NWListener(using: .tcp, on: .any) else { return }
+    /// The port Linux and Windows use too, so one firewall rule covers every computer. Any free port does if it's taken.
+    static let fixedPort: UInt16 = 47821
+
+    func start() { listen(on: NWEndpoint.Port(rawValue: Self.fixedPort)!) }
+
+    private func listen(on port: NWEndpoint.Port) {
+        guard let l = try? NWListener(using: .tcp, on: port) else { return port == .any ? () : listen(on: .any) }
         listener = l
         l.newConnectionHandler = { [weak self] c in self?.serve(c) }
         l.stateUpdateHandler = { [weak self] state in
+            // A taken port only shows up here, after the listener was made: try again on any free one.
+            if case .failed = state, port != .any, let self, self.listener === l {
+                l.cancel()
+                return self.listen(on: .any)
+            }
             guard case .ready = state, let self, let port = l.port?.rawValue else { return }
+            self.port = port
             let url = self.link(port: port)
             DispatchQueue.main.async { self.onReady(url) }
         }
@@ -39,6 +58,12 @@ final class PairingServer {
                         .init(name: "p", value: String(port)), .init(name: "c", value: code),
                         .init(name: "n", value: SyncEngine.shared.name)]
         return c.url!
+    }
+
+    /// What to type on another computer's Add a computer: this Mac's .local name (with the port if it isn't the usual one).
+    var typedAddress: String {
+        let a = Self.addresses().first ?? "this Mac"
+        return port == 0 || port == Self.fixedPort ? a : "\(a):\(port)"
     }
 
     /// The .local name first, since it survives a new IP address; then every non-loopback IPv4 address.
@@ -79,9 +104,9 @@ final class PairingServer {
 
     private func answer(_ line: Data, on c: NWConnection) {
         var reply: [String: Any] = ["ok": false]
-        if let req = try? JSONSerialization.jsonObject(with: line) as? [String: String],
-           req["code"] == code,
-           let key = req["key"], let name = req["name"] {
+        let req = try? JSONSerialization.jsonObject(with: line) as? [String: String]
+        let given = req?["code"] ?? ""
+        if given == code || LinkCode.same(given, shortCode), let key = req?["key"], let name = req?["name"] {
             do {
                 try AuthorizedKeys.add(key: key, name: name)
                 reply = ["ok": true, "user": NSUserName(), "name": SyncEngine.shared.name, "hostKey": Self.hostKey() ?? ""]
@@ -90,6 +115,15 @@ final class PairingServer {
                 DispatchQueue.main.async { self.onPaired(name) }
             } catch {
                 reply["error"] = "\(error)"
+            }
+        } else {
+            wrong += 1
+            reply["error"] = "That code isn't right. Check it on this computer and try again."
+            if wrong >= Self.maxWrong {
+                reply["error"] = "Too many wrong codes, so this computer stopped linking. Open Link iPhone… there again for a new code."
+                SyncLog.write("pairing stopped after \(wrong) wrong codes")
+                stop()
+                DispatchQueue.main.async { self.onGaveUp() }
             }
         }
         var out = (try? JSONSerialization.data(withJSONObject: reply)) ?? Data()

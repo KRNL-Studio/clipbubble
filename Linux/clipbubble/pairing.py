@@ -13,6 +13,8 @@ import threading
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
+from . import peers
+
 # The launcher install.sh writes, which ssh runs with --peer.
 LAUNCHER = Path.home() / ".local/bin/clipbubble"
 SSH_DIR = Path.home() / ".ssh"
@@ -26,8 +28,13 @@ class Server:
     """Answers one phone, then stops. `on_paired(name)` and `on_expired()`, after ten quiet minutes, run on the
     server's thread."""
 
+    MAX_WRONG = 5
+
     def __init__(self, name, on_paired, on_expired=lambda: None, timeout=600):
         self.code = secrets.token_hex(16)
+        # What a person types on another computer. Short, so a few wrong guesses end the listener.
+        self.short_code = peers.make_code()
+        self.wrong = 0
         self.name = name
         self.on_paired = on_paired
         self.on_expired = on_expired
@@ -42,6 +49,11 @@ class Server:
     def link(self):
         q = {"u": getpass.getuser(), "h": ",".join(addresses()), "p": self.port, "c": self.code, "n": self.name}
         return "clipbubble://pair?" + urlencode(q, quote_via=quote, safe=",")
+
+    def typed_address(self):
+        """What to type into another computer's Add a computer: this machine's name, with the port if it's unusual."""
+        a = next(iter(addresses()), socket.gethostname())
+        return a if self.port == PORT else f"{a}:{self.port}"
 
     def stop(self):
         try:
@@ -64,6 +76,10 @@ class Server:
                 if self._answer(c):
                     self.stop()
                     return
+            if self.wrong >= self.MAX_WRONG:
+                self.stop()
+                self.on_expired()
+                return
 
     def _answer(self, c):
         buf = b""
@@ -77,14 +93,19 @@ class Server:
         except (OSError, ValueError):
             return False
         reply, paired = {"ok": False}, False
-        if isinstance(req, dict) and hmac.compare_digest(str(req.get("code", "")), self.code) \
-                and isinstance(req.get("key"), str) and isinstance(req.get("name"), str):
+        given = str(req.get("code", "")) if isinstance(req, dict) else ""
+        right = hmac.compare_digest(given.encode(), self.code.encode()) or peers.same_code(given, self.short_code)
+        if right and isinstance(req.get("key"), str) and isinstance(req.get("name"), str):
             try:
                 authorize(req["key"], req["name"])
                 reply = {"ok": True, "user": getpass.getuser(), "name": self.name, "hostKey": host_key() or ""}
                 paired = True
             except (OSError, ValueError) as e:
                 reply["error"] = str(e)
+        else:
+            self.wrong += 1
+            reply["error"] = ("Too many wrong codes, so this machine stopped linking. Start linking there again for a new code."
+                              if self.wrong >= self.MAX_WRONG else "That code isn't right. Check it on this machine and try again.")
         try:
             c.sendall(json.dumps(reply).encode() + b"\n")
         except OSError:

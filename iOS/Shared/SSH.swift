@@ -253,7 +253,7 @@ private final class HostKeys: NIOSSHClientServerAuthenticationDelegate {
         let key = "sync.hostkey." + id
         let seen = String(openSSHPublicKey: hostKey)
         if let known = Platform.defaults.string(forKey: key), known != seen {
-            say("Host key verification failed.")
+            say("WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nHost key verification failed.")
             return validationCompletePromise.fail(SSHTunnelError.hostKeyChanged)
         }
         Platform.defaults.set(seen, forKey: key)

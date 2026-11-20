@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from clipbubble import pairing, qr
+from clipbubble import pairing, peers, qr
 
 FIXTURES = Path(__file__).resolve().parents[2] / "Tests/fixtures/qr/codes.json"
 KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPqR3mUOcskK0AMMwJekuAgZW350J/juYdkvePQaexfg"
@@ -53,9 +53,30 @@ class Pairing(unittest.TestCase):
         self.assertTrue(q["h"][0])
 
     def test_wrong_code_adds_nothing(self):
-        self.assertEqual(self.ask({"code": "0" * 32, "key": KEY, "name": "iPhone"}), {"ok": False})
+        reply = self.ask({"code": "0" * 32, "key": KEY, "name": "iPhone"})
+        self.assertFalse(reply["ok"])
+        self.assertIn("code isn't right", reply["error"])
         self.assertFalse((self.ssh / "authorized_keys").exists())
         self.assertEqual(self.paired, [])
+
+    def test_a_computer_can_type_the_short_code(self):
+        typed = peers.display_code(self.server.short_code).lower()   # "k7qm-4ztd": case and dash don't matter
+        reply = self.ask({"code": typed, "key": KEY, "name": "Studio Mac"})
+        self.assertTrue(reply["ok"])
+        self.assertTrue(self.done.wait(5))
+        self.assertEqual(self.paired, ["Studio Mac"])
+
+    def test_too_many_wrong_codes_stop_it(self):
+        expired = threading.Event()
+        self.server.stop()
+        self.server = pairing.Server("ROG", lambda name: self.paired.append(name), on_expired=expired.set)
+        for _ in range(pairing.Server.MAX_WRONG):
+            reply = self.ask({"code": "WRONGONE", "key": KEY, "name": "Guesser"})
+        self.assertIn("Too many wrong codes", reply["error"])
+        self.assertTrue(expired.wait(5))
+        with self.assertRaises(OSError):
+            self.ask({"code": self.server.short_code, "key": KEY, "name": "Guesser"})
+        self.assertFalse((self.ssh / "authorized_keys").exists())
 
     def test_pairs_once_with_a_restricted_key(self):
         reply = self.ask({"code": self.server.code, "key": KEY, "name": "Rohit's iPhone"})

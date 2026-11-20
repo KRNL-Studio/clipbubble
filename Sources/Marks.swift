@@ -89,11 +89,13 @@ struct Mark: Codable, Equatable, Identifiable {
 
     /// Preserve the source rotation when the canvas snaps each axis to whole pixels.
     func rotationTransform(around center: CGPoint, aspect: CGFloat = 1) -> CGAffineTransform {
-        guard rotation != 0 else { return .identity }
-        let c = cos(rotation), sx = -sin(rotation) * aspect, sy = sin(rotation) / aspect
-        return CGAffineTransform(a: c, b: sy, c: sx, d: c,
-                                 tx: center.x - c * center.x - sx * center.y,
-                                 ty: center.y - sy * center.x - c * center.y)
+        let angle = rotation
+        guard angle.isFinite, angle != 0, center.hasFiniteCoordinates,
+              aspect.isFinite, aspect >= CGFloat.ulpOfOne else { return .identity }
+        let c = cos(angle), sx = -sin(angle) * aspect, sy = sin(angle) / aspect
+        let tx = center.x - c * center.x - sx * center.y, ty = center.y - sy * center.x - c * center.y
+        guard tx.isFinite, ty.isFinite else { return .identity }
+        return CGAffineTransform(a: c, b: sy, c: sx, d: c, tx: tx, ty: ty)
     }
 
     /// Everything the mark covers before applying its rotation.
@@ -416,7 +418,7 @@ enum MarkPainter {
     }
 
     private enum RedactionWork: Hashable {
-        case patch(CGRect, Mark.Redaction)
+        case patch(CGRect, Mark.Redaction, [Redaction])
         case crop(CGRect, [Redaction])
     }
 
@@ -484,21 +486,29 @@ enum MarkPainter {
     }
 
     private static func paintRedactions(_ masks: [Redaction], source: CGImage, in ctx: CGContext, place: (CGRect) -> CGRect) {
-        // Patches sample the source, so paint solid masks last to keep their coverage.
-        for mask in masks where mask.mode != .solid { paint(mask, source: source, in: place(mask.rect), ctx: ctx) }
-        for mask in masks where mask.mode == .solid { paint(mask, source: source, in: place(mask.rect), ctx: ctx) }
+        let solids = masks.filter { $0.mode == .solid }
+        for mask in masks where mask.mode != .solid {
+            paintPatch(mask, sampling: source, solids: solids, in: place(mask.rect), ctx: ctx)
+        }
+        // Solid coverage still wins in the final image.
+        for mask in solids { fillSolid(mask, in: place(mask.rect), ctx: ctx) }
     }
 
-    private static func paint(_ mask: Redaction, source: CGImage, in dest: CGRect, ctx: CGContext) {
-        if let color = mask.color {
-            ctx.setFillColor(color.cg)
-            ctx.fill(dest)
-            return
-        }
+    private static func fillSolid(_ mask: Redaction, in dest: CGRect, ctx: CGContext) {
+        guard let color = mask.color else { return }
+        ctx.setFillColor(color.cg)
+        ctx.fill(dest)
+    }
+
+    private static func paintPatch(_ mask: Redaction, sampling source: CGImage, solids: [Redaction], in dest: CGRect, ctx: CGContext) {
         // Sample only whole source pixels inside the crop, even on a fractional edge.
         let x = ceil(mask.rect.minX), y = ceil(mask.rect.minY)
         let r = CGRect(x: x, y: y, width: max(0, floor(mask.rect.maxX) - x), height: max(0, floor(mask.rect.maxY) - y))
-        guard !r.isEmpty, let img = cachedImage(source, .patch(r, mask.mode), make: { redacted(source, r, mask.mode) }) else {
+        let overlaps = solids.filter { !$0.rect.intersection(r).isEmpty }
+        guard !r.isEmpty, let img = cachedImage(source, .patch(r, mask.mode, overlaps), make: {
+            guard let crop = patchSource(source, in: r, solids: overlaps) else { return nil }
+            return redacted(crop, mask.mode)
+        }) else {
             ctx.setFillColor(gray: 0.2, alpha: 1)
             ctx.fill(dest)
             return
@@ -509,15 +519,30 @@ enum MarkPainter {
         ctx.restoreGState()
     }
 
+    private static func patchSource(_ source: CGImage, in rect: CGRect, solids: [Redaction]) -> CGImage? {
+        guard let crop = source.cropping(to: rect) else { return nil }
+        guard !solids.isEmpty else { return crop }
+        // The filter only reads its patch. Fill the overlapping solids before it samples any pixels.
+        guard let ctx = CGContext(data: nil, width: crop.width, height: crop.height, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        ctx.translateBy(x: -rect.minX, y: rect.maxY)
+        ctx.scaleBy(x: 1, y: -1)
+        ctx.interpolationQuality = .none
+        PolishRenderer.drawImage(crop, in: rect, ctx: ctx)
+        for mask in solids { fillSolid(mask, in: mask.rect, ctx: ctx) }
+        return ctx.makeImage()
+    }
+
     /// The covered pixels. Pixelate keeps a handful of big blocks; blur is heavy enough that text can't be read back.
-    static func redacted(_ source: CGImage, _ r: CGRect, _ mode: Mark.Redaction) -> CGImage? {
-        guard let crop = source.cropping(to: r) else { return nil }
+    private static func redacted(_ crop: CGImage, _ mode: Mark.Redaction) -> CGImage? {
+        let width = CGFloat(crop.width), height = CGFloat(crop.height)
         switch mode {
         case .solid: return nil
         case .pixelate:
             // Blocks at least as tall as half the region: one or two rows over a line of text.
-            let block = max(10, min(r.width, r.height) / 2)
-            let w = max(1, Int((r.width / block).rounded(.up))), h = max(1, Int((r.height / block).rounded(.up)))
+            let block = max(10, min(width, height) / 2)
+            let w = max(1, Int((width / block).rounded(.up))), h = max(1, Int((height / block).rounded(.up)))
             guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
                                       space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
             else { return nil }
@@ -530,7 +555,7 @@ enum MarkPainter {
             return ctx.makeImage()
         case .blur:
             let img = CIImage(cgImage: crop)
-            let sigma = max(8, min(r.width, r.height) * 0.45)
+            let sigma = max(8, min(width, height) * 0.45)
             let matte = CIImage(color: CIColor(red: 0.2, green: 0.2, blue: 0.2))
             let out = img.clampedToExtent().applyingGaussianBlur(sigma: sigma).composited(over: matte).cropped(to: img.extent)
             return PolishRenderer.ci.createCGImage(out, from: img.extent)

@@ -94,6 +94,7 @@ struct Geometry: Equatable {
     func source(_ v: CGPoint) -> CGPoint { layout.toSource(CGPoint(x: v.x - origin.x, y: v.y - origin.y), crop: crop) }
 
     func view(_ r: CGRect) -> CGRect {
+        guard r.hasFiniteBounds else { return .null }
         let a = view(r.origin), b = view(CGPoint(x: r.maxX, y: r.maxY))
         return CGRect(x: a.x, y: a.y, width: b.x - a.x, height: b.y - a.y)
     }
@@ -118,7 +119,7 @@ struct Geometry: Equatable {
         g.layout.radius = l(a.layout.radius, b.layout.radius)
         // Scale follows the image's width, so marks stay pinned to it while it moves.
         g.layout.scale = g.layout.image.width / max(b.crop.width, 1)
-        g.layout.image.size.height = b.crop.height * g.layout.scale
+        g.layout.image.size.height = max(1, b.crop.height * g.layout.scale)
         return g
     }
 }
@@ -217,18 +218,20 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
     }
 
     private func target() -> Geometry? {
-        guard let m = model, let d = shownDoc, bounds.width > 40, bounds.height > 40 else { return nil }
+        guard let m = model, let d = shownDoc, d.crop.hasFiniteBounds, !d.crop.isEmpty,
+              bounds.hasFiniteBounds, bounds.width > 40, bounds.height > 40 else { return nil }
         let one = PolishLayout(doc: d, scale: 1)
-        let avail = bounds.insetBy(dx: 36, dy: 30)
-        let fit = max(0.01, min(avail.width / one.canvas.width, avail.height / one.canvas.height, 1))
+        let fit = max(0.01, min((bounds.width - 72) / one.canvas.width, (bounds.height - 60) / one.canvas.height, 1))
         let L = PolishLayout(doc: d, scale: fit * m.zoom)
         let origin = CGPoint(x: ((bounds.width - L.canvas.width) / 2 + m.pan.x).rounded(),
                              y: ((bounds.height - L.canvas.height) / 2 + m.pan.y).rounded())
+        guard origin.hasFiniteCoordinates, L.card.hasFiniteBounds, L.image.hasFiniteBounds,
+              L.scale.isFinite, L.scale > 0 else { return nil }
         return Geometry(origin: origin, layout: L, crop: d.crop)
     }
 
     private func relayout(animated: Bool) {
-        guard let t = target() else { return }
+        guard let t = target() else { shown = nil; anim = nil; needsDisplay = true; return }
         if animated, let s = shown, s != t {
             anim = (s, t, CACurrentMediaTime())
             startLink()
@@ -338,7 +341,7 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
                 PolishRenderer.drawImage(b, in: canvas, ctx: ctx)
             }
         } else {
-            PolishRenderer.drawImage(m.preview.cropping(to: previewRect(m, m.doc.crop)) ?? m.preview, in: g.view(g.crop), ctx: ctx)
+            PolishRenderer.drawImage(m.preview.cropping(to: previewRect(m, g.crop)) ?? m.preview, in: g.view(g.crop), ctx: ctx)
         }
         drawMarks(m, g, ctx)
         drawSelection(m, g, ctx)
@@ -363,7 +366,7 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
     }
 
     private func drawChecker(in r: CGRect, _ ctx: CGContext) {
-        guard r.width > 0 else { return }
+        guard r.hasFiniteBounds, !r.isEmpty else { return }
         ctx.saveGState()
         ctx.clip(to: r)
         ctx.setFillColor(gray: 1, alpha: 1); ctx.fill(r)
@@ -427,6 +430,7 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
         PolishRenderer.drawImage(m.preview, in: img, ctx: ctx)
         drawMarks(m, g, ctx)
         let r = g.view(m.cropDraft)
+        guard r.hasFiniteBounds else { return }
         // Dim what's cut away.
         let dim = CGMutablePath()
         dim.addRect(img); dim.addRect(r)
@@ -444,7 +448,11 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
         ctx.strokePath()
         ctx.setStrokeColor(CGColor(gray: 1, alpha: 1))
         ctx.setLineWidth(1.5)
-        ctx.stroke(r)
+        if r.isEmpty {
+            ctx.move(to: r.origin)
+            ctx.addLine(to: CGPoint(x: r.maxX, y: r.maxY))
+            ctx.strokePath()
+        } else { ctx.stroke(r) }
         // Corner brackets, thicker, so the grab points are obvious.
         ctx.setLineWidth(4)
         let k = min(18, r.width / 3, r.height / 3)
@@ -466,11 +474,13 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
     // MARK: Handles
 
     private func rotationArm(_ mk: Mark, _ g: Geometry) -> (start: CGPoint, end: CGPoint)? {
-        guard mk.canRotate else { return nil }
+        guard mk.canRotate, mk.unrotatedBounds.hasFiniteBounds, g.layout.scale.isFinite, g.layout.scale > 0 else { return nil }
         let r = mk.unrotatedBounds, transform = mk.rotationTransform
         let top = CGPoint(x: r.midX, y: r.minY)
         let knob = CGPoint(x: top.x, y: top.y - 18 / g.layout.scale)
-        return (top.applying(transform), knob.applying(transform))
+        let start = top.applying(transform), end = knob.applying(transform)
+        guard start.hasFiniteCoordinates, end.hasFiniteCoordinates else { return nil }
+        return (start, end)
     }
 
     private func handles(_ mk: Mark, _ g: Geometry) -> [(Handle, CGPoint)] {
@@ -487,7 +497,7 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
             out += [(.point(0), mk.a), (.point(1), mk.b)]
             if mk.kind == .arrow { out.append((.point(2), mk.bendHandle)) }
         }
-        return out
+        return out.filter { $0.1.hasFiniteCoordinates }
     }
 
     private func handle(at v: CGPoint, for mk: Mark, _ g: Geometry) -> Handle? {
@@ -526,6 +536,7 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
         recorded = false
         creationBefore = nil
         drag = .none
+        guard v.hasFiniteCoordinates, p.hasFiniteCoordinates else { return }
 
         if m.tool == .crop { cropDown(m, g, v, p); return }
 
@@ -583,6 +594,7 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
     override func mouseDragged(with e: NSEvent) {
         guard let m = model, let g = shown else { return }
         let v = point(e), p = g.source(v), shift = e.modifierFlags.contains(.shift)
+        guard v.hasFiniteCoordinates, p.hasFiniteCoordinates else { return }
         autoscroll(with: e)
         switch drag {
         case .none: return
@@ -672,18 +684,19 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
                 if mk.kind == .pen { mk.points = Mark.smooth(mk.points, minGap: 1.5 / g.layout.scale) }
                 m.update(id) { $0 = mk }
             }
-        case .cropNew:
-            if m.cropDraft.width < 4 || m.cropDraft.height < 4 { m.cropDraft = m.doc.crop }
         default: break
         }
     }
 
     private func cropDown(_ m: PolishModel, _ g: Geometry, _ v: CGPoint, _ p: CGPoint) {
-        let r = m.cropDraft
+        let r = m.cropDraft.hasFiniteBounds ? m.cropDraft : m.doc.crop
+        var nearest: (dx: Int, dy: Int, distance: CGFloat)?
         for dy in -1...1 { for dx in -1...1 where dx != 0 || dy != 0 {
             let h = g.view(CGPoint(x: r.midX + CGFloat(dx) * r.width / 2, y: r.midY + CGFloat(dy) * r.height / 2))
-            if hypot(h.x - v.x, h.y - v.y) <= 12 { drag = .cropHandle(dx, dy, r); return }
+            let distance = hypot(h.x - v.x, h.y - v.y)
+            if distance <= 12, distance < (nearest?.distance ?? .infinity) { nearest = (dx, dy, distance) }
         } }
+        if let nearest { drag = .cropHandle(nearest.dx, nearest.dy, r); return }
         // Inside a crop that's already been drawn, a drag moves it. Over the whole image, it draws a new one.
         let whole = r.size == CGSize(width: m.source.width, height: m.source.height)
         if r.contains(p) && !whole { drag = .cropMove(p); return }
@@ -692,7 +705,11 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
     }
 
     private func clampCrop(_ m: PolishModel, _ r: CGRect) -> CGRect {
-        r.intersection(CGRect(x: 0, y: 0, width: m.source.width, height: m.source.height))
+        // Clamp both edges to the image so a drag past it can still leave a finite line.
+        let w = CGFloat(m.source.width), h = CGFloat(m.source.height)
+        let x0 = min(w, max(0, r.minX)), x1 = min(w, max(0, r.maxX))
+        let y0 = min(h, max(0, r.minY)), y1 = min(h, max(0, r.maxY))
+        return CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
     }
 
     override func magnify(with e: NSEvent) {
@@ -716,26 +733,36 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
     // MARK: Cursor
 
     override func resetCursorRects() {
+        registerCursorRects(addCursorRect(_:cursor:))
+    }
+
+    func registerCursorRects(_ register: (CGRect, NSCursor) -> Void) {
         guard let m = model else { return }
+        func add(_ rect: CGRect, _ cursor: NSCursor) {
+            guard rect.hasFiniteBounds, !rect.isEmpty else { return }
+            register(rect, cursor)
+        }
         let cursor: NSCursor
         switch m.tool {
         case .select: cursor = .arrow
         case .text: cursor = .iBeam
         default: cursor = .crosshair
         }
-        addCursorRect(bounds, cursor: cursor)
+        add(bounds, cursor)
         guard let g = shown else { return }
         if m.tool == .crop {
-            addCursorRect(g.view(m.cropDraft).insetBy(dx: 10, dy: 10), cursor: .openHand)
+            let rect = g.view(m.cropDraft)
+            // Insetting past the centre gives CGRect.null, which AppKit can't register.
+            if rect.width > 20, rect.height > 20 { add(rect.insetBy(dx: 10, dy: 10), .openHand) }
             return
         }
         if m.tool == .select {
-            for mk in m.doc.marks { addCursorRect(g.view(mk.bounds).insetBy(dx: -4, dy: -4), cursor: .openHand) }
+            for mk in m.doc.marks { add(g.view(mk.bounds).insetBy(dx: -4, dy: -4), .openHand) }
         }
         if let id = m.selection, let mk = m.mark(id) {
             for (_, p) in handles(mk, g) {
                 let v = g.view(p)
-                addCursorRect(CGRect(x: v.x - 7, y: v.y - 7, width: 14, height: 14), cursor: .crosshair)
+                add(CGRect(x: v.x - 7, y: v.y - 7, width: 14, height: 14), .crosshair)
             }
         }
     }
@@ -754,7 +781,7 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
             else { m.close() }
             return true
         case 36, 76: // Return, Enter
-            if m.tool == .crop { m.tool = .select } else { m.copyAndClose() }
+            if m.tool == .crop { m.finishCrop() } else { m.copyAndClose() }
             return true
         case 51, 117: // Delete
             guard m.selection != nil else { return false }
@@ -772,7 +799,7 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
         }
         guard mods.isEmpty, let c = e.charactersIgnoringModifiers?.lowercased().first,
               let tool = PolishTool.allCases.first(where: { $0.key == c }) else { return false }
-        m.tool = tool == .crop && m.tool == .crop ? .select : tool
+        if tool == .crop && m.tool == .crop { m.finishCrop() } else { m.tool = tool }
         return true
     }
 

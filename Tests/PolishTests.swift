@@ -13,6 +13,15 @@ func polishTests() {
         ctx.setFillColor(CGColor(srgbRed: 0, green: 0, blue: 1, alpha: 1)); ctx.fill(CGRect(x: 200, y: 0, width: 200, height: 200))
         ctx.setFillColor(CGColor(gray: 1, alpha: 1)); ctx.fill(CGRect(x: 0, y: 90, width: 400, height: 20))
     }
+    var tiny = PolishDoc(source: dir, size: .zero, style: PolishStyle(size: .x))
+    for crop in [CGRect.zero, .null, CGRect(x: 10, y: 10, width: 100, height: 0.5)] {
+        tiny.crop = crop
+        let layout = PolishLayout(doc: tiny, scale: .zero)
+        check(layout.image.hasFiniteBounds && layout.card.hasFiniteBounds && layout.scale.isFinite
+              && layout.toCanvas(.zero, crop: crop).hasFiniteCoordinates
+              && layout.toSource(.zero, crop: crop).hasFiniteCoordinates && layout.pixelAspect(crop: crop).isFinite,
+              "zero and subpixel dimensions keep layout and coordinate mapping finite")
+    }
     let url = dir.appendingPathComponent("shot.png")
     writePNG(src, to: url)
     check(PolishRenderer.load(url).map { $0.width == 400 && $0.height == 200 } == true, "loads a PNG at its own size")
@@ -310,9 +319,10 @@ private func renderRegressionTests(in dir: URL) {
         }
         check([live, PolishRenderer.render(doc, source: red)].allSatisfy {
             guard let image = $0 else { return false }
-            return pixel(image, 25, 40) == (0, 0, 0, 255) && pixel(image, 75, 40).r == 255
+            return pixel(image, 25, 40) == (0, 0, 0, 255) && pixel(image, 75, 40).r > 0
         }, "a solid mask stays solid under \(mode) in preview and export")
     }
+    redactionSamplingChecks(doc)
     solid.points = full.points
     doc.marks = [solid]
     doc.style = PolishStyle(background: .blurred, padding: 0.2, radius: 0, shadow: 0)
@@ -413,6 +423,42 @@ private func renderRegressionTests(in dir: URL) {
             $0.width == (w + 1) / 2 && $0.height == (h + 1) / 2 &&
                 pixel($0, 0, 0).a == 255 && pixel($0, $0.width - 1, $0.height - 1).a == 255
         } == true, "1× output keeps opaque edges at \(w)×\(h)")
+    }
+}
+
+private func redactionSamplingChecks(_ original: PolishDoc) {
+    var doc = original
+    func source(_ hidden: RGBA) -> CGImage {
+        makeImage(width: 100, height: 80) { ctx in
+            ctx.setFillColor(RGBA(0.2, 0.2, 0.2).cg)
+            ctx.fill(doc.crop)
+            ctx.setFillColor(hidden.cg)
+            for y in stride(from: 0, to: 80, by: 8) {
+                ctx.fill(CGRect(x: 0, y: y, width: 20, height: 6))
+            }
+        }
+    }
+    let bright = source(.white), dark = source(RGBA(0, 0, 1))
+    var solid = Mark(.redact, [.zero, CGPoint(x: 20, y: 80)])
+    solid.redaction = .solid
+    solid.color = .black
+    for mode in [Mark.Redaction.pixelate, .blur] {
+        var patch = Mark(.redact, [.zero, CGPoint(x: 80, y: 80)])
+        patch.redaction = mode
+        doc.marks = [solid, patch]
+        func live(_ image: CGImage) -> CGImage {
+            makeImage(width: 100, height: 80) { ctx in
+                PolishRenderer.drawImage(image, in: doc.crop, ctx: ctx)
+                MarkPainter.draw(doc.marks, doc: doc, source: image, layout: PolishLayout(doc: doc), in: ctx)
+            }
+        }
+        func png(_ image: CGImage?) -> Data? {
+            image.flatMap { NSBitmapImageRep(cgImage: $0).representation(using: .png, properties: [:]) }
+        }
+        let preview = png(live(bright)), export = png(PolishRenderer.render(doc, source: bright))
+        check(preview != nil && preview == png(live(dark))
+              && export != nil && export == png(PolishRenderer.render(doc, source: dark)),
+              "\(mode) cannot sample pixels under the solid mask in preview or export")
     }
 }
 

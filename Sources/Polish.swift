@@ -163,6 +163,17 @@ struct PolishDoc: Codable, Equatable {
 
 // MARK: - Layout
 
+extension CGPoint {
+    var hasFiniteCoordinates: Bool { x.isFinite && y.isFinite }
+}
+
+extension CGRect {
+    var hasFiniteBounds: Bool {
+        !isNull && !isInfinite && origin.hasFiniteCoordinates && size.width.isFinite && size.height.isFinite
+            && minX.isFinite && minY.isFinite && maxX.isFinite && maxY.isFinite
+    }
+}
+
 /// Where everything goes for a document at a given scale (1 = the source's own pixels).
 struct PolishLayout: Equatable {
     /// The whole picture.
@@ -178,43 +189,48 @@ struct PolishLayout: Equatable {
 
     init(doc: PolishDoc, scale requested: CGFloat = 1) {
         let style = doc.style
-        let content = doc.crop.size
+        let crop = doc.crop.hasFiniteBounds ? doc.crop.size : .zero
+        let content = CGSize(width: max(1, crop.width), height: max(1, crop.height))
         let bar = style.frame == .none ? 0 : min(max(content.width / 36, 22), 60)
         let cardSize = CGSize(width: content.width, height: content.height + bar)
-        let pad = style.padding * max(content.width, content.height)
-        var size = CGSize(width: cardSize.width + pad * 2, height: cardSize.height + pad * 2)
+        let padding = max(0, style.padding) * max(content.width, content.height) * 2
+        let pad = padding.isFinite ? padding : 0
+        var size = CGSize(width: cardSize.width + pad, height: cardSize.height + pad)
         if let aspect = style.size.aspect {
             // Grow the short side so the card still fits with its padding.
             if size.width / size.height < aspect { size.width = size.height * aspect } else { size.height = size.width / aspect }
         }
-        var s = requested
+        var s = requested.isFinite && requested > 0 ? requested : 1
         if let px = style.size.pixels { s *= px.width / size.width }
-        let minimum: CGFloat = s > 0 ? 1 : 0
-        canvas = CGSize(width: max(minimum, (size.width * s).rounded()), height: max(minimum, (size.height * s).rounded()))
+        canvas = CGSize(width: max(1, (size.width * s).rounded()), height: max(1, (size.height * s).rounded()))
         // Snap the clip and image together so odd sizes keep their opaque edges at 1×.
-        let cw = max(minimum, (cardSize.width * s).rounded()), ih = max(minimum, (content.height * s).rounded())
+        let cw = max(1, (cardSize.width * s).rounded()), ih = max(1, (content.height * s).rounded())
         let ch = max(ih, (cardSize.height * s).rounded())
         card = CGRect(x: ((canvas.width - cw) / 2).rounded(), y: ((canvas.height - ch) / 2).rounded(), width: cw, height: ch)
         titleBar = ch - ih
         image = CGRect(x: card.minX, y: card.minY + titleBar, width: cw, height: ih)
-        radius = style.radius * min(content.width, content.height) * s
+        let corner = style.radius * min(content.width, content.height) * s
+        radius = corner.isFinite ? max(0, corner) : 0
         scale = s
     }
 
     /// A point in source pixels to a point on the canvas (origin top left).
     func toCanvas(_ p: CGPoint, crop: CGRect) -> CGPoint {
-        CGPoint(x: image.minX + (p.x - crop.minX) * image.width / crop.width,
-                y: image.minY + (p.y - crop.minY) * image.height / crop.height)
+        guard crop.hasFiniteBounds else { return image.origin }
+        return CGPoint(x: image.minX + (p.x - crop.minX) * (image.width / max(1, crop.width)),
+                       y: image.minY + (p.y - crop.minY) * (image.height / max(1, crop.height)))
     }
 
     /// A point on the canvas back to source pixels.
     func toSource(_ p: CGPoint, crop: CGRect) -> CGPoint {
-        CGPoint(x: (p.x - image.minX) * crop.width / image.width + crop.minX,
-                y: (p.y - image.minY) * crop.height / image.height + crop.minY)
+        guard crop.hasFiniteBounds else { return .zero }
+        return CGPoint(x: (p.x - image.minX) * (max(1, crop.width) / max(1, image.width)) + crop.minX,
+                       y: (p.y - image.minY) * (max(1, crop.height) / max(1, image.height)) + crop.minY)
     }
 
     func pixelAspect(crop: CGRect) -> CGFloat {
-        (image.width / crop.width) / (image.height / crop.height)
+        guard crop.hasFiniteBounds else { return 1 }
+        return (max(1, image.width) / max(1, crop.width)) / (max(1, image.height) / max(1, crop.height))
     }
 }
 
@@ -258,18 +274,19 @@ enum PolishRenderer {
 
     /// The whole picture. `marks: false` leaves them out, for the editor, which draws them live on top.
     static func render(_ doc: PolishDoc, source: CGImage, scale: CGFloat = 1, marks drawMarks: Bool = true) -> CGImage? {
+        guard doc.crop.hasFiniteBounds, scale.isFinite, scale > 0 else { return nil }
+        let sourceBounds = CGRect(x: 0, y: 0, width: source.width, height: source.height)
+        let bounds = doc.crop.integral.intersection(sourceBounds)
+        guard !bounds.isEmpty, let cropped = bounds == sourceBounds ? source : source.cropping(to: bounds) else { return nil }
         let L = PolishLayout(doc: doc, scale: scale)
-        guard L.canvas.width >= 1, L.canvas.height >= 1,
-              let ctx = CGContext(data: nil, width: Int(L.canvas.width), height: Int(L.canvas.height), bitsPerComponent: 8, bytesPerRow: 0,
+        guard let width = Int(exactly: L.canvas.width), let height = Int(exactly: L.canvas.height),
+              let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
                                   space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
         // Draw top-down, like the layout.
         ctx.translateBy(x: 0, y: L.canvas.height)
         ctx.scaleBy(x: 1, y: -1)
         ctx.interpolationQuality = .high
-        let sourceBounds = CGRect(x: 0, y: 0, width: source.width, height: source.height)
-        let bounds = doc.crop.integral.intersection(sourceBounds)
-        guard !bounds.isEmpty, let cropped = bounds == sourceBounds ? source : source.cropping(to: bounds) else { return nil }
         // The editor draws the masks live over the foreground, but padding also reads source pixels.
         let masks = drawMarks || doc.style.background == .blurred ? MarkPainter.redactions(doc.marks, in: doc.crop, source: source) : []
         guard let redacted = MarkPainter.redactedCrop(cropped, source: source, bounds: bounds, redactions: masks) else { return nil }

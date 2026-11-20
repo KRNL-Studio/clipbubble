@@ -51,7 +51,12 @@ final class PolishModel: ObservableObject {
     }
     @Published var selection: UUID? { didSet { if selection != nil { pane = .markup } } }
     @Published var cropDraft: CGRect
-    @Published var zoom: CGFloat = 1
+    @Published var zoom: CGFloat = 1 {
+        didSet {
+            if !zoom.isFinite { zoom = 1 }
+            else if zoom < 0.25 || zoom > 8 { zoom = min(8, max(0.25, zoom)) }
+        }
+    }
     @Published var pan: CGPoint = .zero
     @Published var ink = Ink.saved { didSet { Ink.saved = ink } }
     @Published var pane: Pane = .style
@@ -215,13 +220,16 @@ final class PolishModel: ObservableObject {
     }
 
     private var validCropDraft: CGRect? {
-        let r = cropDraft.integral.intersection(CGRect(x: 0, y: 0, width: source.width, height: source.height))
-        return r.width >= 4 && r.height >= 4 ? r : nil
+        guard cropDraft.hasFiniteBounds else { return nil }
+        let r = cropDraft.intersection(CGRect(x: 0, y: 0, width: source.width, height: source.height))
+        // Validate before snapping so a subpixel drag can't become an applied crop.
+        return r.width >= 1 && r.height >= 1 ? r.integral : nil
     }
 
     var cropBadgeText: String {
+        guard let crop = validCropDraft else { return "Crop too small" }
         var draft = doc
-        draft.crop = validCropDraft ?? doc.crop
+        draft.crop = crop
         let size = PolishLayout(doc: draft, scale: exportScale).canvas
         return "\(Int(size.width)) × \(Int(size.height))"
     }
@@ -230,6 +238,14 @@ final class PolishModel: ObservableObject {
         guard let r = validCropDraft, r != doc.crop else { return }
         edit("crop") { $0.crop = r }
         lastCoalesce = nil
+    }
+
+    func finishCrop() {
+        guard validCropDraft != nil else {
+            say("Crop must be at least 1 × 1 pixel", "exclamationmark.triangle")
+            return
+        }
+        tool = .select
     }
 
     func cancelCrop() {
@@ -570,7 +586,7 @@ final class PolishWindow: NSObject, NSWindowDelegate {
         let screen = (NSScreen.main ?? NSScreen.screens[0]).visibleFrame
         let chrome = NSSize(width: 290, height: 140)
         let one = PolishLayout(doc: model.doc, scale: 1).canvas
-        let backing = NSScreen.main?.backingScaleFactor ?? 2
+        let backing = max(1, NSScreen.main?.backingScaleFactor ?? 2)
         let maxW = screen.width * 0.86 - chrome.width, maxH = screen.height * 0.86 - chrome.height
         let k = min(maxW / one.width, maxH / one.height, 1 / backing * 1.4)
         return NSSize(width: max(860, one.width * k + chrome.width + 72), height: max(560, one.height * k + chrome.height + 60))
@@ -723,14 +739,18 @@ private struct PolishToolbar: View {
             ForEach(Array(PolishTool.groups.enumerated()), id: \.offset) { i, group in
                 if i > 0 { Divider().frame(height: 18) }
                 HStack(spacing: 2) {
-                    ForEach(group) { t in ToolButton(tool: t, on: model.tool == t) { model.tool = model.tool == t && t == .crop ? .select : t } }
+                    ForEach(group) { t in
+                        ToolButton(tool: t, on: model.tool == t) {
+                            if t == .crop && model.tool == .crop { model.finishCrop() } else { model.tool = t }
+                        }
+                    }
                 }
             }
             WindowDragArea().frame(maxWidth: .infinity, maxHeight: .infinity)
             if model.tool == .crop {
                 Button("Reset") { model.resetCrop() }.controlSize(.small)
                 Button("Cancel") { model.cancelCrop() }.controlSize(.small)
-                Button("Done") { model.tool = .select }.controlSize(.small).buttonStyle(.borderedProminent)
+                Button("Done") { model.finishCrop() }.controlSize(.small).buttonStyle(.borderedProminent)
                 Divider().frame(height: 18)
             }
             IconButton(symbol: "arrow.uturn.backward", help: "Undo  ⌘Z", disabled: !model.history.canUndo) { model.undo() }
@@ -951,11 +971,13 @@ private struct StylePane: View {
                     Chip(title: s.title, on: model.doc.style.size == s) { model.edit("size") { $0.style.size = s } }
                 }
             }
-            Text(sizeLine).font(.system(size: 11).monospacedDigit()).foregroundStyle(.tertiary)
+            InspectorHintLabel(text: Text(sizeLine).font(.system(size: 11).monospacedDigit()))
         }
         Section(title: "Crop") {
             HStack {
-                Button(model.tool == .crop ? "Done Cropping" : "Crop…") { model.tool = model.tool == .crop ? .select : .crop }
+                Button(model.tool == .crop ? "Done Cropping" : "Crop…") {
+                    if model.tool == .crop { model.finishCrop() } else { model.tool = .crop }
+                }
                 if model.doc.crop.size != CGSize(width: model.source.width, height: model.source.height) {
                     Button("Reset") { model.resetCrop() }
                 }
@@ -1048,11 +1070,37 @@ private struct Chip: View {
     }
 }
 
-private struct MarkupPane: View {
+enum InspectorHint: CaseIterable, View {
+    case arrow, text, redact, spotlight, measure, tools, privacy
+
+    private var message: String {
+        switch self {
+        case .arrow: return "Drag the middle handle to curve it."
+        case .text: return "Double-click text to edit it. Return finishes, ⌥Return adds a line."
+        case .redact: return "Covered pixels are replaced in the exported image, not just hidden."
+        case .spotlight: return "Everything outside the box is dimmed. Draw several to spotlight more than one thing."
+        case .measure: return "Shows the distance in the screenshot's own pixels. Hold Shift for straight lines."
+        case .tools: return "Pick a tool above, or press its key: A for an arrow, R for a box, T for text, B to redact."
+        case .privacy: return "Text is read on this Mac. Check the result: anything missed can be covered with the Redact tool."
+        }
+    }
+
+    var body: some View { InspectorHintLabel(text: Text(message).font(.system(size: self == .tools ? 12 : 11))) }
+}
+
+private struct InspectorHintLabel: View {
+    let text: Text
     @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        text.foregroundStyle(Color(white: colorScheme == .dark ? 0.78 : 0.33))
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+private struct MarkupPane: View {
     @ObservedObject var model: PolishModel
 
-    private var hintColor: Color { Color(white: colorScheme == .dark ? 0.78 : 0.33) }
     /// What the controls apply to: the selected mark, or the tool's next one.
     private var kind: Mark.Kind? { model.selected?.kind ?? model.tool.kind }
 
@@ -1081,7 +1129,7 @@ private struct MarkupPane: View {
                     get: { model.selected?.doubleHead ?? model.ink.doubleHead },
                     set: { v in model.style("double", ink: { $0.doubleHead = v }, mark: { $0.doubleHead = v }) }))
                     .font(.system(size: 12))
-                Text("Drag the middle handle to curve it.").font(.system(size: 11)).foregroundStyle(.tertiary)
+                InspectorHint.arrow
             }
             if kind == .text || kind == .step {
                 SliderRow(title: "Size", value: Binding(
@@ -1094,7 +1142,7 @@ private struct MarkupPane: View {
                     get: { model.selected?.pill ?? model.ink.pill },
                     set: { v in model.style("pill", ink: { $0.pill = v }, mark: { $0.pill = v }) }))
                     .font(.system(size: 12))
-                Text("Double-click text to edit it. Return finishes, ⌥Return adds a line.").font(.system(size: 11)).foregroundStyle(.tertiary)
+                InspectorHint.text
             }
             if kind == .step, let m = model.selected {
                 Stepper("Number \(m.number)", value: Binding(
@@ -1109,13 +1157,13 @@ private struct MarkupPane: View {
                     ForEach(Mark.Redaction.allCases, id: \.self) { Text($0.title).tag($0) }
                 }
                 .pickerStyle(.segmented).labelsHidden()
-                Text("Covered pixels are replaced in the exported image, not just hidden.").font(.system(size: 11)).foregroundStyle(.tertiary)
+                InspectorHint.redact
             }
             if kind == .highlight {
-                Text("Everything outside the box is dimmed. Draw several to spotlight more than one thing.").font(.system(size: 11)).foregroundStyle(hintColor)
+                InspectorHint.spotlight
             }
             if kind == .measure {
-                Text("Shows the distance in the screenshot's own pixels. Hold Shift for straight lines.").font(.system(size: 11)).foregroundStyle(.tertiary)
+                InspectorHint.measure
             }
             if model.selected != nil {
                 Button(role: .destructive) { model.deleteSelection() } label: { Label("Delete", systemImage: "trash") }
@@ -1123,9 +1171,7 @@ private struct MarkupPane: View {
             }
             Divider()
         } else {
-            Text("Pick a tool above, or press its key: A for an arrow, R for a box, T for text, B to redact.")
-                .font(.system(size: 12)).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            InspectorHint.tools
             Divider()
         }
         Section(title: "Hide sensitive info") {
@@ -1143,9 +1189,7 @@ private struct MarkupPane: View {
                 }
             }
             .controlSize(.small)
-            Text("Text is read on this Mac. Check the result: anything missed can be covered with the Redact tool.")
-                .font(.system(size: 11)).foregroundStyle(hintColor)
-                .fixedSize(horizontal: false, vertical: true)
+            InspectorHint.privacy
         }
     }
 

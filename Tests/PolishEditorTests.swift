@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import SwiftUI
 
 private func editorPump(_ seconds: TimeInterval) {
     RunLoop.main.run(until: Date().addingTimeInterval(seconds))
@@ -215,6 +216,79 @@ private func editorCropBadgeChecks(_ dir: URL) throws {
     }
 }
 
+private func editorThinCropChecks(_ model: PolishModel, _ canvas: PolishCanvas, _ window: EditorWindow) {
+    let doc = model.doc, history = model.history, tool = model.tool
+    defer { model.cancelCrop(); model.doc = doc; model.history = history; model.tool = tool; canvas.sync() }
+    let start = CGPoint(x: 100.25, y: 100.25)
+    for (w, h) in [(180.0, 0.0), (180, 0.5), (180, 6), (0, 100)] {
+        if model.tool != .crop { editorKey("c", kVK_ANSI_C, in: window) }
+        model.resetCrop()
+        canvas.sync()
+        guard let g = canvas.geometry else { check(false, "crop has a canvas layout"); return }
+        let view = g.view(start)
+        let end = g.source(CGPoint(x: view.x + w, y: view.y + h))
+        editorMouse(.leftMouseDown, start, on: canvas)
+        editorMouse(.leftMouseDragged, end, on: canvas)
+        canvas.sync()
+        var rects = [CGRect]()
+        canvas.registerCursorRects { rect, _ in rects.append(rect) }
+        let safe = !rects.isEmpty && rects.allSatisfy { !$0.isNull && !$0.isInfinite
+            && [$0.minX, $0.minY, $0.width, $0.height].allSatisfy(\.isFinite) }
+        check(safe, "thin crop \(w) × \(h) registers only finite cursor rects")
+        if safe { canvas.resetCursorRects() }
+        let draft = model.cropDraft
+        editorMouse(.leftMouseUp, end, on: canvas)
+        check(model.cropDraft == draft && abs(g.view(draft).width - w) < 0.01
+              && abs(g.view(draft).height - h) < 0.01, "thin crop \(w) × \(h) remains visible after dragging")
+        editorKey("\r", kVK_Return, in: window)
+        if draft.width >= 1 && draft.height >= 1 {
+            check(model.tool == .select && model.doc.crop == draft.integral, "a six-point crop applies")
+            model.doc = doc
+        } else {
+            check(model.tool == .crop && model.doc.crop == doc.crop && model.cropBadgeText == "Crop too small",
+                  "a crop below one source pixel stays a draft")
+        }
+    }
+    let zoom = model.zoom
+    model.zoom = .nan
+    canvas.sync()
+    check(model.zoom == 1 && canvas.geometry?.layout.scale.isFinite == true, "invalid zoom keeps the canvas layout finite")
+    model.zoom = zoom
+}
+
+@MainActor private func inspectorHintChecks() {
+    func linear(_ channel: CGFloat) -> CGFloat {
+        channel <= 0.04045 ? channel / 12.92 : pow((channel + 0.055) / 1.055, 2.4)
+    }
+    func luminance(_ color: NSColor) -> CGFloat {
+        guard let rgb = color.usingColorSpace(.sRGB) else { return 0 }
+        return 0.2126 * linear(rgb.redComponent) + 0.7152 * linear(rgb.greenComponent) + 0.0722 * linear(rgb.blueComponent)
+    }
+    for (scheme, name) in [(ColorScheme.light, NSAppearance.Name.aqua), (.dark, .darkAqua)] {
+        var backdrop = NSColor.white
+        NSAppearance(named: name)?.performAsCurrentDrawingAppearance {
+            backdrop = NSColor.windowBackgroundColor.usingColorSpace(.sRGB) ?? .white
+        }
+        let background = luminance(backdrop)
+        for hint in InspectorHint.allCases {
+            let renderer = ImageRenderer(content: hint.frame(width: 244, alignment: .leading).padding(4)
+                .background(Color(nsColor: backdrop)).environment(\.colorScheme, scheme))
+            renderer.scale = 3
+            guard let image = renderer.cgImage else { check(false, "render inspector \(hint) hint"); continue }
+            let bitmap = NSBitmapImageRep(cgImage: image)
+            var contrast: CGFloat = 1
+            for y in 0..<image.height {
+                for x in 0..<image.width {
+                    guard let color = bitmap.colorAt(x: x, y: y) else { continue }
+                    let foreground = luminance(color)
+                    contrast = max(contrast, (max(foreground, background) + 0.05) / (min(foreground, background) + 0.05))
+                }
+            }
+            check(contrast >= 4.5, "inspector \(hint) hint meets 4.5:1 in \(scheme) (\(contrast))")
+        }
+    }
+}
+
 private func editorThumbnailChecks(_ dir: URL) {
     let model = PolishModel(url: dir.appendingPathComponent("thumbnail.png"), image: editorImage())
     func shade(_ x: Int) -> CGFloat {
@@ -299,6 +373,29 @@ func editorRotationChecks(_ model: PolishModel, _ canvas: PolishCanvas) {
     check(atAngle(30), "one undo restores the previous rotation")
     model.redo()
     check(atAngle(45), "redo restores the snapped rotation")
+
+    for kind in [Mark.Kind.rect, .ellipse] {
+        let center = CGPoint(x: 330, y: 150)
+        let point = Mark(kind, [center, center])
+        model.doc.marks = [point]
+        model.selection = point.id
+        canvas.sync()
+        let handle = CGPoint(x: center.x, y: center.y - 18 / (canvas.geometry?.layout.scale ?? 1))
+        var rotated = point
+        rotated.rotation = .pi / 4
+        drag(handle, through: [handle.applying(rotated.rotationTransform)])
+        var rects = [CGRect]()
+        canvas.registerCursorRects { rect, _ in rects.append(rect) }
+        let angle = model.mark(point.id)?.rotation ?? 0
+        check(abs(angle - .pi / 4) < 0.001 && rects.count > 2 && rects.allSatisfy {
+            [$0.minX, $0.minY, $0.width, $0.height].allSatisfy(\.isFinite)
+        }, "a zero-size \(kind) rotates with finite handles")
+        let end = CGPoint(x: center.x + 60, y: center.y + 40)
+        drag(center, through: [end.applying(rotated.rotationTransform)])
+        let size = model.mark(point.id)?.rect.size ?? .zero
+        check(abs(size.width - 60) < 0.01 && abs(size.height - 40) < 0.01
+              && model.mark(point.id)?.rotation == angle, "a rotated zero-size \(kind) resizes from its point")
+    }
 }
 
 func polishEditorInteractions(_ model: PolishModel, _ canvas: PolishCanvas, _ window: EditorWindow) {
@@ -454,6 +551,7 @@ private func editorWindowChecks(_ dir: URL) throws {
         window = editor
         model = activeModel
         editorPump(0.3)
+        editorThinCropChecks(activeModel, canvas, editor)
         polishEditorInteractions(activeModel, canvas, editor)
         activeModel.doc.style.background = .solid(RGBA(0, 1, 0))
         canvas.sync()
@@ -568,6 +666,7 @@ func polishEditorTests() {
         try editorHandoffIsolation()
         try editorExports(dir)
         try editorCropBadgeChecks(dir)
+        MainActor.assumeIsolated { inspectorHintChecks() }
         editorThumbnailChecks(dir)
         editorPreviewCheck(dir)
         editorBaseKeyChecks(dir)

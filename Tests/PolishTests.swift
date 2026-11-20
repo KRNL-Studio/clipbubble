@@ -1,4 +1,6 @@
 import AppKit
+import ImageIO
+import UniformTypeIdentifiers
 
 /// The screenshot editor: layout maths, rendering, marks, redaction matching, presets and undo.
 func polishTests() {
@@ -14,6 +16,22 @@ func polishTests() {
     let url = dir.appendingPathComponent("shot.png")
     writePNG(src, to: url)
     check(PolishRenderer.load(url).map { $0.width == 400 && $0.height == 200 } == true, "loads a PNG at its own size")
+    let tall = dir.appendingPathComponent("tall.png")
+    writePNG(makeImage(width: 500, height: 20_000) { ctx in
+        ctx.setFillColor(gray: 1, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: 500, height: 20_000))
+    }, to: tall)
+    check(PolishRenderer.load(tall).map { $0.width == 500 && $0.height == 20_000 } == true, "long PNG loads at full resolution")
+
+    for type in [UTType.jpeg, .heic] {
+        let rotated = dir.appendingPathComponent("rotated.\(type.preferredFilenameExtension!)")
+        if let dest = CGImageDestinationCreateWithURL(rotated as CFURL, type.identifier as CFString, 1, nil) {
+            CGImageDestinationAddImage(dest, src, [kCGImagePropertyOrientation: 6] as CFDictionary)
+            check(CGImageDestinationFinalize(dest) && PolishRenderer.load(rotated).map {
+                $0.width == 200 && $0.height == 400 && pixel($0, 40, 50).r > 220 && pixel($0, 40, 350).b > 220
+            } == true, "\(type) honors EXIF rotation")
+        } else { check(false, "can write a rotated \(type) fixture") }
+    }
 
     // Layout: padding is a share of the longer side, on every side.
     var doc = PolishDoc(source: url, size: CGSize(width: 400, height: 200), style: PolishPreset.builtIn[0].style)
@@ -91,6 +109,7 @@ func polishTests() {
         let row = (0..<50).map { pixel(img, $0, 10) }
         check(Set(row.map { "\($0.r),\($0.g),\($0.b)" }).count == 1, "a pixelate block is one flat color")
     }
+    renderRegressionTests(in: dir)
 
     // Every kind of mark draws without trouble, through the same path as export.
     doc.style = PolishPreset.builtIn[2].style
@@ -144,6 +163,8 @@ func polishTests() {
     check(found("mail rohit.g+test@example.co.uk now") == ["rohit.g+test@example.co.uk"], "finds an email: \(found("mail rohit.g+test@example.co.uk now"))")
     check(kinds("card 4242 4242 4242 4242 exp") == [.card], "finds a valid card number: \(kinds("card 4242 4242 4242 4242 exp"))")
     check(kinds("4000-0566-5566-5556") == [.card], "with dashes too")
+    check(found("card 4242 4242 4242 4242 12/29") == ["4242 4242 4242 4242"], "card span ends before expiry")
+    check(found("12 4242 4242 4242 4242 12/29") == ["4242 4242 4242 4242"], "card span can start inside a grouped run")
     check(!kinds("4242 4242 4242 4241").contains(.card), "a number that fails the check digit isn't a card")
     check(Redactor.luhn(Redactor.digits("378282246310005")) && !Redactor.luhn(Redactor.digits("378282246310006")), "Luhn")
     check(kinds("call +1 (415) 555-0132 today") == [.phone], "finds a phone number: \(found("call +1 (415) 555-0132 today"))")
@@ -151,6 +172,11 @@ func polishTests() {
     check(kinds("2026-11-20 14:22:01").isEmpty, "a timestamp isn't a phone number: \(found("2026-11-20 14:22:01"))")
     check(kinds("order 12345").isEmpty && kinds("v1.2.3").isEmpty, "short numbers and versions are left alone")
     check(found("ssh 192.168.1.20 -p 22") == ["192.168.1.20"], "finds an IP address")
+    check(found("ssh [2001:db8::1], [::ffff:192.0.2.1], and ::1") == ["2001:db8::1", "::ffff:192.0.2.1", "::1"], "finds valid IPv6 addresses")
+    check(kinds("bad 2001:::db8::1 and 2001:db8::xyz").isEmpty, "rejects malformed IPv6")
+    check(kinds("v1.2.3.4 V1.2.3.4 build1.2.3.4").isEmpty, "skips letter-prefixed IPv4 versions")
+    check(kinds("time=1712345678 time:1712345678").isEmpty, "skips bare Unix timestamps as phones")
+    check(found("call: 4155550132") == ["4155550132"], "accepts bare phones after a space")
     check(kinds("999.1.1.1").isEmpty, "a part over 255 isn't an IP address")
     // Split up so the source holds nothing that looks like a real key to a secret scanner.
     let secrets: [String] = [
@@ -197,6 +223,132 @@ func polishTests() {
     check(!h.canRedo, "a new change drops the redo trail")
 }
 
+private func renderRegressionTests(in dir: URL) {
+    let url = dir.appendingPathComponent("redactions.png")
+    let plain = PolishPreset.builtIn[0].style
+    var doc = PolishDoc(source: url, size: CGSize(width: 100, height: 80), style: plain)
+    let full = Mark(.redact, [.zero, CGPoint(x: 100, y: 80)])
+    let translucent = makeImage(width: 100, height: 80) { ctx in
+        ctx.setFillColor(CGColor(srgbRed: 1, green: 0, blue: 0, alpha: 0.65))
+        ctx.fill(CGRect(x: 25, y: 0, width: 6, height: 80))
+    }
+    for mode in [Mark.Redaction.pixelate, .blur] {
+        doc.marks = [full]
+        doc.marks[0].redaction = mode
+        check(PolishRenderer.render(doc, source: translucent).map {
+            pixel($0, 27, 40).a == 255 && pixel($0, 80, 40).a == 255
+        } == true, "\(mode) replaces transparent and translucent pixels")
+    }
+
+    let red = makeImage(width: 100, height: 80) { ctx in
+        ctx.setFillColor(RGBA(1, 0, 0).cg)
+        ctx.fill(doc.crop)
+    }
+    var solid = full
+    solid.redaction = .solid
+    solid.color = .black
+    doc.marks = [solid]
+    doc.style = PolishStyle(background: .blurred, padding: 0.2, radius: 0, shadow: 0)
+    check([true, false].allSatisfy { marks in
+        PolishRenderer.render(doc, source: red, marks: marks).map { pixel($0, 6, 6).r < 5 } == true
+    }, "blurred padding uses redacted pixels")
+    doc.marks[0].color = RGBA(0, 0, 1)
+    check(PolishRenderer.render(doc, source: red, marks: false).map {
+        pixel($0, 6, 6).b > 180 && pixel($0, 70, 60).r > 240
+    } == true, "blurred padding refreshes when redactions change")
+
+    doc.style = plain
+    doc.marks = [full]
+    // Repeatedly release the sources so the allocator can reuse their addresses.
+    let ownPatches = (0..<128).allSatisfy { i in
+        autoreleasepool {
+            let expected = (r: 16 + i % 8 * 32, g: 16 + i / 8 % 4 * 64, b: 16 + i / 32 * 64)
+            let source = makeImage(width: 100, height: 80) { ctx in
+                ctx.setFillColor(RGBA(CGFloat(expected.r) / 255, CGFloat(expected.g) / 255, CGFloat(expected.b) / 255).cg)
+                ctx.fill(doc.crop)
+            }
+            return PolishRenderer.render(doc, source: source).map {
+                let p = pixel($0, 50, 40)
+                return abs(p.r - expected.r) <= 1 && abs(p.g - expected.g) <= 1 && abs(p.b - expected.b) <= 1
+            } == true
+        }
+    }
+    check(ownPatches, "same mask uses each source image's own pixels")
+
+    solid.color = .white
+    var box = Mark(.rect, [CGPoint(x: 20, y: 20), CGPoint(x: 60, y: 60)])
+    box.fill = .fill
+    box.color = RGBA(1, 0, 0)
+    let firstLight = Mark(.highlight, [CGPoint(x: 8, y: 8), CGPoint(x: 55, y: 65)])
+    let secondLight = Mark(.highlight, [CGPoint(x: 28, y: 18), CGPoint(x: 72, y: 72)])
+    doc.marks = [solid, firstLight, box]
+    let live = makeImage(width: 100, height: 80) { ctx in
+        PolishRenderer.drawImage(red, in: doc.crop, ctx: ctx)
+        MarkPainter.draw(doc.marks, doc: doc, source: red, layout: PolishLayout(doc: doc), in: ctx)
+    }
+    check([live, PolishRenderer.render(doc, source: red)].allSatisfy {
+        guard let img = $0 else { return false }
+        return pixel(img, 40, 40).g == 255 && pixel(img, 90, 40).g == 255
+    }, "redaction covers later marks and spotlight dimming")
+    doc.marks = [firstLight, secondLight]
+    check(PolishRenderer.render(doc, source: red).map {
+        pixel($0, 18, 40).r == 255 && pixel($0, 40, 40).r == 255 && pixel($0, 90, 40).r < 150
+    } == true, "overlapping spotlights stay lit")
+
+    let split = makeImage(width: 100, height: 80) { ctx in
+        ctx.setFillColor(gray: 0, alpha: 1)
+        ctx.fill(doc.crop)
+        ctx.setFillColor(RGBA(1, 0, 0).cg)
+        ctx.fill(CGRect(x: 0, y: 0, width: 31, height: 80))
+    }
+    var strip = Mark(.redact, [.zero, CGPoint(x: 31, y: 80)])
+    strip.redaction = .solid
+    strip.color = .black
+    doc.marks = [strip]
+    writePNG(split, to: url)
+    check(PolishRenderer.png(doc, retina: false).flatMap { NSBitmapImageRep(data: $0)?.cgImage }.map { img in
+        (12...18).allSatisfy { pixel(img, $0, 20).r == 0 }
+    } == true, "1× export resamples after masking the original")
+
+    doc.crop = CGRect(x: 31, y: 0, width: 69, height: 80)
+    for mode in [Mark.Redaction.pixelate, .blur] {
+        doc.marks = [Mark(.redact, [.zero, CGPoint(x: 53, y: 80)])]
+        doc.marks[0].redaction = mode
+        check(PolishRenderer.render(doc, source: split).map { pixel($0, 2, 40).r == 0 } == true,
+              "\(mode) samples only inside the crop")
+    }
+
+    doc.crop = CGRect(x: 0, y: 40, width: 100, height: 40)
+    doc.style.frame = .light
+    doc.marks = []
+    box.points = [CGPoint(x: 50, y: 20), CGPoint(x: 90, y: 60)]
+    let without = PolishRenderer.render(doc, source: red)
+    doc.marks = [box]
+    check(without.flatMap { base in
+        PolishRenderer.render(doc, source: red).map { pixel($0, 70, 12) == pixel(base, 70, 12) }
+    } == true, "marks stay out of the title bar")
+
+    doc.style = plain
+    doc.crop = CGRect(x: 0, y: 0, width: 100, height: 80)
+    doc.marks = []
+    doc.style.radius = 0.25
+    check(PolishRenderer.render(doc, source: red).map {
+        pixel($0, 0, 0).a == 0 && pixel($0, 50, 40).a == 255
+    } == true, "None style honors corners")
+
+    for (w, h) in [(101, 51), (1, 1)] {
+        let img = makeImage(width: w, height: h) { ctx in
+            ctx.setFillColor(gray: 1, alpha: 1)
+            ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        }
+        doc = PolishDoc(source: url, size: CGSize(width: w, height: h), style: plain)
+        check(PolishRenderer.render(doc, source: img, scale: 0.5).map {
+            $0.width == (w + 1) / 2 && $0.height == (h + 1) / 2 &&
+                pixel($0, 0, 0).a == 255 && pixel($0, $0.width - 1, $0.height - 1).a == 255
+        } == true, "1× output keeps opaque edges at \(w)×\(h)")
+    }
+}
+
 private func makeImage(width: Int, height: Int, draw: (CGContext) -> Void) -> CGImage {
     let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
                         space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
@@ -212,10 +364,10 @@ private func writePNG(_ img: CGImage, to url: URL) {
 }
 
 /// The color at (x, y), origin top left, in 0–255 sRGB.
-private func pixel(_ img: CGImage, _ x: Int, _ y: Int) -> (r: Int, g: Int, b: Int) {
+private func pixel(_ img: CGImage, _ x: Int, _ y: Int) -> (r: Int, g: Int, b: Int, a: Int) {
     var px = [UInt8](repeating: 0, count: 4)
     let ctx = CGContext(data: &px, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
                         space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
     ctx.draw(img, in: CGRect(x: -x, y: -(img.height - 1 - y), width: img.width, height: img.height))
-    return (Int(px[0]), Int(px[1]), Int(px[2]))
+    return (Int(px[0]), Int(px[1]), Int(px[2]), Int(px[3]))
 }

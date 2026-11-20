@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Vision
 
 // Finding what to hide in a screenshot: emails, phone and card numbers, IP addresses, keys and tokens, and faces.
@@ -28,9 +29,11 @@ enum Redactor {
     private static func rx(_ p: String) -> NSRegularExpression { try! NSRegularExpression(pattern: p) }
 
     private static let email = rx(#"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}"#)
-    private static let card = rx(#"(?<![\d-])\d(?:[ -]?\d){12,18}(?![\d-])"#)
+    private static let cardRun = rx(#"(?<![\d-])\d++(?:[ -]\d++)*(?![\d-])"#)
+    private static let digitGroup = rx(#"\d+"#)
     private static let phone = rx(#"(?<![\w.])\+?\(?\d[\d ().-]{7,18}\d(?![\w:])"#)
-    private static let ip = rx(#"(?<![\d.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?![\d.])"#)
+    private static let ipv4 = rx(#"(?<![\p{L}\d.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?![\d.])"#)
+    private static let ipv6 = rx(#"(?<![\w:.])[0-9A-Fa-f]*:[0-9A-Fa-f:.]*:(?:[0-9A-Fa-f:.]*[0-9A-Fa-f:])?(?![\w:]|\.[\w.])"#)
     private static let secrets: [NSRegularExpression] = [
         #"sk-[A-Za-z0-9_-]{16,}"#,                            // OpenAI and Anthropic style
         #"[sr]k_(?:live|test)_[A-Za-z0-9]{16,}"#,             // Stripe
@@ -55,12 +58,24 @@ enum Redactor {
         for r in secrets.dropLast() { add(.secret, r) }
         add(.secret, secrets.last!) { looksRandom(ns.substring(with: $0.range)) }
         add(.email, email)
-        add(.card, card) { luhn(digits(ns.substring(with: $0.range))) }
-        add(.ip, ip) { m in (1...4).allSatisfy { Int(ns.substring(with: m.range(at: $0))).map { $0 <= 255 } ?? false } }
+        let cards = kinds.contains(.card) ? cardSpans(in: s, range: all) : []
+        found += cards.map { Match(kind: .card, range: $0) }
+        add(.ip, ipv4) { m in (1...4).allSatisfy { Int(ns.substring(with: m.range(at: $0))).map { $0 <= 255 } ?? false } }
+        add(.ip, ipv6) { m in
+            var address = in6_addr()
+            return ns.substring(with: m.range).withCString { inet_pton(AF_INET6, $0, &address) == 1 }
+        }
         add(.phone, phone) { m in
             let s = ns.substring(with: m.range)
+            let count = digits(s).count
+            if count == 10, s.count == 10, m.range.location > 0 {
+                let prefix = ns.substring(with: NSRange(location: m.range.location - 1, length: 1))
+                if prefix == "=" || prefix == ":" { return false }
+            }
             // A date and time reads like a long number too.
-            return (10...15).contains(digits(s).count) && s.range(of: #"^\d{4}[-./]\d{1,2}[-./]\d{1,2}"#, options: .regularExpression) == nil
+            return (10...15).contains(count) &&
+                s.range(of: #"^\d{4}[-./]\d{1,2}[-./]\d{1,2}"#, options: .regularExpression) == nil &&
+                !cards.contains { NSIntersectionRange($0, m.range).length > 0 }
         }
         // Keep the earliest, longest match where they overlap: a card number isn't also a phone number.
         found.sort { $0.range.location != $1.range.location ? $0.range.location < $1.range.location : $0.range.length > $1.range.length }
@@ -73,6 +88,26 @@ enum Redactor {
             kept.append(m)
         }
         return kept
+    }
+
+    private static func cardSpans(in s: String, range: NSRange) -> [NSRange] {
+        let ns = s as NSString
+        var spans: [NSRange] = []
+        for run in cardRun.matches(in: s, range: range) where run.range.length >= 13 {
+            let groups = digitGroup.matches(in: s, range: run.range).map(\.range)
+            let numbers = groups.map { digits(ns.substring(with: $0)) }
+            for start in groups.indices {
+                let first = groups[start].location
+                var candidate: [Int] = []
+                // Start and end on group boundaries so an expiry can follow the card.
+                for end in start..<groups.count {
+                    guard candidate.count + numbers[end].count <= 19 else { break }
+                    candidate += numbers[end]
+                    if luhn(candidate) { spans.append(NSRange(location: first, length: NSMaxRange(groups[end]) - first)) }
+                }
+            }
+        }
+        return spans
     }
 
     static func digits(_ s: String) -> [Int] { s.compactMap { $0.wholeNumberValue } }

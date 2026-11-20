@@ -189,23 +189,28 @@ struct PolishLayout: Equatable {
         }
         var s = requested
         if let px = style.size.pixels { s *= px.width / size.width }
-        canvas = CGSize(width: (size.width * s).rounded(), height: (size.height * s).rounded())
-        let cw = cardSize.width * s, ch = cardSize.height * s
+        let minimum: CGFloat = s > 0 ? 1 : 0
+        canvas = CGSize(width: max(minimum, (size.width * s).rounded()), height: max(minimum, (size.height * s).rounded()))
+        // Snap the clip and image together so odd sizes keep their opaque edges at 1×.
+        let cw = max(minimum, (cardSize.width * s).rounded()), ih = max(minimum, (content.height * s).rounded())
+        let ch = max(ih, (cardSize.height * s).rounded())
         card = CGRect(x: ((canvas.width - cw) / 2).rounded(), y: ((canvas.height - ch) / 2).rounded(), width: cw, height: ch)
-        titleBar = bar * s
-        image = CGRect(x: card.minX, y: card.minY + titleBar, width: cw, height: content.height * s)
-        radius = style.isPlain ? 0 : style.radius * min(content.width, content.height) * s
+        titleBar = ch - ih
+        image = CGRect(x: card.minX, y: card.minY + titleBar, width: cw, height: ih)
+        radius = style.radius * min(content.width, content.height) * s
         scale = s
     }
 
     /// A point in source pixels to a point on the canvas (origin top left).
     func toCanvas(_ p: CGPoint, crop: CGRect) -> CGPoint {
-        CGPoint(x: image.minX + (p.x - crop.minX) * scale, y: image.minY + (p.y - crop.minY) * scale)
+        CGPoint(x: image.minX + (p.x - crop.minX) * image.width / crop.width,
+                y: image.minY + (p.y - crop.minY) * image.height / crop.height)
     }
 
     /// A point on the canvas back to source pixels.
     func toSource(_ p: CGPoint, crop: CGRect) -> CGPoint {
-        CGPoint(x: (p.x - image.minX) / scale + crop.minX, y: (p.y - image.minY) / scale + crop.minY)
+        CGPoint(x: (p.x - image.minX) * crop.width / image.width + crop.minX,
+                y: (p.y - image.minY) * crop.height / image.height + crop.minY)
     }
 }
 
@@ -215,11 +220,36 @@ enum PolishRenderer {
     static let ci = CIContext(options: [.cacheIntermediates: false])
 
     static func load(_ url: URL) -> CGImage? {
-        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-        // Apply the EXIF orientation, so a photo comes out the way it looks.
-        let opts = [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true,
-                    kCGImageSourceThumbnailMaxPixelSize: 16384] as CFDictionary
-        return CGImageSourceCreateThumbnailAtIndex(src, 0, opts) ?? CGImageSourceCreateImageAtIndex(src, 0, nil)
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
+        let properties = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+        guard let value = properties?[kCGImagePropertyOrientation] as? UInt32,
+              let orientation = CGImagePropertyOrientation(rawValue: value), orientation != .up else { return image }
+        return orient(image, as: orientation)
+    }
+
+    private static func orient(_ image: CGImage, as orientation: CGImagePropertyOrientation) -> CGImage? {
+        let w = CGFloat(image.width), h = CGFloat(image.height)
+        let transform: CGAffineTransform
+        switch orientation {
+        case .up: return image
+        case .upMirrored: transform = CGAffineTransform(a: -1, b: 0, c: 0, d: 1, tx: w, ty: 0)
+        case .down: transform = CGAffineTransform(a: -1, b: 0, c: 0, d: -1, tx: w, ty: h)
+        case .downMirrored: transform = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: h)
+        case .leftMirrored: transform = CGAffineTransform(a: 0, b: -1, c: -1, d: 0, tx: h, ty: w)
+        case .right: transform = CGAffineTransform(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: w)
+        case .rightMirrored: transform = CGAffineTransform(a: 0, b: 1, c: 1, d: 0, tx: 0, ty: 0)
+        case .left: transform = CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: h, ty: 0)
+        @unknown default: return image
+        }
+        let rect = CGRect(x: 0, y: 0, width: w, height: h)
+        let size = rect.applying(transform).size
+        let space = image.colorSpace.flatMap { $0.model == .rgb ? $0 : nil } ?? CGColorSpace(name: CGColorSpace.sRGB)!
+        guard let ctx = CGContext(data: nil, width: Int(size.width), height: Int(size.height), bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.concatenate(transform)
+        ctx.draw(image, in: rect)
+        return ctx.makeImage()
     }
 
     /// The whole picture. `marks: false` leaves them out, for the editor, which draws them live on top.
@@ -233,8 +263,13 @@ enum PolishRenderer {
         ctx.translateBy(x: 0, y: L.canvas.height)
         ctx.scaleBy(x: 1, y: -1)
         ctx.interpolationQuality = .high
-        let cropped = source.cropping(to: doc.crop.integral) ?? source
-        drawBackground(doc.style, cropped: cropped, in: ctx, L: L)
+        let sourceBounds = CGRect(x: 0, y: 0, width: source.width, height: source.height)
+        let bounds = doc.crop.integral.intersection(sourceBounds)
+        guard !bounds.isEmpty, let cropped = bounds == sourceBounds ? source : source.cropping(to: bounds) else { return nil }
+        // The editor draws the masks live over the foreground, but padding also reads source pixels.
+        let masks = drawMarks || doc.style.background == .blurred ? MarkPainter.redactions(doc.marks, in: doc.crop, source: source) : []
+        guard let redacted = MarkPainter.redactedCrop(cropped, source: source, bounds: bounds, redactions: masks) else { return nil }
+        drawBackground(doc.style, cropped: redacted, in: ctx, L: L)
 
         let cardPath = CGPath(roundedRect: L.card, cornerWidth: L.radius, cornerHeight: L.radius, transform: nil)
         if doc.style.shadow > 0 && !doc.style.isPlain && doc.style.background != .none {
@@ -251,8 +286,8 @@ enum PolishRenderer {
         ctx.addPath(cardPath)
         ctx.clip()
         if L.titleBar > 0 { drawTitleBar(doc.style.frame, in: ctx, L: L) }
-        drawImage(cropped, in: L.image, ctx: ctx)
-        if drawMarks { MarkPainter.draw(doc.marks, doc: doc, source: source, layout: L, in: ctx) }
+        drawImage(drawMarks ? redacted : cropped, in: L.image, ctx: ctx)
+        if drawMarks { MarkPainter.drawAnnotations(doc.marks, crop: doc.crop, layout: L, excluding: masks, in: ctx) }
         ctx.restoreGState()
         if L.titleBar > 0 || L.radius > 0, !doc.style.isPlain {
             // A hairline, so a white screenshot doesn't melt into a white background.

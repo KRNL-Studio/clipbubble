@@ -893,7 +893,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// A saved copy joins history as Polished, not as a new screenshot.
-    private func polishedSaved(_ url: URL) {
+    func polishedSaved(_ url: URL) {
         polishedPaths.insert(url.resolvingSymlinksInPath().standardizedFileURL.path)
         model.db.insertIfMissing(kind: "file", text: url.path, source: "Polished", hash: "f:" + sha(url.path), created: Date())
         refreshLists()

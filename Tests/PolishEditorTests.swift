@@ -247,6 +247,35 @@ private func editorPreviewCheck(_ dir: URL) {
     check((corner()?.redComponent ?? 0) > 0.9 && (corner()?.blueComponent ?? 1) < 0.1, "undo keeps the red preview when a blue render was pending")
 }
 
+private func editorBaseKeyChecks(_ dir: URL) {
+    let source = editorImage()
+    var doc = PolishDoc(source: dir.appendingPathComponent("padding.png"), size: CGSize(width: source.width, height: source.height))
+    doc.style.background = .blurred
+    func key() -> PolishCanvas.BaseKey { PolishCanvas.BaseKey(doc: doc, source: source, scale: 1) }
+
+    let bare = key()
+    doc.marks = [Mark(.redact, [CGPoint(x: 40, y: 40), CGPoint(x: 80, y: 80)])]
+    let added = key()
+    doc.marks[0] = doc.marks[0].moved(by: CGSize(width: 25, height: 0))
+    let moved = key()
+    check(moved != added, "moving a redaction changes the blurred preview key")
+    doc.marks[0].redaction = .solid
+    let solid = key()
+    check(solid != moved, "changing the redaction mode changes the blurred preview key")
+    doc.marks[0].color = .white
+    check(key() != solid, "recoloring a solid redaction changes the blurred preview key")
+
+    let redaction = doc.marks.removeFirst()
+    doc.marks.append(Mark(.arrow, [.zero, CGPoint(x: 90, y: 90)]))
+    check(added != bare && key() == bare, "adding and deleting a redaction change the blurred preview key")
+
+    doc.style.background = .gradient(0)
+    let gradient = key()
+    doc.marks.append(redaction)
+    doc.marks[1] = redaction.moved(by: CGSize(width: 25, height: 0))
+    check(key() == gradient, "redactions do not affect the gradient preview key")
+}
+
 private func editorWindowChecks(_ dir: URL) throws {
     let url = dir.appendingPathComponent("window.png")
     try editorPNG(editorImage()).write(to: url)
@@ -340,6 +369,7 @@ func polishEditorTests() {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try editorExports(dir)
         editorPreviewCheck(dir)
+        editorBaseKeyChecks(dir)
         try editorWindowChecks(dir)
         try editorCardChecks(dir)
     } catch { check(false, "editor fixtures: \(error)") }

@@ -137,7 +137,20 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
     private var last: (style: PolishStyle, crop: CGRect, tool: PolishTool, zoom: CGFloat, pan: CGPoint)?
     private static let renderQueue = DispatchQueue(label: "polish.render", qos: .userInteractive)
 
-    private struct BaseKey: Equatable { var style: PolishStyle; var crop: CGRect; var scale: CGFloat }
+    struct BaseKey: Equatable {
+        let style: PolishStyle
+        let crop: CGRect
+        let scale: CGFloat
+        private let redactions: [MarkPainter.Redaction]
+
+        init(doc: PolishDoc, source: CGImage, scale: CGFloat) {
+            style = doc.style
+            crop = doc.crop
+            self.scale = scale
+            // Blurred padding reads the same masked pixels as the renderer.
+            redactions = style.background == .blurred ? MarkPainter.redactions(doc.marks, in: crop, source: source) : []
+        }
+    }
 
     private enum Handle: Equatable { case point(Int), box(Int, Int) }
     private enum Drag {
@@ -229,7 +242,7 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
         let backing = window?.backingScaleFactor ?? 2
         let wanted = t.layout.scale / max(PolishLayout(doc: m.doc, scale: 1).scale, 0.0001) * backing
         let scale = min(1, max(0.1, (wanted * 8).rounded(.up) / 8))
-        return BaseKey(style: m.doc.style, crop: m.doc.crop, scale: scale)
+        return BaseKey(doc: m.doc, source: m.source, scale: scale)
     }
 
     private func cancelBaseRequest() {

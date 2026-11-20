@@ -303,9 +303,10 @@ private func placementTests() {
 /// A new screenshot always counts once, whichever way the two switches are set.
 private func screenshotTests(_ r: Rig) {
     let bubble = r.bubble
-    func take(_ name: String) -> (news: Int, hops: Int, copied: Bool) {
+    func take(_ name: String, editorSaved: Bool = false) -> (news: Int, hops: Int, copied: Bool) {
         let url = testHome.appendingPathComponent(name)
         FileManager.default.createFile(atPath: url.path, contents: Data(name.utf8))
+        if editorSaved { r.d.polishedSaved(url) }
         let hops = r.model.pulseTicks
         r.model.unseen = 0
         r.d.screenshotAdded(url, at: Date())
@@ -340,8 +341,15 @@ private func screenshotTests(_ r: Rig) {
     _ = take("no card.png")
     check(!r.d.shotCard.isVisible, "with the card switched off, there's no card")
     UserDefaults.standard.set(true, forKey: "polishCard")
-    let polished = take("both on polished.png")
-    check(polished.news == 0 && polished.hops == 0 && !r.d.shotCard.isVisible, "a saved polished copy isn't a new screenshot, got \(polished)")
+    let savedName = "editor saved polished.png"
+    let saved = take(savedName, editorSaved: true)
+    check(saved == (0, 0, false) && r.db.clip(hash: "f:" + sha(testHome.appendingPathComponent(savedName).path))?.source == "Polished"
+          && !r.d.shotCard.isVisible, "an editor save stays Polished and shows no screenshot card")
+    let screenshotName = "both on polished.png"
+    let screenshot = take(screenshotName)
+    check(screenshot == (1, 1, true) && r.db.clip(hash: "f:" + sha(testHome.appendingPathComponent(screenshotName).path))?.source == "Screenshot"
+          && r.d.shotCard.isVisible, "a screenshot named polished enters history and shows a card")
+    r.d.shotCard.hide()
     check(until { !bubble.isVisible }, "gone again")
     r.model.hideBubble = false
     check(until { bubble.isVisible }, "back for the rest")

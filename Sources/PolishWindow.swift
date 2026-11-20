@@ -76,6 +76,7 @@ final class PolishModel: ObservableObject {
     var onSaved: (URL) -> Void = { _ in }
     var focusInspector: () -> Void = {}
     var pasteboard = NSPasteboard.general
+    var detectRedactions: (CGImage, Set<Redactor.Kind>, Bool) throws -> [(Redactor.Kind?, CGRect)] = Redactor.find
 
     private static let thumbnailQueue = DispatchQueue(label: "polish.thumbnails", qos: .userInitiated)
     private var thumbnailWork: DispatchWorkItem?
@@ -385,11 +386,18 @@ final class PolishModel: ObservableObject {
     func autoRedact() {
         guard busy == nil else { return }
         activity = .finding
-        let src = source, kinds = redactKinds, faces = redactFaces
+        let src = source, kinds = redactKinds, faces = redactFaces, detect = detectRedactions
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let detected = Redactor.find(in: src, kinds: kinds, faces: faces)
+            let detected = try? detect(src, kinds, faces)
             DispatchQueue.main.async {
                 guard let self else { return }
+                // A failed scan must leave the existing coverage and clipboard alone.
+                guard let detected else {
+                    self.cancelExports()
+                    self.activity = nil
+                    self.say("Couldn't check the image; nothing was copied", "exclamationmark.triangle")
+                    return
+                }
                 let crop = (self.tool == .crop ? self.validCropDraft : nil) ?? self.doc.crop
                 let found = detected.filter { crop.intersects($0.1) }
                 if !found.isEmpty || self.doc.marks.contains(where: \.auto) {
@@ -444,16 +452,32 @@ final class PolishModel: ObservableObject {
 
 enum PolishHandoffs {
     private static let lifetime: TimeInterval = 3600
-    private static let directory: URL = {
+    static let root: URL = {
         // A second instance with its own data folder also has its own handoffs.
         let suffix = ProcessInfo.processInfo.environment["CLIPBUBBLE_HOME"].map { "-" + sha($0) } ?? ""
         return FileManager.default.temporaryDirectory.appendingPathComponent("ClipBubble Polish" + suffix, isDirectory: true)
     }()
-    private static let startup: Void = clear()
+    private static let directory = root.appendingPathComponent("\(getpid())-\(UUID())", isDirectory: true)
+    private static let startup: Void = removeExpiredProcesses()
 
     static func prepare() { _ = startup }
 
     static func clear() { try? FileManager.default.removeItem(at: directory) }
+
+    private static func removeExpiredProcesses() {
+        let fm = FileManager.default
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey]
+        guard let entries = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: Array(keys)) else { return }
+        let stale = Date().addingTimeInterval(-lifetime)
+        for entry in entries {
+            let name = entry.lastPathComponent.split(separator: "-", maxSplits: 1)
+            guard name.count == 2, let pid = pid_t(name[0]), pid > 0, UUID(uuidString: String(name[1])) != nil,
+                  let values = try? entry.resourceValues(forKeys: keys), values.isDirectory == true,
+                  values.isSymbolicLink == false, let date = values.contentModificationDate, date < stale,
+                  kill(pid, 0) == -1, errno == ESRCH else { continue }
+            try? fm.removeItem(at: entry)
+        }
+    }
 
     static func write(_ data: Data, name: String) throws -> URL {
         prepare()
@@ -521,7 +545,7 @@ final class PolishWindow: NSObject, NSWindowDelegate {
         return true
     }
 
-    private init(url: URL, image: CGImage) {
+    init(url: URL, image: CGImage) {
         model = PolishModel(url: url, image: image)
         window = EditorWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 720),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -577,8 +601,10 @@ final class PolishWindow: NSObject, NSWindowDelegate {
         window.contentView = nil
         ColorPanelLink.shared.detach()
         PolishPreset.last = model.doc.style
-        Presence.closed(window)
-        PolishWindow.open.removeAll { $0 === self }
+        if PolishWindow.open.contains(where: { $0 === self }) {
+            Presence.closed(window)
+            PolishWindow.open.removeAll { $0 === self }
+        }
     }
 }
 

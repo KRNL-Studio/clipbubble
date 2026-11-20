@@ -112,6 +112,19 @@ private func editorExports(_ dir: URL) throws {
           && copied.flatMap { NSBitmapImageRep(data: $0)?.pixelsWide } == 780,
           "queued exports apply the draft crop")
 
+    let masks = model.doc.marks, undos = model.history.undos.count
+    let savedCount = saves.count, clipboardChange = pasteboard.changeCount
+    shared = nil
+    model.detectRedactions = { _, _, _ in throw CocoaError(.fileReadUnknown) }
+    model.autoRedact()
+    model.copyAndClose()
+    model.save()
+    model.share { shared = $0 }
+    check(editorUntil { model.busy == nil } && model.doc.marks == masks && model.history.undos.count == undos
+          && saves.count == savedCount && pasteboard.changeCount == clipboardChange && shared == nil
+          && model.toast?.text == "Couldn't check the image; nothing was copied",
+          "failed Find and Hide preserves masks and cancels queued exports")
+
     model.tool = .crop
     model.cropDraft = CGRect(x: 40, y: 185, width: 240, height: 90)
     let first = model.exportFile()
@@ -150,6 +163,31 @@ private func editorExports(_ dir: URL) throws {
     model.copyAndClose()
     editorPump(0.35)
     check(!closed, "Return keeps the editor open when Copy fails")
+}
+
+private func editorHandoffIsolation() throws {
+    let fm = FileManager.default
+    let root = PolishHandoffs.root
+    func makeFolder(pid: pid_t, age: TimeInterval) throws -> URL {
+        let folder = root.appendingPathComponent("\(pid)-\(UUID())", isDirectory: true)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appendingPathComponent("handoff.png")
+        try Data([1]).write(to: file)
+        try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-age)], ofItemAtPath: folder.path)
+        return file
+    }
+    let live = try makeFolder(pid: getpid(), age: 3601)
+    let young = try makeFolder(pid: Int32.max, age: 0)
+    let stale = try makeFolder(pid: Int32.max, age: 3601)
+    defer {
+        for file in [live, young, stale] { try? fm.removeItem(at: file.deletingLastPathComponent()) }
+    }
+    let own = try PolishHandoffs.write(Data([2]), name: "mine.png")
+    check(fm.fileExists(atPath: live.path) && fm.fileExists(atPath: young.path) && !fm.fileExists(atPath: stale.path),
+          "handoff startup removes only expired files from dead processes")
+    PolishHandoffs.clear()
+    check(!fm.fileExists(atPath: own.path) && fm.fileExists(atPath: live.path) && fm.fileExists(atPath: young.path),
+          "handoff quit clears only this launch's files")
 }
 
 private func editorCropBadgeChecks(_ dir: URL) throws {
@@ -271,6 +309,14 @@ func polishEditorInteractions(_ model: PolishModel, _ canvas: PolishCanvas, _ wi
     }
     let oldDoc = model.doc, oldHistory = model.history, oldTool = model.tool, oldSelection = model.selection
     defer { model.tool = oldTool; model.doc = oldDoc; model.history = oldHistory; model.selection = oldSelection; canvas.sync() }
+
+    let mask = Mark(.redact, [CGPoint(x: 80, y: 80), CGPoint(x: 180, y: 180)])
+    let line = Mark(.line, [CGPoint(x: 90, y: 130), CGPoint(x: 170, y: 130)])
+    model.doc.marks = [mask, line]
+    model.tool = .select
+    model.selection = nil
+    click(130, 130)
+    check(model.selection == mask.id, "click selects the redaction over a hidden later annotation")
 
     model.doc.marks = []
     model.tool = .rect
@@ -397,12 +443,14 @@ private func editorWindowChecks(_ dir: URL) throws {
     var window: EditorWindow?
     weak var model: PolishModel?
     autoreleasepool {
-        check(PolishWindow.open(url), "open an editor for interaction tests")
-        guard let editor = NSApp.windows.first(where: { $0 is EditorWindow && $0.isVisible }) as? EditorWindow,
-              let canvas = editor.canvas, let activeModel = canvas.model else {
-            check(false, "find the visible editor canvas and model")
-            return
-        }
+        let controller = PolishWindow(url: url, image: editorImage())
+        let editor = controller.window, canvas = controller.canvas, activeModel = controller.model
+        let screens = NSScreen.screens.map(\.frame)
+        editor.setFrameOrigin(NSPoint(x: (screens.map(\.maxX).max() ?? 0) + 4000, y: 0))
+        editor.contentView?.layoutSubtreeIfNeeded()
+        editor.makeFirstResponder(canvas)
+        check(!editor.isVisible && !editor.isKeyWindow && !NSApp.isActive && !screens.contains { $0.intersects(editor.frame) },
+              "interaction tests keep the editor offscreen and unfocused")
         window = editor
         model = activeModel
         editorPump(0.3)
@@ -463,13 +511,48 @@ private func editorCardChecks(_ dir: URL) throws {
     editorPump(0.3)
     check(app.model.db.clip(hash: "f:" + sha(named.path))?.source == "Screenshot" && app.shotCard.isVisible,
           "a real screenshot named polished enters history and shows a card")
+    app.putOnClipboard = { _ in nil }
+    app.shotCard.state.copy()
+    check(app.shotCard.state.copyLabel == "Copy failed", "the screenshot card reports a failed copy")
+    app.putOnClipboard = { _ in 1 }
+    app.shotCard.state.copy()
+    check(app.shotCard.state.copyLabel == "Copied", "the screenshot card confirms a successful retry")
+
     let saved = dir.appendingPathComponent("editor output polished.png")
+    try editorPNG(editorImage()).write(to: saved)
     PolishWindow.onSaved(saved)
     let hops = app.model.pulseTicks
     app.putOnClipboard = { _ in check(false, "watcher never copies an editor-saved file"); return nil }
     app.screenshotAdded(saved, at: Date())
+    editorPump(0.15)
     check(app.model.db.clip(hash: "f:" + sha(saved.path))?.source == "Polished" && app.model.pulseTicks == hops,
-          "the screenshot watcher skips an editor-saved path")
+          "the screenshot watcher skips an unchanged editor-saved file")
+
+    let backlog = dir.appendingPathComponent("backfilled capture.png")
+    try editorPNG(editorImage()).write(to: backlog)
+    let alias = dir.appendingPathComponent("backfilled editor alias.png")
+    try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: saved)
+    let lock = NSLock()
+    var lookups: [Bool] = []
+    let resolve = app.polishedFileAt
+    app.polishedFileAt = { url in
+        lock.withLock { lookups.append(Thread.isMainThread) }
+        return resolve(url)
+    }
+    app.importFiles([(backlog, Date()), (alias, Date())], source: "Screenshot")
+    let backlogHash = "f:" + sha(backlog.path)
+    check(editorUntil { app.model.db.clip(hash: backlogHash)?.source == "Screenshot" }
+          && app.model.db.clip(hash: "f:" + sha(alias.path)) == nil
+          && lock.withLock { lookups == [false, false] },
+          "screenshot backfill resolves files off main and skips editor aliases")
+    app.polishedFileAt = resolve
+
+    try editorPNG(editorImage(.blue)).write(to: saved, options: .atomic)
+    var replacementCopied = false
+    app.putOnClipboard = { c in replacementCopied = c.text == saved.path; return 1 }
+    app.screenshotAdded(saved, at: Date())
+    check(editorUntil { replacementCopied && app.model.db.clip(hash: "f:" + sha(saved.path))?.source == "Screenshot" }
+          && app.shotCard.state.url == saved, "a replacement screenshot at an editor-saved path is accepted")
 
     app.toggleBubble()
     check(editorUntil(0.75) { !bubble.isVisible && !app.shotCard.isVisible }, "the hide-bubble shortcut hides the card and bubble together")
@@ -482,6 +565,7 @@ func polishEditorTests() {
     defer { defaults.set(last, forKey: "polish.last"); PolishHandoffs.clear() }
     do {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try editorHandoffIsolation()
         try editorExports(dir)
         try editorCropBadgeChecks(dir)
         editorThumbnailChecks(dir)

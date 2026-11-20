@@ -5,8 +5,24 @@ import SwiftUI
 // It leaves on its own after a few seconds, but never while the pointer is on it.
 
 final class ShotCardState: ObservableObject {
+    enum CopyFeedback { case copied, failed }
+
     @Published var url: URL?
-    @Published var copied = false
+    @Published var copyFeedback: CopyFeedback?
+    var copyLabel: String {
+        switch copyFeedback {
+        case .copied: return "Copied"
+        case .failed: return "Copy failed"
+        case nil: return "Copy"
+        }
+    }
+    var copyIcon: String {
+        switch copyFeedback {
+        case .copied: return "checkmark"
+        case .failed: return "exclamationmark.triangle"
+        case nil: return "doc.on.doc"
+        }
+    }
     var polish: () -> Void = {}
     var copy: () -> Void = {}
     var close: () -> Void = {}
@@ -16,12 +32,13 @@ final class ShotCardState: ObservableObject {
 final class ShotCard {
     static let size = NSSize(width: 280, height: 218)
     private let panel = FloatingPanel(size: ShotCard.size, keyable: false)
-    private let state = ShotCardState()
+    let state = ShotCardState()
     private var hideWork: DispatchWorkItem?
+    private var copyFeedbackWork: DispatchWorkItem?
     private var hovering = false
 
     var onPolish: (URL) -> Void = { _ in }
-    var onCopy: (URL) -> Void = { _ in }
+    var onCopy: (URL) -> Bool = { _ in false }
     var onHidden: () -> Void = {}
 
     var isVisible: Bool { panel.isVisible }
@@ -41,9 +58,17 @@ final class ShotCard {
         }
         state.copy = { [weak self] in
             guard let self, let url = self.state.url else { return }
-            self.onCopy(url)
-            self.state.copied = true
-            self.schedule(after: 1.0)
+            self.copyFeedbackWork?.cancel()
+            if self.onCopy(url) {
+                self.state.copyFeedback = .copied
+                self.schedule(after: 1)
+            } else {
+                self.state.copyFeedback = .failed
+                self.schedule(after: 6)
+                let work = DispatchWorkItem { [weak self] in self?.state.copyFeedback = nil }
+                self.copyFeedbackWork = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+            }
         }
         state.close = { [weak self] in self?.hide() }
         state.hovered = { [weak self] on in
@@ -56,7 +81,8 @@ final class ShotCard {
     /// Slides out of the bubble's side of the screen, level with the bubble.
     func show(_ url: URL, beside b: NSRect, in area: NSRect) {
         state.url = url
-        state.copied = false
+        copyFeedbackWork?.cancel()
+        state.copyFeedback = nil
         let s = ShotCard.size
         let right = b.midX > area.midX, top = b.midY > area.midY
         var x = right ? b.minX - s.width - 6 : b.maxX + 6
@@ -98,6 +124,7 @@ final class ShotCard {
 
     private func finishHide() {
         panel.orderOut(nil)
+        copyFeedbackWork?.cancel()
         state.url = nil
         hovering = false
         onHidden()
@@ -164,7 +191,7 @@ private struct ShotCardView: View {
                 .buttonStyle(PressStyle())
                 .help("Open in the editor")
                 Button(action: state.copy) {
-                    Label(state.copied ? "Copied" : "Copy", systemImage: state.copied ? "checkmark" : "doc.on.doc")
+                    Label(state.copyLabel, systemImage: state.copyIcon)
                         .font(.system(size: 12.5, weight: .medium))
                         .frame(width: 92, height: 30)
                         .background(Color.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))

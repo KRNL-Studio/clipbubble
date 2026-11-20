@@ -213,7 +213,7 @@ enum MarkPainter {
         ctx.saveGState()
         defer { ctx.restoreGState() }
         ctx.clip(to: L.image)
-        for mask in masks { paint(mask, source: source, in: rectOnCanvas(mask.rect, map), ctx: ctx) }
+        paintRedactions(masks, source: source, in: ctx) { rectOnCanvas($0, map) }
     }
 
     /// On export the masks are baked into the source. Leave those pixels untouched by annotations.
@@ -478,9 +478,15 @@ enum MarkPainter {
             ctx.scaleBy(x: 1, y: -1)
             ctx.interpolationQuality = .none
             PolishRenderer.drawImage(cropped, in: bounds, ctx: ctx)
-            for mask in redactions { paint(mask, source: source, in: mask.rect, ctx: ctx) }
+            paintRedactions(redactions, source: source, in: ctx) { $0 }
             return ctx.makeImage()
         }
+    }
+
+    private static func paintRedactions(_ masks: [Redaction], source: CGImage, in ctx: CGContext, place: (CGRect) -> CGRect) {
+        // Patches sample the source, so paint solid masks last to keep their coverage.
+        for mask in masks where mask.mode != .solid { paint(mask, source: source, in: place(mask.rect), ctx: ctx) }
+        for mask in masks where mask.mode == .solid { paint(mask, source: source, in: place(mask.rect), ctx: ctx) }
     }
 
     private static func paint(_ mask: Redaction, source: CGImage, in dest: CGRect, ctx: CGContext) {

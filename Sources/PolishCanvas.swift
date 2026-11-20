@@ -535,7 +535,12 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
             return
         }
         let slop = 6 / g.layout.scale
-        let hit = m.doc.marks.last { $0.hit(p, slop: slop) }
+        // Reverse the paint order so a covering redaction gets the click.
+        let marks = m.doc.marks
+        let hit = marks.last { $0.kind == .redact && $0.redaction == .solid && $0.hit(p, slop: slop) }
+            ?? marks.last { $0.kind == .redact && $0.redaction != .solid && $0.hit(p, slop: slop) }
+            ?? marks.last { $0.kind != .redact && $0.kind != .highlight && $0.hit(p, slop: slop) }
+            ?? marks.last { $0.kind == .highlight && $0.hit(p, slop: slop) }
 
         switch m.tool {
         case .select:

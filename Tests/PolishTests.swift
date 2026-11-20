@@ -166,6 +166,8 @@ func polishTests() {
     check(kinds("4000-0566-5566-5556") == [.card], "with dashes too")
     check(found("card 4242 4242 4242 4242 12/29") == ["4242 4242 4242 4242"], "card span ends before expiry")
     check(found("12 4242 4242 4242 4242 12/29") == ["4242 4242 4242 4242"], "card span can start inside a grouped run")
+    check(found("2022 4242 4242 4242 4242 12/29") == ["2022 4242 4242 4242 4242"],
+          "overlapping card spans cover every valid window")
     check(!kinds("4242 4242 4242 4241").contains(.card), "a number that fails the check digit isn't a card")
     check(Redactor.luhn(Redactor.digits("378282246310005")) && !Redactor.luhn(Redactor.digits("378282246310006")), "Luhn")
     check(kinds("call +1 (415) 555-0132 today") == [.phone], "finds a phone number: \(found("call +1 (415) 555-0132 today"))")
@@ -174,9 +176,14 @@ func polishTests() {
     check(kinds("order 12345").isEmpty && kinds("v1.2.3").isEmpty, "short numbers and versions are left alone")
     check(found("ssh 192.168.1.20 -p 22") == ["192.168.1.20"], "finds an IP address")
     check(found("ssh [2001:db8::1], [::ffff:192.0.2.1], and ::1") == ["2001:db8::1", "::ffff:192.0.2.1", "::1"], "finds valid IPv6 addresses")
+    check(found("IPv6:2001:db8::1 host:::1") == ["2001:db8::1", "::1"], "finds IPv6 addresses after labels")
     check(kinds("bad 2001:::db8::1 and 2001:db8::xyz").isEmpty, "rejects malformed IPv6")
     check(kinds("v1.2.3.4 V1.2.3.4 build1.2.3.4").isEmpty, "skips letter-prefixed IPv4 versions")
+    check(kinds("clock:14:22:01 mac:aa:bb:cc:dd:ee:ff aa:bb:cc:dd:ee:ff").isEmpty, "timestamps and MAC addresses aren't IPs")
     check(kinds("time=1712345678 time:1712345678").isEmpty, "skips bare Unix timestamps as phones")
+    check(kinds("ts=1712345678000 ts:1712345678006").isEmpty, "skips bare millisecond timestamps")
+    check(found("tel:4155550132 TEL:4155550132") == ["4155550132", "4155550132"], "accepts phones directly after tel:")
+    check(found("phone: 415-555-0132") == ["415-555-0132"], "accepts formatted phones after a label and space")
     check(found("call: 4155550132") == ["4155550132"], "accepts bare phones after a space")
     check(kinds("999.1.1.1").isEmpty, "a part over 255 isn't an IP address")
     // Split up so the source holds nothing that looks like a real key to a secret scanner.
@@ -292,6 +299,21 @@ private func renderRegressionTests(in dir: URL) {
     var solid = full
     solid.redaction = .solid
     solid.color = .black
+    solid.points = [.zero, CGPoint(x: 50, y: 80)]
+    for mode in [Mark.Redaction.pixelate, .blur] {
+        var patch = full
+        patch.redaction = mode
+        doc.marks = [solid, patch]
+        let live = makeImage(width: 100, height: 80) { ctx in
+            PolishRenderer.drawImage(red, in: doc.crop, ctx: ctx)
+            MarkPainter.draw(doc.marks, doc: doc, source: red, layout: PolishLayout(doc: doc), in: ctx)
+        }
+        check([live, PolishRenderer.render(doc, source: red)].allSatisfy {
+            guard let image = $0 else { return false }
+            return pixel(image, 25, 40) == (0, 0, 0, 255) && pixel(image, 75, 40).r == 255
+        }, "a solid mask stays solid under \(mode) in preview and export")
+    }
+    solid.points = full.points
     doc.marks = [solid]
     doc.style = PolishStyle(background: .blurred, padding: 0.2, radius: 0, shadow: 0)
     check([true, false].allSatisfy { marks in

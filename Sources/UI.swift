@@ -787,6 +787,22 @@ struct PeekView: View {
 
 // MARK: - App
 
+struct PolishedFile: Equatable {
+    let path: String
+    private let device: dev_t
+    private let inode: ino_t
+    private let birthSeconds: Int
+    private let birthNanoseconds: Int
+
+    static func read(_ url: URL) -> PolishedFile? {
+        let path = url.resolvingSymlinksInPath().standardizedFileURL.path
+        var info = stat()
+        guard stat(path, &info) == 0 else { return nil }
+        return PolishedFile(path: path, device: info.st_dev, inode: info.st_ino,
+                            birthSeconds: info.st_birthtimespec.tv_sec, birthNanoseconds: info.st_birthtimespec.tv_nsec)
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let idleAlpha: CGFloat = 0.4
     private static let margin: CGFloat = 10
@@ -799,7 +815,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var peekHost: NSView!
     private(set) var appWindow: AppWindow!
     private(set) var shotCard = ShotCard()
-    private var polishedPaths = Set<String>()
+    private var polishedPaths: [String: PolishedFile] = [:]
+    var polishedFileAt: (URL) -> PolishedFile? = PolishedFile.read
+    private static let screenshotIdentityQueue = DispatchQueue(label: "clipbubble.screenshotIdentity", qos: .userInitiated)
     private var localClickMonitor: Any?
     private var capture: Capture!
     private var screenshots: FolderWatcher?
@@ -907,8 +925,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         PolishWindow.onSaved = { [weak self] in self?.polishedSaved($0) }
         shotCard.onPolish = { [weak self] in self?.polish(file: $0) }
         shotCard.onCopy = { [weak self] url in
-            guard let self, let c = self.model.db.clip(hash: "f:" + sha(url.path)) else { return }
-            self.model.pick(c, false)
+            guard let self, let c = self.model.db.clip(hash: "f:" + sha(url.path)) else { return false }
+            return self.model.pick(c, false)
         }
         shotCard.onHidden = { [weak self] in self?.restBubble() }
     }
@@ -929,7 +947,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// A saved copy joins history as Polished, not as a new screenshot.
     func polishedSaved(_ url: URL) {
-        polishedPaths.insert(url.resolvingSymlinksInPath().standardizedFileURL.path)
+        if let file = polishedFileAt(url) { polishedPaths[file.path] = file }
         model.db.insertIfMissing(kind: "file", text: url.path, source: "Polished", hash: "f:" + sha(url.path), created: Date())
         refreshLists()
     }
@@ -1016,15 +1034,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func screenshotAdded(_ url: URL, at date: Date) {
-        // A polished copy saved into the screenshot folder is already in history, as Polished.
-        if polishedPaths.contains(url.resolvingSymlinksInPath().standardizedFileURL.path) { return }
-        let hash = "f:" + sha(url.path)
-        model.db.insertIfMissing(kind: "file", text: url.path, source: "Screenshot", hash: hash, created: date)
+        guard !polishedPaths.isEmpty else { announceScreenshot(url, at: date, file: nil); return }
+        let read = polishedFileAt
+        Self.screenshotIdentityQueue.async { [weak self] in
+            let file = read(url)
+            DispatchQueue.main.async { self?.announceScreenshot(url, at: date, file: file) }
+        }
+    }
+
+    private func announceScreenshot(_ url: URL, at date: Date, file: PolishedFile?) {
+        guard let hash = recordScreenshot(url, at: date, file: file) else { return }
         // A copy to the clipboard is announced when capture saves it, unless copied files aren't saved.
         let copy = UserDefaults.standard.bool(forKey: "copyScreenshots")
         if !copy || !Prefs.on("files") { captured() }
         if copy, let c = model.db.clip(hash: hash) { _ = putOnClipboard(c) }
         offerPolish(url)
+    }
+
+    /// A path can be reused by a new screenshot after an editor save.
+    private func recordScreenshot(_ url: URL, at date: Date, file: PolishedFile?) -> String? {
+        let saved = file.flatMap { polishedPaths[$0.path] }
+        if let saved, saved == file { return nil }
+        let hash = "f:" + sha(url.path)
+        if saved != nil, model.db.clip(hash: hash)?.source == "Polished" {
+            model.db.upsert(kind: "file", text: url.path, file: nil, source: "Screenshot", hash: hash)
+        } else {
+            model.db.insertIfMissing(kind: "file", text: url.path, source: "Screenshot", hash: hash, created: date)
+        }
+        return hash
     }
 
     /// Watches ~/Downloads only while that's switched on (so the privacy prompt only shows up if you want it).
@@ -1049,14 +1086,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if screenshots == nil, downloads == nil { refreshLists() }
     }
 
-    private func importFiles(_ found: [(URL, Date)], source: String) {
-        for (url, date) in found {
-            if source == "Screenshot", polishedPaths.contains(url.resolvingSymlinksInPath().standardizedFileURL.path) { continue }
-            model.db.insertIfMissing(kind: "file", text: url.path, source: source, hash: "f:" + sha(url.path), created: date)
+    func importFiles(_ found: [(URL, Date)], source: String) {
+        let apply: ([(URL, Date, PolishedFile?)]) -> Void = { [weak self] files in
+            guard let self else { return }
+            for (url, date, file) in files {
+                if source == "Screenshot" {
+                    _ = self.recordScreenshot(url, at: date, file: file)
+                } else {
+                    self.model.db.insertIfMissing(kind: "file", text: url.path, source: source, hash: "f:" + sha(url.path), created: date)
+                }
+            }
+            self.model.reload()
+            self.model.reloadRecent()
+            self.model.historyChanged()
         }
-        model.reload()
-        model.reloadRecent()
-        model.historyChanged()
+        guard source == "Screenshot", !polishedPaths.isEmpty else {
+            apply(found.map { ($0.0, $0.1, nil) })
+            return
+        }
+        // Resolving aliases and reading file metadata can block on a mounted volume.
+        let read = polishedFileAt
+        DispatchQueue.global(qos: .utility).async {
+            let files = found.map { ($0.0, $0.1, read($0.0)) }
+            DispatchQueue.main.async { apply(files) }
+        }
     }
 
     private func hosted<V: View>(_ view: V, size: NSSize, radius: CGFloat) -> NSView {

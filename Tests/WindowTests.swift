@@ -15,7 +15,9 @@ func windowTests() {
                                  hash: "window-page-\(i)", created: now.addingTimeInterval(-Double(i / 2)))
     }
     model.db.insertIfMissing(kind: "text", text: "history_a_page decoy", source: "Notes",
-                             hash: "window-page-decoy", created: now)
+                             hash: "window-page-percent-decoy", created: now)
+    model.db.insertIfMissing(kind: "text", text: "historyA%Bpage decoy", source: "Notes",
+                             hash: "window-page-underscore-decoy", created: now)
     browser.query = prefix
     check(browser.count == 501 && browser.clips.count < browser.count, "History counts all matches before loading the later pages")
     for _ in 0..<10 {
@@ -25,10 +27,10 @@ func windowTests() {
     check(ids.count == 501 && Set(ids).count == 501 && browser.clips.last?.text == "\(prefix) 500",
           "History loads every match once, even with tied timestamps")
 
-    guard let selected = browser.clips.last else { return }
-    browser.selection = selected.id
+    let selected = browser.clips.last
+    browser.selection = selected?.id
     browser.reload()
-    check(browser.selected == selected, "History keeps a selection on a later page when refreshed")
+    check(selected != nil && browser.selected == selected, "History keeps a selection on a later page when refreshed")
 
     model.pickClip = { _, _ in false }
     browser.copySelected()
@@ -37,8 +39,8 @@ func windowTests() {
     browser.copySelected()
     check(browser.copyFeedback == true, "History reports a successful clipboard write")
 
-    model.historyChanged = { browser.reload() }
-    model.delete(selected)
+    model.historyChanged = { [weak browser] in browser?.reload() }
+    if let selected { model.delete(selected) }
     check(browser.count == 500 && browser.selection == nil, "a panel deletion updates History and clears the selected clip")
 
     browser.filter = "shots"

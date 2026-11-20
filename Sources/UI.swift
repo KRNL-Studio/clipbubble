@@ -191,14 +191,17 @@ struct Thumb: View {
     }
 
     var body: some View {
-        Group {
-            if let image {
-                Image(nsImage: image).resizable().interpolation(.high).aspectRatio(contentMode: fit ? .fit : .fill)
-            } else {
-                Color.white.opacity(0.06)
+        // Let the tile set the size, even when an aspect-filled image is much wider or taller.
+        Color.clear
+            .overlay {
+                if let image {
+                    Image(nsImage: image).resizable().interpolation(.high).aspectRatio(contentMode: fit ? .fit : .fill)
+                } else {
+                    Color.white.opacity(0.06)
+                }
             }
-        }
-        .onAppear { if image == nil { Thumbs.load(path, px) { image = $0 } } }
+            .clipped()
+            .onAppear { if image == nil { Thumbs.load(path, px) { image = $0 } } }
     }
 }
 
@@ -813,10 +816,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let launch = NSAppleEventManager.shared().currentAppleEvent
         setUpWindows()
         startServices()
-        guard launch?.paramDescriptor(forKeyword: AEKeyword(keyAELaunchedAsLogInItem)) == nil else { return }
-        let first = !UserDefaults.standard.bool(forKey: "shownAppWindow")
-        if first { UserDefaults.standard.set(true, forKey: "shownAppWindow") }
-        appWindow.show(first ? .general : .history)
+        guard launch?.eventClass == AEEventClass(kCoreEventClass), launch?.eventID == AEEventID(kAEOpenApplication),
+              launch?.paramDescriptor(forKeyword: AEKeyword(keyAELaunchedAsLogInItem)) == nil,
+              !CommandLine.arguments.contains(Updater.relaunchArgument) else { return }
+        DispatchQueue.main.async { [weak self] in
+            // Launch Services can hide the app just after it finishes launching.
+            guard let self, !NSApp.isHidden, !NSRunningApplication.current.isHidden, self.appWindow.window == nil else { return }
+            let first = !UserDefaults.standard.bool(forKey: "shownAppWindow")
+            if first { UserDefaults.standard.set(true, forKey: "shownAppWindow") }
+            self.appWindow.show(first ? .general : .history)
+        }
     }
 
     /// The bubble, panel and peek. Tests stop here, so they start no capture, sync or global shortcuts, and pass
@@ -973,21 +982,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Backfills the last 7 days of screenshots and downloads. Cheap and idempotent, so it also reruns after access is granted.
     private func importFolders() {
-        let (shots, dls) = (screenshots, downloads)
-        // Listing a big Downloads folder and reading every file's dates is slow: do it off the main thread.
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let found = (shots?.existing(days: 7) ?? []).map { ($0, $1, "Screenshot") }
-                + (dls?.existing(days: 7) ?? []).map { ($0, $1, "Downloads") }
-            DispatchQueue.main.async {
-                guard let self else { return }
-                for (url, date, source) in found {
-                    self.model.db.insertIfMissing(kind: "file", text: url.path, source: source, hash: "f:" + sha(url.path), created: date)
-                }
-                self.model.reload()
-                self.model.reloadRecent()
-                self.model.historyChanged()
-            }
+        screenshots?.existing(days: 7) { [weak self] in self?.importFiles($0, source: "Screenshot") }
+        downloads?.existing(days: 7) { [weak self] in self?.importFiles($0, source: "Downloads") }
+        if screenshots == nil, downloads == nil { refreshLists() }
+    }
+
+    private func importFiles(_ found: [(URL, Date)], source: String) {
+        for (url, date) in found {
+            model.db.insertIfMissing(kind: "file", text: url.path, source: source, hash: "f:" + sha(url.path), created: date)
         }
+        model.reload()
+        model.reloadRecent()
+        model.historyChanged()
     }
 
     private func hosted<V: View>(_ view: V, size: NSSize, radius: CGFloat) -> NSView {

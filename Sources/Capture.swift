@@ -154,54 +154,81 @@ final class FolderWatcher {
     private let include: (URL) -> Bool
     private let maxAge: TimeInterval?
     private let onNew: (URL, Date) -> Void
+    private let list: (URL) -> [URL]?
+    private let queue = DispatchQueue(label: "clipbubble.folder", qos: .utility)
+    private let lifecycle = NSLock()
+    private var cancelled = false
+    private var stopped: Bool { lifecycle.withLock { cancelled } }
     private var known: Set<URL> = []
     private var source: DispatchSourceFileSystemObject?
     private var pending: DispatchWorkItem?
-    private var stopped = false
 
     /// `maxAge` ignores files older than that (so moving old screenshots in doesn't count); nil takes everything new.
-    init(folder: URL, maxAge: TimeInterval?, include: @escaping (URL) -> Bool, onNew: @escaping (URL, Date) -> Void) {
+    init(folder: URL, maxAge: TimeInterval?, include: @escaping (URL) -> Bool,
+         list: @escaping (URL) -> [URL]? = FolderWatcher.listFiles, onNew: @escaping (URL, Date) -> Void) {
         self.folder = folder
         self.maxAge = maxAge
         self.include = include
+        self.list = list
         self.onNew = onNew
-        known = Set(listing())
-        start()
+        let since = Date()
+        queue.async { [weak self] in self?.start(since: since) }
     }
 
+    deinit { source?.cancel() }
+
     func stop() {
-        stopped = true
+        lifecycle.withLock { cancelled = true }
+        queue.async { self.stopWatching() }
+    }
+
+    private func stopWatching() {
+        pending?.cancel()
+        pending = nil
         source?.cancel()
         source = nil
     }
 
     /// Retries until macOS grants access to the folder (the privacy prompt may still be open).
-    private func start() {
+    private func start(since: Date) {
         guard !stopped else { return }
         let fd = open(folder.path, O_EVTONLY)
         guard fd >= 0 else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in self?.start() }
+            retry(since: since, after: 5)
             return
         }
-        known = Set(listing())
-        let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename, .delete], queue: .main)
+        let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename, .delete], queue: queue)
         src.setEventHandler { [weak self, weak src] in
-            guard let self, let src else { return }
+            guard let self, let src, self.source === src, !self.stopped else { return }
             // The folder itself moved or vanished: the old handle is dead, so watch the path afresh.
             if !src.data.isDisjoint(with: [.rename, .delete]) {
-                src.cancel()
-                self.source = nil
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.start() }
+                self.stopWatching()
+                self.retry(since: Date(), after: 1)
                 return
             }
-            self.pending?.cancel()
-            let w = DispatchWorkItem { self.scan() }
-            self.pending = w
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: w)
+            self.scheduleScan()
         }
         src.setCancelHandler { close(fd) }
-        src.resume()
         source = src
+        // Arm the watch before taking the first snapshot so writes during that read still trigger a scan.
+        src.activate()
+        if scan(since: since) {
+            scheduleScan()
+        } else {
+            stopWatching()
+            retry(since: since, after: 5)
+        }
+    }
+
+    private func scheduleScan() {
+        pending?.cancel()
+        let work = DispatchWorkItem { [weak self] in _ = self?.scan() }
+        pending = work
+        queue.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    private func retry(since: Date, after seconds: TimeInterval) {
+        queue.asyncAfter(deadline: .now() + seconds) { [weak self] in self?.start(since: since) }
     }
 
     static func added(_ u: URL) -> Date {
@@ -210,26 +237,41 @@ final class FolderWatcher {
     }
 
     /// Everything already in the folder from the last `days` days, for backfilling history.
-    func existing(days: Double) -> [(URL, Date)] {
-        let cutoff = Date().addingTimeInterval(-days * 86400)
-        return listing().map { ($0, Self.added($0)) }.filter { $0.1 > cutoff }
+    func existing(days: Double, done: @escaping ([(URL, Date)]) -> Void) {
+        queue.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            let cutoff = Date().addingTimeInterval(-days * 86400)
+            let found = (self.list(self.folder) ?? []).filter(self.include).map { ($0, Self.added($0)) }.filter { $0.1 > cutoff }
+            self.deliver { _ in done(found) }
+        }
     }
 
-    private func listing() -> [URL] {
-        let urls = (try? FileManager.default.contentsOfDirectory(
-            at: folder, includingPropertiesForKeys: [.creationDateKey, .addedToDirectoryDateKey], options: [.skipsHiddenFiles])) ?? []
-        return urls.filter(include)
+    static func listFiles(_ folder: URL) -> [URL]? {
+        try? FileManager.default.contentsOfDirectory(
+            at: folder, includingPropertiesForKeys: [.creationDateKey, .addedToDirectoryDateKey], options: [.skipsHiddenFiles])
     }
 
-    private func scan() {
-        let now = listing()
-        let fresh = now.filter { !known.contains($0) }
+    private func scan(since: Date? = nil) -> Bool {
+        guard !stopped, let urls = list(folder) else { return false }
+        let now = urls.filter(include)
+        let fresh = since == nil ? now.filter { !known.contains($0) } : now
         known = Set(now)
-        let cutoff = maxAge.map { Date().addingTimeInterval(-$0) }
-        for url in fresh.sorted(by: { Self.added($0) < Self.added($1) }) {
-            let date = Self.added(url)
-            if let cutoff, date < cutoff { continue }
-            onNew(url, maxAge == nil ? Date() : date)
+        let cutoff = max(since ?? .distantPast, maxAge.map { Date().addingTimeInterval(-$0) } ?? .distantPast)
+        let added = fresh.map { ($0, Self.added($0)) }.filter { $0.1 >= cutoff }.sorted { $0.1 < $1.1 }
+        if !added.isEmpty {
+            deliver { watcher in
+                for (url, date) in added where !watcher.stopped {
+                    watcher.onNew(url, watcher.maxAge == nil ? Date() : date)
+                }
+            }
+        }
+        return true
+    }
+
+    private func deliver(_ action: @escaping (FolderWatcher) -> Void) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            action(self)
         }
     }
 }

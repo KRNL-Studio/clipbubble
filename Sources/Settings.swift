@@ -535,6 +535,7 @@ final class Access: ObservableObject {
     @Published var downloads: Bool?
     @Published var accessibility = AXIsProcessTrusted()
     private var timer: Timer?
+    private var checkingFolders = false
 
     func start() {
         refresh()
@@ -545,12 +546,20 @@ final class Access: ObservableObject {
     func stop() { timer?.invalidate(); timer = nil }
 
     func refresh() {
-        let shots = Prefs.on("screenshots") ? FolderWatcher.canRead(FolderWatcher.screenshotFolder) : nil
-        let dls = Prefs.on("downloads") ? FolderWatcher.canRead(FolderWatcher.downloadsFolder) : nil
         let ax = AXIsProcessTrusted()
-        if shots != screenshots { screenshots = shots }
-        if dls != downloads { downloads = dls }
         if ax != accessibility { accessibility = ax }
+        guard !checkingFolders else { return }
+        checkingFolders = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let shots = Prefs.on("screenshots") ? FolderWatcher.canRead(FolderWatcher.screenshotFolder) : nil
+            let dls = Prefs.on("downloads") ? FolderWatcher.canRead(FolderWatcher.downloadsFolder) : nil
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.checkingFolders = false
+                if shots != self.screenshots { self.screenshots = shots }
+                if dls != self.downloads { self.downloads = dls }
+            }
+        }
     }
 
     static func openFilesSettings() {

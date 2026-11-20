@@ -49,4 +49,38 @@ func folderWatcherTests() {
           "files on both sides of the first snapshot arrive on main exactly once")
     check(backfill?.sorted() == ["after-snapshot.png", "before-snapshot.png", "existing.png"],
           "backfill includes existing files and respects the same filter")
+
+    folderWatcherRetryTest()
+}
+
+private func folderWatcherRetryTest() {
+    let folder = testHome.appendingPathComponent("folder-watch-retry", isDirectory: true)
+    try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let shot = folder.appendingPathComponent("retry.png")
+    let ready = DispatchSemaphore(value: 0)
+    let failed = DispatchSemaphore(value: 0)
+    var scans = 0
+    var injectedFailure = false
+    var delivered: [String] = []
+    let watcher = FolderWatcher(folder: folder, maxAge: 120, include: { $0.pathExtension == "png" }, list: { url in
+        let files = FolderWatcher.listFiles(url)
+        scans += 1
+        if scans == 2 { ready.signal() }
+        if !injectedFailure, files?.contains(where: { $0.lastPathComponent == shot.lastPathComponent }) == true {
+            injectedFailure = true
+            failed.signal()
+            return nil
+        }
+        return files
+    }) { url, _ in delivered.append(url.lastPathComponent) }
+    defer { watcher.stop() }
+
+    check(ready.wait(timeout: .now() + 3) == .success, "folder watch finished its startup scans")
+    try? Data([1]).write(to: shot)
+    check(failed.wait(timeout: .now() + 3) == .success, "the first scan after a write hit the injected error")
+    let deadline = Date().addingTimeInterval(3)
+    while delivered.isEmpty, Date() < deadline {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+    }
+    check(delivered == ["retry.png"], "a failed scan retries and delivers the screenshot once without another write")
 }

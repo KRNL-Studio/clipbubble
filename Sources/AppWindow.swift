@@ -338,45 +338,77 @@ final class HistoryBrowser: ObservableObject {
     @Published var selection: Int64? { didSet { if selection != oldValue { clearCopyFeedback() } } }
     @Published private(set) var copyFeedback: Bool?
     private var copyFeedbackReset: DispatchWorkItem?
-    private var matchingIDs: [Int64] = []
-    private var loadedCount = 0
 
     init(model: Model) { self.model = model }
 
     var selected: Clip? {
         guard let selection else { return nil }
-        return clips.first { $0.id == selection } ?? model.db.clip(id: selection)
+        return clips.first { $0.id == selection } ?? matchingClips(limit: 1, id: selection)?.first
     }
 
     func reload(resetPages: Bool = false) {
         model.refreshDeviceNames()
-        guard let ids = matchingClipIDs() else { return }
-        matchingIDs = ids
-        count = ids.count
-        loadedCount = min(ids.count, resetPages ? Self.pageSize : max(Self.pageSize, loadedCount))
-        clips = ids.prefix(loadedCount).compactMap { model.db.clip(id: $0) }
-        if let selection, !ids.contains(selection) { self.selection = nil }
+        let limit = resetPages ? Self.pageSize : max(Self.pageSize, clips.count)
+        guard let total = matchingCount(), let rows = matchingClips(limit: limit) else { return }
+        count = total
+        clips = rows
+        if selection != nil, selected == nil { selection = nil }
         Thumbs.prewarm(clips.prefix(60))
     }
 
     func loadMore(after id: Int64) {
-        guard id == clips.last?.id, loadedCount < count else { return }
-        let end = min(loadedCount + Self.pageSize, count)
-        let rows = matchingIDs[loadedCount..<end].compactMap { model.db.clip(id: $0) }
-        loadedCount = end
+        guard let last = clips.last, id == last.id, clips.count < count,
+              let rows = matchingClips(limit: Self.pageSize, after: last), let total = matchingCount() else { return }
+        count = total
         clips += rows
     }
 
-    /// Keep the count and page boundaries from the same query without loading every clip's contents.
-    private func matchingClipIDs() -> [Int64]? {
+    private func matchingCount() -> Int? {
+        readMatches("count(*)") { s in
+            sqlite3_step(s) == SQLITE_ROW ? Int(sqlite3_column_int64(s, 0)) : nil
+        }
+    }
+
+    private func matchingClips(limit: Int, after cursor: Clip? = nil, id: Int64? = nil) -> [Clip]? {
+        var tail = ""
+        var bindings: [Any] = []
+        if let cursor {
+            // The ID breaks ties when several clips share a timestamp.
+            tail += " AND (created, id) < (?, ?)"
+            bindings += [cursor.created.timeIntervalSince1970, cursor.id]
+        }
+        if let id {
+            tail += " AND id = ?"
+            bindings.append(id)
+        }
+        tail += " ORDER BY created DESC, id DESC LIMIT ?"
+        bindings.append(limit)
+        return readMatches("id, kind, text, file, source, created, hash, origin, remote", tail: tail, bindings: bindings) { s in
+            func col(_ i: Int32) -> String { sqlite3_column_text(s, i).map { String(cString: $0) } ?? "" }
+            var clips: [Clip] = []
+            var result = sqlite3_step(s)
+            while result == SQLITE_ROW {
+                clips.append(Clip(id: sqlite3_column_int64(s, 0), kind: col(1), text: col(2),
+                                  file: sqlite3_column_type(s, 3) == SQLITE_NULL ? nil : col(3), source: col(4),
+                                  created: Date(timeIntervalSince1970: sqlite3_column_double(s, 5)),
+                                  hash: col(6), origin: col(7), remote: sqlite3_column_int(s, 8) != 0))
+                result = sqlite3_step(s)
+            }
+            return result == SQLITE_DONE ? clips : nil
+        }
+    }
+
+    /// Apply the same filters to the count, every page and a selection outside the loaded pages.
+    private func readMatches<T>(_ columns: String, tail: String = "", bindings: [Any] = [],
+                                read: (OpaquePointer?) -> T?) -> T? {
         var db: OpaquePointer?
         defer { sqlite3_close(db) }
         guard sqlite3_open_v2(Paths.db.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return nil }
         sqlite3_busy_timeout(db, 3000)
 
         // Match the filters in DB.clips so History and the panel agree.
-        var sql = "SELECT id FROM clips WHERE created >= ?"
-        var args: [String] = []
+        var sql = "SELECT \(columns) FROM clips WHERE created >= ?"
+        var args: [Any] = [Date().timeIntervalSince1970 - DB.retention]
         let kind = ["text", "image", "file"].contains(filter) ? filter : nil
         if kind == "image" {
             sql += " AND (kind = 'image' OR (kind = 'file' AND (" +
@@ -395,21 +427,24 @@ final class HistoryBrowser: ObservableObject {
             sql += " AND (text LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\')"
             args += [text, text]
         }
-        sql += Prefs.hiddenSQL + " ORDER BY created DESC, id DESC"
+        sql += Prefs.hiddenSQL + tail
+        args += bindings
 
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
-        sqlite3_bind_double(statement, 1, Date().timeIntervalSince1970 - DB.retention)
         let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        for (index, value) in args.enumerated() { sqlite3_bind_text(statement, Int32(index + 2), value, -1, transient) }
-        var ids: [Int64] = []
-        var result = sqlite3_step(statement)
-        while result == SQLITE_ROW {
-            ids.append(sqlite3_column_int64(statement, 0))
-            result = sqlite3_step(statement)
+        for (index, value) in args.enumerated() {
+            let index = Int32(index + 1)
+            switch value {
+            case let text as String: sqlite3_bind_text(statement, index, text, -1, transient)
+            case let time as Double: sqlite3_bind_double(statement, index, time)
+            case let id as Int64: sqlite3_bind_int64(statement, index, id)
+            case let limit as Int: sqlite3_bind_int64(statement, index, Int64(limit))
+            default: return nil
+            }
         }
-        return result == SQLITE_DONE ? ids : nil
+        return read(statement)
     }
 
     /// Returns whether the keyboard shortcut had a selected item to copy.

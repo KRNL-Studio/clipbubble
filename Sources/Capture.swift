@@ -220,11 +220,17 @@ final class FolderWatcher {
         }
     }
 
-    private func scheduleScan() {
+    private func scheduleScan(after delay: TimeInterval = 0.4) {
+        guard !stopped else { return }
         pending?.cancel()
-        let work = DispatchWorkItem { [weak self] in _ = self?.scan() }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.pending = nil
+            // A transient read error may be the last event we see for this write.
+            if !self.scan() { self.scheduleScan(after: min(delay * 2, 5)) }
+        }
         pending = work
-        queue.asyncAfter(deadline: .now() + 0.4, execute: work)
+        queue.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func retry(since: Date, after seconds: TimeInterval) {

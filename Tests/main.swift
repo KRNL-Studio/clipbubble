@@ -44,6 +44,9 @@ polishTests()
 polishEditorTests()
 windowTests()
 folderWatcherTests()
+// The quit checks permanently close this process's handoffs.
+do { try editorHandoffQuit() }
+catch { check(false, "handoff quit fixtures: \(error)") }
 
 try? FileManager.default.removeItem(at: testHome)
 print("\(ran) checks, \(failures) failed")

@@ -142,8 +142,6 @@ private func editorExports(_ dir: URL) throws {
                                               ofItemAtPath: first.deletingLastPathComponent().path)
         check(model.exportFile() != nil && !FileManager.default.fileExists(atPath: first.path)
               && FileManager.default.fileExists(atPath: second.path), "handoffs older than an hour are removed")
-        AppDelegate().applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
-        check(!FileManager.default.fileExists(atPath: second.path), "app quit removes the remaining handoffs")
     }
 
     model.doc.crop = CGRect(x: 0, y: 0, width: 800, height: 320)
@@ -203,7 +201,7 @@ func editorHandoffIsolation() throws {
             try? fm.removeItem(at: file.deletingLastPathComponent())
         }
     }
-    let own = try PolishHandoffs.write(Data([2]), name: "mine.png")
+    PolishHandoffs.prepare()
     check(fm.fileExists(atPath: live.path) && fm.fileExists(atPath: young.path) && !fm.fileExists(atPath: stale.path),
           "handoff startup removes only expired files from dead processes")
     check(!fm.fileExists(atPath: legacy.path) && fm.fileExists(atPath: youngLegacy.path),
@@ -211,14 +209,38 @@ func editorHandoffIsolation() throws {
     check(fm.fileExists(atPath: project.path) && fm.fileExists(atPath: link.path),
           "handoff cleanup keeps aged Project exports and skips a UUID folder symlink")
     check(fm.fileExists(atPath: savedPNG.path), "handoff cleanup keeps an aged UUID folder containing the save location")
-    defaults.set(own.deletingLastPathComponent().path, forKey: "polish.folder")
-    PolishHandoffs.clear()
-    check(fm.fileExists(atPath: own.path), "handoff quit preserves the current save location")
-    defaults.set(saveFolder.path, forKey: "polish.folder")
-    PolishHandoffs.clear()
-    let launch = own.deletingLastPathComponent().deletingLastPathComponent()
-    check(!fm.fileExists(atPath: launch.path) && fm.fileExists(atPath: live.path) && fm.fileExists(atPath: young.path),
-          "handoff quit removes this launch folder")
+}
+
+func editorHandoffQuit() throws {
+    let fm = FileManager.default
+    let defaults = UserDefaults.standard
+    let previous = defaults.object(forKey: "polish.folder")
+    defer { defaults.set(previous, forKey: "polish.folder") }
+    let folder = testHome.appendingPathComponent("quit exports", isDirectory: true)
+    defaults.set(folder.path, forKey: "polish.folder")
+    let image = editorImage()
+    let png = editorPNG(image)
+    let handoff = try PolishHandoffs.write(png, name: "quit.png")
+    let launch = handoff.deletingLastPathComponent().deletingLastPathComponent()
+    let otherLaunch = PolishHandoffs.root.appendingPathComponent("\(getpid())-\(UUID())", isDirectory: true)
+    try fm.createDirectory(at: otherLaunch, withIntermediateDirectories: false)
+    defer { try? fm.removeItem(at: otherLaunch) }
+    let model = PolishModel(url: handoff, image: image)
+    model.save()
+
+    let app = AppDelegate()
+    let quit = Notification(name: NSApplication.willTerminateNotification)
+    defaults.set(handoff.deletingLastPathComponent().path, forKey: "polish.folder")
+    app.applicationWillTerminate(quit)
+    check(fm.fileExists(atPath: handoff.path), "handoff quit preserves the current save location")
+    defaults.set(folder.path, forKey: "polish.folder")
+    app.applicationWillTerminate(quit)
+    check(PolishRenderer.load(folder.appendingPathComponent("quit polished.png")) != nil,
+          "the editor's saved copy of a handoff original survives app quit")
+    check(!fm.fileExists(atPath: launch.path) && fm.fileExists(atPath: otherLaunch.path),
+          "app quit removes this launch folder and keeps other launches")
+    check((try? PolishHandoffs.write(png, name: "late.png")) == nil && !fm.fileExists(atPath: launch.path),
+          "a late handoff write after quit cannot recreate the launch folder")
 }
 
 private func editorCropBadgeChecks(_ dir: URL) throws {
@@ -856,7 +878,7 @@ func polishEditorTests() {
     let dir = testHome.appendingPathComponent("editor")
     let defaults = UserDefaults.standard
     let last = defaults.object(forKey: "polish.last")
-    defer { defaults.set(last, forKey: "polish.last"); PolishHandoffs.clear() }
+    defer { defaults.set(last, forKey: "polish.last") }
     do {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try editorExports(dir)

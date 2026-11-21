@@ -412,6 +412,18 @@ enum PolishRenderer {
         return URL(fileURLWithPath: path)
     }
 
+    static func polishedFilename(base: String, copy: Int = 1) -> String {
+        let suffix = copy == 1 ? " polished.png" : " polished \(copy).png"
+        var remaining = Int(NAME_MAX) - suffix.utf8.count
+        var prefix = ""
+        for character in base {
+            remaining -= character.utf8.count
+            guard remaining >= 0 else { break }
+            prefix.append(character)
+        }
+        return prefix + suffix
+    }
+
     /// Temporary originals default to the watched screenshot folder. A saved copy always outlives the handoff.
     static func saveURL(for source: URL) -> URL? {
         let custom = saveFolder
@@ -432,12 +444,12 @@ enum PolishRenderer {
             dir = preferred
         }
         guard !PolishHandoffs.contains(dir) else { return nil }
-        let base = (inApp ? "Image" : source.deletingPathExtension().lastPathComponent) + " polished"
-        var url = dir.appendingPathComponent(base + ".png")
+        let base = inApp ? "Image" : source.deletingPathExtension().lastPathComponent
+        var url = dir.appendingPathComponent(polishedFilename(base: base))
         var n = 2
         var info = stat()
         while lstat(url.path, &info) == 0 {
-            url = dir.appendingPathComponent("\(base) \(n).png")
+            url = dir.appendingPathComponent(polishedFilename(base: base, copy: n))
             n += 1
         }
         return url

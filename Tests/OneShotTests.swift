@@ -49,7 +49,6 @@ private func checkOneShot() throws {
     let editorBoard = NSPasteboard(name: .init("polish-one-shot-editor-" + UUID().uuidString))
     defer {
         app.shotCard.hide(animated: false)
-        PolishHandoffs.clear()
         windows.forEach { $0.orderOut(nil) }
         board.releaseGlobally()
         editorBoard.releaseGlobally()
@@ -165,13 +164,6 @@ private func checkOneShot() throws {
     check(polishedFile != nil && draggedFile(secondItem) == polishedFile && dragFileCount() == 1,
           "two drags of one polish result share one handoff file")
 
-    let failedDrag = ShotCardState()
-    failedDrag.url = folder.appendingPathComponent(String(repeating: "x", count: 250) + ".png")
-    failedDrag.polished = output
-    let failedItem = failedDrag.dragItem()
-    check(draggedFile(failedItem) == nil && draggedPNG(failedItem) == polishedPNG,
-          "the in-memory PNG still loads when the handoff filename is too long to write")
-
     defaults.removeObject(forKey: "polish.last")
     app.model.polish(clip)
     check(waitForOneShot { writes == 3 }, "a missing starting preference still copies")
@@ -179,6 +171,7 @@ private func checkOneShot() throws {
     let files = try FileManager.default.contentsOfDirectory(atPath: folder.path)
     check(files == [source.lastPathComponent],
           "one-shot leaves the screenshot and editor output folders untouched")
+    try checkLongPolishedNames(source: source, image: image, output: output)
 
     guard let polishedFile, let polishedImage = PolishRenderer.load(polishedFile) else {
         check(false, "the polished drag file is available to edit and save")
@@ -208,6 +201,7 @@ private func checkOneShot() throws {
     check(PolishRenderer.saveURL(for: source)?.deletingLastPathComponent().path == folder.path,
           "a custom destination in another instance's handoff root uses the watched screenshot folder")
     defaults.removeObject(forKey: "polish.folder")
+    try checkSaveThroughSymlinks(source: source, image: image, handoffRoot: otherRoot)
 
     let alias = folder.appendingPathComponent("drag alias.png")
     try fm.createSymbolicLink(at: alias, withDestinationURL: polishedFile)
@@ -238,9 +232,83 @@ private func checkOneShot() throws {
     check(PolishRenderer.saveURL(for: storedImage)?.deletingLastPathComponent().path == folder.path,
           "a stored image uses a readable, writable screenshot folder")
 
-    app.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
-    check(PolishRenderer.load(saved) != nil, "the editor's saved copy of a handoff original survives app quit")
-    check(!FileManager.default.fileExists(atPath: polishedFile.path), "app quit removes the polished drag file")
+    try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-3601)],
+                         ofItemAtPath: polishedFile.deletingLastPathComponent().path)
+    _ = try PolishHandoffs.write(Data([1]), name: "sweep.png")
+    check(!fm.fileExists(atPath: polishedFile.path), "the handoff sweep removes the expired drag file")
+    guard let refreshed = draggedFile(polishedItem) else {
+        check(false, "a drag provider can replace its expired handoff")
+        return
+    }
+    check(refreshed != polishedFile && (try? Data(contentsOf: refreshed)) == polishedPNG && draggedFile(secondItem) == refreshed,
+          "two providers share a fresh handoff after their cached file expires")
+}
+
+private func checkLongPolishedNames(source: URL, image: CGImage, output: OneShot.Output?) throws {
+    let fm = FileManager.default
+    let folder = source.deletingLastPathComponent()
+    let cluster = "👩🏽‍💻"
+    let shortUnicode = "abcdefg" + String(repeating: cluster, count: 15)
+    let cases = [(String(repeating: "x", count: 250), String(repeating: "x", count: 242), String(repeating: "x", count: 240)),
+                 (shortUnicode + cluster, shortUnicode, shortUnicode)]
+    for (base, first, numbered) in cases {
+        let url = folder.appendingPathComponent(base + ".png")
+        try fm.copyItem(at: source, to: url)
+        let name = first + " polished.png"
+        let state = ShotCardState()
+        state.url = url
+        state.polished = output
+        let item = state.dragItem()
+        let dragged = draggedFile(item)
+        check(item.suggestedName == name && dragged?.lastPathComponent == name
+              && dragged.flatMap { try? Data(contentsOf: $0) } == output?.png,
+              "card drag fits a \(base.utf8.count)-byte base in NAME_MAX without splitting characters")
+
+        let model = PolishModel(url: url, image: image)
+        model.doc.style = PolishPreset.builtIn[0].style
+        check(model.exportFile()?.lastPathComponent == name, "editor handoff also fits a \(base.utf8.count)-byte base")
+        var saves: [URL] = []
+        model.onSaved = { saves.append($0) }
+        model.save()
+        model.save()
+        check(saves.map(\.lastPathComponent) == [name, numbered + " polished 2.png"]
+              && saves.allSatisfy { fm.fileExists(atPath: $0.path) },
+              "Save fits both copy names for a \(base.utf8.count)-byte base")
+    }
+}
+
+private func checkSaveThroughSymlinks(source: URL, image: CGImage, handoffRoot: URL) throws {
+    let fm = FileManager.default
+    let defaults = UserDefaults.standard
+    let folder = source.deletingLastPathComponent()
+    let work = folder.appendingPathComponent("work", isDirectory: true)
+    let marker = work.appendingPathComponent("marker", isDirectory: true)
+    try fm.createDirectory(at: marker, withIntermediateDirectories: true)
+    let link = work.appendingPathComponent("link", isDirectory: true)
+    try fm.createSymbolicLink(at: link, withDestinationURL: handoffRoot)
+    let seed = URL(fileURLWithPath: work.path + "/marker/../link/seed.png")
+    try fm.copyItem(at: source, to: seed)
+    let model = PolishModel(url: seed, image: image)
+    try fm.removeItem(at: marker)
+    model.save()
+    check(fm.fileExists(atPath: folder.appendingPathComponent("seed polished.png").path)
+          && !fm.fileExists(atPath: handoffRoot.appendingPathComponent("seed polished.png").path)
+          && !fm.fileExists(atPath: marker.path),
+          "Save handles work/marker/../link/seed.png after marker is removed")
+
+    let nested = handoffRoot.appendingPathComponent("nested", isDirectory: true)
+    try fm.createDirectory(at: nested, withIntermediateDirectories: false)
+    let nestedLink = work.appendingPathComponent("nested-link", isDirectory: true)
+    try fm.createSymbolicLink(at: nestedLink, withDestinationURL: nested)
+    defaults.set(nestedLink.path + "/../exports", forKey: "polish.folder")
+    defer { defaults.removeObject(forKey: "polish.folder") }
+    var saved = false
+    model.onSaved = { _ in saved = true }
+    model.save()
+    let exports = handoffRoot.appendingPathComponent("exports", isDirectory: true)
+    check(model.toast?.text == "Couldn't find a folder for the saved copy" && !saved
+          && (try? fm.contentsOfDirectory(atPath: exports.path)) == [],
+          "Save refuses the resolved handoff destination after creating its directory")
 }
 
 private func draggedPNG(_ item: NSItemProvider, asFile: Bool = false) -> Data? {

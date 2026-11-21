@@ -41,7 +41,7 @@ final class ShotCardState: ObservableObject {
     func dragItem() -> NSItemProvider {
         guard let url else { return NSItemProvider() }
         guard let polished else { return NSItemProvider(contentsOf: url) ?? NSItemProvider() }
-        let name = url.deletingPathExtension().lastPathComponent + " polished.png"
+        let name = PolishRenderer.polishedFilename(base: url.deletingPathExtension().lastPathComponent)
         let png = polished.png
         let file = polishedDragFile ?? PolishedDragFile()
         polishedDragFile = file
@@ -64,13 +64,16 @@ final class ShotCardState: ObservableObject {
         return provider
     }
 
-    /// Providers keep their result even after the card closes or shows a new screenshot.
+    /// Providers keep their cache even after the card closes or shows a new screenshot.
     private final class PolishedDragFile: @unchecked Sendable {
         private static let queue = DispatchQueue(label: "clipbubble.polish-drag", qos: .userInitiated)
         private var result: Result<URL, Error>?
 
         func load(_ png: Data, name: String, completion: @escaping @Sendable (URL?, Error?) -> Void) {
             Self.queue.async {
+                if case .success(let url) = self.result, !FileManager.default.fileExists(atPath: url.path) {
+                    self.result = nil
+                }
                 let result = self.result ?? Result { try PolishHandoffs.write(png, name: name) }
                 self.result = result
                 switch result {

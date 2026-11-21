@@ -339,8 +339,19 @@ final class PolishModel: ObservableObject {
                 return
             }
             do {
-                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try data.write(to: url, options: .withoutOverwriting)
+                let parent = url.deletingLastPathComponent()
+                try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+                guard let path = realpath(parent.path, nil) else {
+                    model.say("Couldn't find a folder for the saved copy", "exclamationmark.triangle")
+                    return
+                }
+                defer { free(path) }
+                let resolvedParent = URL(fileURLWithPath: String(cString: path), isDirectory: true)
+                guard !PolishHandoffs.contains(resolvedParent) else {
+                    model.say("Couldn't find a folder for the saved copy", "exclamationmark.triangle")
+                    return
+                }
+                try data.write(to: resolvedParent.appendingPathComponent(url.lastPathComponent), options: .withoutOverwriting)
                 model.onSaved(url)
                 model.say("Saved as “\(url.lastPathComponent)”", "square.and.arrow.down")
             } catch {
@@ -367,7 +378,7 @@ final class PolishModel: ObservableObject {
 
     private func handoff(_ data: Data) -> URL? {
         do {
-            return try PolishHandoffs.write(data, name: "\(name) polished.png")
+            return try PolishHandoffs.write(data, name: PolishRenderer.polishedFilename(base: name))
         } catch {
             say("Couldn't prepare the image", "exclamationmark.triangle")
             return nil
@@ -461,6 +472,7 @@ enum PolishHandoffs {
     private static let lifetime: TimeInterval = 3600
     private static let permissions: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
     private static let lock = NSLock()
+    private static var closed = false
     private static let temp = FileManager.default.temporaryDirectory
     private static let rootPrefix = "ClipBubble Polish"
     static let root: URL = {
@@ -473,7 +485,12 @@ enum PolishHandoffs {
 
     static func prepare() { _ = startup }
 
-    static func clear() { lock.withLock { remove(launch) } }
+    static func clear() {
+        lock.withLock {
+            closed = true
+            remove(launch)
+        }
+    }
 
     static func contains(_ child: URL) -> Bool {
         func isHandoffPath(_ url: URL, under parent: URL) -> Bool {
@@ -493,7 +510,7 @@ enum PolishHandoffs {
 
     // A save can create a directory below a symlink, so resolve the existing ancestor.
     private static func resolvingSymlinks(_ url: URL) -> URL {
-        var ancestor = url
+        var ancestor = url.standardizedFileURL
         var missing: [String] = []
         while !FileManager.default.fileExists(atPath: ancestor.path) {
             let parent = ancestor.deletingLastPathComponent()
@@ -539,8 +556,9 @@ enum PolishHandoffs {
         guard !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.contains("\0") else {
             throw POSIXError(.EINVAL)
         }
-        prepare()
         return try lock.withLock {
+            guard !closed else { throw POSIXError(.ECANCELED) }
+            prepare()
             let fm = FileManager.default
             try fm.createDirectory(at: root, withIntermediateDirectories: true, attributes: permissions)
             guard try root.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink == false else {

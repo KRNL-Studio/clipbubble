@@ -645,6 +645,7 @@ struct HistoryActions: View {
             Button("Get from \(model.devices[clip.origin] ?? "other device")") { SyncEngine.shared.get(clip.hash) }
         } else {
             Button("Copy") { model.pick(clip, false) }
+            if clip.polishPath != nil { Button("Polish…") { model.polish(clip) } }
             if let p = clip.imagePath ?? clip.paths.first {
                 Button("Open") { NSWorkspace.shared.open(URL(fileURLWithPath: p)) }
                 Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p)]) }
@@ -695,6 +696,10 @@ struct HistoryInspector: View {
                               systemImage: feedback.map { $0 ? "checkmark" : "exclamationmark.circle" } ?? "doc.on.doc").frame(maxWidth: .infinity)
                     }
                     .controlSize(.large).buttonStyle(.borderedProminent)
+                    if clip.polishPath != nil {
+                        Button { model.polish(clip) } label: { Label("Polish", systemImage: "sparkles") }
+                            .controlSize(.large).keyboardShortcut("e", modifiers: .command).help("Open in the editor  ⌘E")
+                    }
                 }
                 Menu {
                     HistoryActions(clip: clip, model: model, browser: browser)

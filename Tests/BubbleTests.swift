@@ -53,6 +53,7 @@ private final class Rig {
         panel = windows.first { $0.frame.width == 420 }!
         view = bubble.contentView as! BubbleView
         d.pointer = { [unowned self] in pointer }
+        d.screenshotClipboardChangeCount = { [board] in board.changeCount }
         d.putOnClipboard = { [board] c in
             board.clearContents()
             switch c.kind {
@@ -303,9 +304,10 @@ private func placementTests() {
 /// A new screenshot always counts once, whichever way the two switches are set.
 private func screenshotTests(_ r: Rig) {
     let bubble = r.bubble
-    func take(_ name: String) -> (news: Int, hops: Int, copied: Bool) {
+    func take(_ name: String, editorSaved: Bool = false) -> (news: Int, hops: Int, copied: Bool) {
         let url = testHome.appendingPathComponent(name)
         FileManager.default.createFile(atPath: url.path, contents: Data(name.utf8))
+        if editorSaved { r.d.polishedSaved(url) }
         let hops = r.model.pulseTicks
         r.model.unseen = 0
         r.d.screenshotAdded(url, at: Date())
@@ -330,6 +332,25 @@ private func screenshotTests(_ r: Rig) {
 
     let both = take("both on.png")
     check(both == (1, 1, true), "with both on, capture announces it, once, got \(both)")
+
+    // The Polish card comes out by the bubble's corner for a new screenshot, and stays on the bubble's display.
+    check(r.d.shotCard.isVisible, "a new screenshot offers to polish it")
+    check(until(2) { stage.contains { $0.visible.contains(r.d.shotCard.frame) } }, "on the bubble's display")
+    r.d.shotCard.hide()
+    check(until(2) { !r.d.shotCard.isVisible }, "and the card goes when dismissed")
+    UserDefaults.standard.set(false, forKey: "polishCard")
+    _ = take("no card.png")
+    check(!r.d.shotCard.isVisible, "with the card switched off, there's no card")
+    UserDefaults.standard.set(true, forKey: "polishCard")
+    let savedName = "editor saved polished.png"
+    let saved = take(savedName, editorSaved: true)
+    check(saved == (0, 0, false) && r.db.clip(hash: "f:" + sha(testHome.appendingPathComponent(savedName).path))?.source == "Polished"
+          && !r.d.shotCard.isVisible, "an editor save stays Polished and shows no screenshot card")
+    let screenshotName = "both on polished.png"
+    let screenshot = take(screenshotName)
+    check(screenshot == (1, 1, true) && r.db.clip(hash: "f:" + sha(testHome.appendingPathComponent(screenshotName).path))?.source == "Screenshot"
+          && r.d.shotCard.isVisible, "a screenshot named polished enters history and shows a card")
+    r.d.shotCard.hide()
     check(until { !bubble.isVisible }, "gone again")
     r.model.hideBubble = false
     check(until { bubble.isVisible }, "back for the rest")

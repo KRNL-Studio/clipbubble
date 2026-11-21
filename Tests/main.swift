@@ -36,6 +36,8 @@ updaterTests()
 syncBadgeTests()
 shortcutTests()
 bubbleTests()
+polishTests()
+polishEditorTests()
 windowTests()
 folderWatcherTests()
 

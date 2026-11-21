@@ -246,7 +246,7 @@ enum PolishRenderer {
               let image = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
         let properties = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
         guard let value = properties?[kCGImagePropertyOrientation] as? UInt32,
-              let orientation = CGImagePropertyOrientation(rawValue: value), orientation != .up else { return image }
+              let orientation = CGImagePropertyOrientation(rawValue: value) else { return image }
         return orient(image, as: orientation)
     }
 
@@ -376,7 +376,20 @@ enum PolishRenderer {
 
     // MARK: Export
 
-    static func exportScale(for style: PolishStyle, retina: Bool) -> CGFloat {
+    static func thumbnail(_ image: CGImage, maxSide: CGFloat) -> CGImage {
+        let scale = maxSide / CGFloat(max(image.width, image.height))
+        guard scale < 1 else { return image }
+        let width = max(1, Int(CGFloat(image.width) * scale))
+        let height = max(1, Int(CGFloat(image.height) * scale))
+        guard let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return image }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return ctx.makeImage() ?? image
+    }
+
+    static func exportScale(for style: PolishStyle, retina: Bool = !UserDefaults.standard.bool(forKey: "polish.export1x")) -> CGFloat {
         retina || style.size.pixels != nil ? 1 : 0.5
     }
 
@@ -394,10 +407,15 @@ enum PolishRenderer {
         return CGImageDestinationFinalize(dest) ? data as Data : nil
     }
 
+    static var saveFolder: URL? {
+        guard let path = UserDefaults.standard.string(forKey: "polish.folder"), !path.isEmpty else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+
     /// Where a saved copy goes: next to the original unless Settings picked a folder, never over another file.
     /// A copied image lives in ClipBubble's own data, so its copy goes to the screenshot folder instead.
     static func saveURL(for source: URL) -> URL {
-        let custom = UserDefaults.standard.string(forKey: "polish.folder").flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
+        let custom = saveFolder
         let inApp = source.deletingLastPathComponent().resolvingSymlinksInPath().path == Paths.images.resolvingSymlinksInPath().path
         let dir = custom ?? (inApp ? FolderWatcher.screenshotFolder : source.deletingLastPathComponent())
         let base = (inApp ? "Image" : source.deletingPathExtension().lastPathComponent) + " polished"

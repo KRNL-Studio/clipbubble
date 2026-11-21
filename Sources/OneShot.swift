@@ -1,5 +1,13 @@
 import AppKit
 
+extension DispatchWorkItem {
+    static func onMain(after delay: TimeInterval, _ action: @escaping () -> Void) -> DispatchWorkItem {
+        let work = DispatchWorkItem(block: action)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        return work
+    }
+}
+
 enum OneShotStatus: Equatable {
     case rendering, copied, failed
 
@@ -24,7 +32,7 @@ final class OneShot {
         inFlight = true
         let startingStyle = PolishPreset.last
         let style = startingStyle.isPlain ? PolishPreset.gradient.style : startingStyle
-        let scale = PolishRenderer.exportScale(for: style, retina: !UserDefaults.standard.bool(forKey: "polish.export1x"))
+        let scale = PolishRenderer.exportScale(for: style)
         Self.queue.async { [weak self] in
             let result = OneShot.export(url, style: style, scale: scale)
             DispatchQueue.main.async { [weak self] in
@@ -43,9 +51,7 @@ final class OneShot {
             let doc = PolishDoc(source: url, size: CGSize(width: source.width, height: source.height), style: style)
             guard let image = PolishRenderer.render(doc, source: source, scale: scale),
                   let png = PolishRenderer.png(image) else { return nil }
-            let ratio = 520 / CGFloat(max(image.width, image.height))
-            let preview = ratio < 1 ? PolishModel.scaled(image, ratio) ?? image : image
-            return (png, preview)
+            return (png, PolishRenderer.thumbnail(image, maxSide: 520))
         }
     }
 }

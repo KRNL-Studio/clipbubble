@@ -877,11 +877,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var polishToastReset: DispatchWorkItem?
     var putPolishedOnClipboard: (Data) -> Bool = { Board.writePNG($0, polished: true) }
     private var polishedPaths: [String: PolishedFile] = [:]
-    var polishedFileAt: (URL) -> PolishedFile? = PolishedFile.read
-    var screenshotClipboardChangeCount: () -> Int = { NSPasteboard.general.changeCount }
-    private var screenshotClipboardWrite: (count: Int, baseline: Int)?
-    // Resolve screenshot identities in arrival order so their effects are delivered in that order.
-    private static let screenshotIdentityQueue = DispatchQueue(label: "clipbubble.screenshotIdentity", qos: .userInitiated)
+    var fileIdentity: (URL) -> PolishedFile? = PolishedFile.read
+    var clipboardCount: () -> Int = { NSPasteboard.general.changeCount }
+    private var shotWrite: (count: Int, baseline: Int)?
+    // Keep screenshot notifications in arrival order.
+    private static let shotQueue = DispatchQueue(label: "clipbubble.screenshotIdentity", qos: .userInitiated)
     private var localClickMonitor: Any?
     private var capture: Capture!
     private var screenshots: FolderWatcher?
@@ -1005,12 +1005,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             self.model.polishActivity = (c.id, thumbnail == nil ? .failed : .copied)
             self.model.polishToast = (source, thumbnail)
-            let resetRow = DispatchWorkItem { [weak self] in self?.model.polishActivity = nil }
-            let resetToast = DispatchWorkItem { [weak self] in self?.model.polishToast = nil }
-            self.polishRowReset = resetRow
-            self.polishToastReset = resetToast
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: resetRow)
-            DispatchQueue.main.asyncAfter(deadline: .now() + (thumbnail == nil ? 1.5 : 4), execute: resetToast)
+            self.polishRowReset = .onMain(after: 1.5) { [weak self] in self?.model.polishActivity = nil }
+            self.polishToastReset = .onMain(after: thumbnail == nil ? 1.5 : 4) { [weak self] in self?.model.polishToast = nil }
         }) else { return }
         polishRowReset?.cancel()
         polishToastReset?.cancel()
@@ -1027,7 +1023,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// A saved copy joins history as Polished, not as a new screenshot.
     func polishedSaved(_ url: URL) {
-        if let file = polishedFileAt(url) { polishedPaths[file.path] = file }
+        if let file = fileIdentity(url) { polishedPaths[file.path] = file }
         model.db.insertIfMissing(kind: "file", text: url.path, source: "Polished", hash: "f:" + sha(url.path), created: Date())
         refreshLists()
     }
@@ -1116,34 +1112,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func screenshotAdded(_ url: URL, at date: Date) {
         guard Prefs.on("screenshots") else { return }
         let watcher = screenshots
-        let clipboardBaseline = screenshotClipboardBaseline()
+        let baseline = clipboardBaseline()
         guard !polishedPaths.isEmpty else {
-            announceScreenshot(url, at: date, file: nil, clipboardBaseline: clipboardBaseline)
+            announceScreenshot(url, at: date, file: nil, baseline: baseline)
             return
         }
-        let read = polishedFileAt
-        Self.screenshotIdentityQueue.async { [weak self] in
+        let read = fileIdentity
+        Self.shotQueue.async { [weak self] in
             let file = read(url)
             DispatchQueue.main.async {
                 guard let self, self.screenshots === watcher, Prefs.on("screenshots") else { return }
-                self.announceScreenshot(url, at: date, file: file, clipboardBaseline: clipboardBaseline)
+                self.announceScreenshot(url, at: date, file: file, baseline: baseline)
             }
         }
     }
 
-    private func screenshotClipboardBaseline() -> Int {
-        let count = screenshotClipboardChangeCount()
+    private func clipboardBaseline() -> Int {
+        let count = clipboardCount()
         // A run of our own screenshot writes shares the clipboard count it started from.
-        if let write = screenshotClipboardWrite, write.count == count { return write.baseline }
+        if let write = shotWrite, write.count == count { return write.baseline }
         return count
     }
 
-    private func announceScreenshot(_ url: URL, at date: Date, file: PolishedFile?, clipboardBaseline: Int) {
+    private func announceScreenshot(_ url: URL, at date: Date, file: PolishedFile?, baseline: Int) {
         guard let hash = recordScreenshot(url, at: date, file: file) else { return }
         // A copy to the clipboard is announced when capture saves it, unless copied files aren't saved.
         if UserDefaults.standard.bool(forKey: "copyScreenshots"), let c = model.db.clip(hash: hash),
-           screenshotClipboardBaseline() == clipboardBaseline {
-            if let count = putOnClipboard(c) { screenshotClipboardWrite = (count, clipboardBaseline) }
+           clipboardBaseline() == baseline {
+            if let count = putOnClipboard(c) { shotWrite = (count, baseline) }
             if !Prefs.on("files") { captured() }
         } else { captured() }
         offerPolish(url)
@@ -1205,7 +1201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         // Resolving aliases and reading file metadata can block on a mounted volume.
-        let read = polishedFileAt
+        let read = fileIdentity
         DispatchQueue.global(qos: .utility).async {
             let files = found.map { ($0.0, $0.1, read($0.0)) }
             DispatchQueue.main.async { apply(files) }

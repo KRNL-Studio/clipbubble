@@ -377,7 +377,7 @@ final class HistoryBrowser: ObservableObject {
 
     private func matchingClips(limit: Int, after cursor: Clip? = nil, id: Int64? = nil) -> [Clip]? {
         var tail = ""
-        var bindings: [Any] = []
+        var bindings: [Any?] = []
         if let cursor {
             // The ID breaks ties when several clips share a timestamp.
             tail += " AND (created, id) < (?, ?)"
@@ -389,15 +389,11 @@ final class HistoryBrowser: ObservableObject {
         }
         tail += " ORDER BY created DESC, id DESC LIMIT ?"
         bindings.append(limit)
-        return readMatches("id, kind, text, file, source, created, hash, origin, remote", tail: tail, bindings: bindings) { s in
-            func col(_ i: Int32) -> String { sqlite3_column_text(s, i).map { String(cString: $0) } ?? "" }
+        return readMatches("id, kind, text, file, source, created, hash, origin, remote, 0", tail: tail, bindings: bindings) { s in
             var clips: [Clip] = []
             var result = sqlite3_step(s)
             while result == SQLITE_ROW {
-                clips.append(Clip(id: sqlite3_column_int64(s, 0), kind: col(1), text: col(2),
-                                  file: sqlite3_column_type(s, 3) == SQLITE_NULL ? nil : col(3), source: col(4),
-                                  created: Date(timeIntervalSince1970: sqlite3_column_double(s, 5)),
-                                  hash: col(6), origin: col(7), remote: sqlite3_column_int(s, 8) != 0))
+                clips.append(DB.readClip(s))
                 result = sqlite3_step(s)
             }
             return result == SQLITE_DONE ? clips : nil
@@ -405,51 +401,19 @@ final class HistoryBrowser: ObservableObject {
     }
 
     /// Apply the same filters to the count, every page and a selection outside the loaded pages.
-    private func readMatches<T>(_ columns: String, tail: String = "", bindings: [Any] = [],
+    private func readMatches<T>(_ columns: String, tail: String = "", bindings: [Any?] = [],
                                 read: (OpaquePointer?) -> T?) -> T? {
         var db: OpaquePointer?
         defer { sqlite3_close(db) }
         guard sqlite3_open_v2(Paths.db.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return nil }
         sqlite3_busy_timeout(db, 3000)
 
-        // Match the filters in DB.clips so History and the panel agree.
-        var sql = "SELECT \(columns) FROM clips WHERE created >= ?"
-        var args: [Any] = [Date().timeIntervalSince1970 - DB.retention]
         let kind = ["text", "image", "file"].contains(filter) ? filter : nil
-        if kind == "image" {
-            sql += " AND (kind = 'image' OR (kind = 'file' AND (" +
-                imageExts.map { "text LIKE '%.\($0)'" }.joined(separator: " OR ") + ")))"
-        } else if let kind {
-            sql += " AND kind = ?"
-            args.append(kind)
-        }
-        if let source = ["iphone": "iPhone", "shots": "Screenshot", "downloads": "Downloads"][filter] {
-            sql += " AND (source = ? COLLATE NOCASE OR origin IN (SELECT id FROM devices WHERE name = ? COLLATE NOCASE))"
-            args += [source, source]
-        }
-        if !query.isEmpty {
-            let text = "%" + query.replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_") + "%"
-            sql += " AND (text LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\')"
-            args += [text, text]
-        }
-        sql += Prefs.hiddenSQL + tail
-        args += bindings
-
-        var statement: OpaquePointer?
+        let source = ["iphone": "iPhone", "shots": "Screenshot", "downloads": "Downloads"][filter]
+        let (whereClause, args) = DB.clipFilter(kind: kind, source: source, query: query)
+        let sql = "SELECT \(columns) FROM clips " + whereClause + tail
+        guard let statement = DB.prepare(db, sql, args + bindings) else { return nil }
         defer { sqlite3_finalize(statement) }
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
-        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        for (index, value) in args.enumerated() {
-            let index = Int32(index + 1)
-            switch value {
-            case let text as String: sqlite3_bind_text(statement, index, text, -1, transient)
-            case let time as Double: sqlite3_bind_double(statement, index, time)
-            case let id as Int64: sqlite3_bind_int64(statement, index, id)
-            case let limit as Int: sqlite3_bind_int64(statement, index, Int64(limit))
-            default: return nil
-            }
-        }
         return read(statement)
     }
 
@@ -460,9 +424,7 @@ final class HistoryBrowser: ObservableObject {
         let feedback = model.pick(clip, false)
         clearCopyFeedback()
         copyFeedback = feedback
-        let reset = DispatchWorkItem { [weak self] in self?.clearCopyFeedback() }
-        copyFeedbackReset = reset
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: reset)
+        copyFeedbackReset = .onMain(after: 1.2) { [weak self] in self?.clearCopyFeedback() }
         return true
     }
 

@@ -77,7 +77,6 @@ final class PolishModel: ObservableObject {
     var history = DocHistory()
     var onClose: () -> Void = {}
     var onSaved: (URL) -> Void = { _ in }
-    var focusInspector: () -> Void = {}
     var pasteboard = NSPasteboard.general
     var detectRedactions: (CGImage, Set<Redactor.Kind>, Bool) throws -> [(Redactor.Kind?, CGRect)] = Redactor.find
 
@@ -96,8 +95,7 @@ final class PolishModel: ObservableObject {
     init(url: URL, image: CGImage) {
         source = image
         name = url.deletingPathExtension().lastPathComponent
-        let k = min(1, 2400 / CGFloat(max(image.width, image.height)))
-        preview = k < 1 ? PolishModel.scaled(image, k) ?? image : image
+        preview = PolishRenderer.thumbnail(image, maxSide: 2400)
         let d = PolishDoc(source: url, size: CGSize(width: image.width, height: image.height))
         doc = d
         cropDraft = d.crop
@@ -105,16 +103,6 @@ final class PolishModel: ObservableObject {
     }
 
     deinit { thumbnailWork?.cancel() }
-
-    static func scaled(_ img: CGImage, _ k: CGFloat) -> CGImage? {
-        let w = max(1, Int(CGFloat(img.width) * k)), h = max(1, Int(CGFloat(img.height) * k))
-        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
-                                  space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-        else { return nil }
-        ctx.interpolationQuality = .high
-        ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
-        return ctx.makeImage()
-    }
 
     // MARK: Marks
 
@@ -284,7 +272,7 @@ final class PolishModel: ObservableObject {
                 d.style = p.style
                 // About 130 px across: sharp at 2× in a 66-point chip.
                 let one = PolishLayout(doc: d, scale: 1).canvas
-                if let img = PolishRenderer.render(d, source: src, scale: 130 / max(one.width, one.height), marks: true) {
+                if let img = PolishRenderer.render(d, source: src, scale: 130 / max(one.width, one.height)) {
                     out[p.name] = NSImage(cgImage: img, size: NSSize(width: img.width, height: img.height))
                 }
             }
@@ -300,9 +288,7 @@ final class PolishModel: ObservableObject {
 
     // MARK: Out
 
-    var exportScale: CGFloat {
-        PolishRenderer.exportScale(for: doc.style, retina: !UserDefaults.standard.bool(forKey: "polish.export1x"))
-    }
+    var exportScale: CGFloat { PolishRenderer.exportScale(for: doc.style) }
 
     private func png() -> Data? {
         guard !findingRedactions else { return nil }
@@ -453,7 +439,7 @@ final class PolishModel: ObservableObject {
         activity = .reading
         let src = source, doc = self.doc
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let image = PolishRenderer.render(doc, source: src, scale: 1, marks: true)
+            let image = PolishRenderer.render(doc, source: src)
             let text = image.map { Redactor.text(in: $0) } ?? ""
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -470,66 +456,64 @@ final class PolishModel: ObservableObject {
 
 enum PolishHandoffs {
     private static let lifetime: TimeInterval = 3600
+    private static let permissions: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
     static let root: URL = {
         // A second instance with its own data folder also has its own handoffs.
         let suffix = ProcessInfo.processInfo.environment["CLIPBUBBLE_HOME"].map { "-" + sha($0) } ?? ""
         return FileManager.default.temporaryDirectory.appendingPathComponent("ClipBubble Polish" + suffix, isDirectory: true)
     }()
-    private static let directory = root.appendingPathComponent("\(getpid())-\(UUID())", isDirectory: true)
-    private static let startup: Void = removeExpiredProcesses()
+    private static let launch = root.appendingPathComponent("\(getpid())-\(UUID())", isDirectory: true)
+    private static let startup: Void? = try? sweep(root, matching: canRemoveLaunch)
 
     static func prepare() { _ = startup }
 
-    static func clear() { removeHandoff(directory) }
+    static func clear() { remove(launch) }
 
-    private static func removeHandoff(_ folder: URL) {
-        if let path = UserDefaults.standard.string(forKey: "polish.folder"), !path.isEmpty {
-            let destination = URL(fileURLWithPath: path, isDirectory: true)
-            func containsSaveFolder(_ parent: URL, _ child: URL) -> Bool {
+    private static func remove(_ folder: URL) {
+        // Never follow a redirect out of the handoff root or launch folder.
+        guard ![root, folder.deletingLastPathComponent()].contains(where: {
+            (try? $0.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true
+        }) else { return }
+        if let destination = PolishRenderer.saveFolder {
+            func contains(_ parent: URL, _ child: URL) -> Bool {
                 child.standardizedFileURL.pathComponents.starts(with: parent.standardizedFileURL.pathComponents) {
                     $0.caseInsensitiveCompare($1) == .orderedSame
                 }
             }
-            if containsSaveFolder(folder, destination) ||
-                containsSaveFolder(folder.resolvingSymlinksInPath(), destination.resolvingSymlinksInPath()) { return }
+            if contains(folder, destination) ||
+                contains(folder.resolvingSymlinksInPath(), destination.resolvingSymlinksInPath()) { return }
         }
         try? FileManager.default.removeItem(at: folder)
     }
 
-    private static func removeExpiredProcesses() {
-        let fm = FileManager.default
+    private static func canRemoveLaunch(_ name: String) -> Bool {
+        if UUID(uuidString: name) != nil { return true } // Older versions used only a UUID.
+        let parts = name.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2, let pid = pid_t(parts[0]), pid > 0, String(pid) == parts[0],
+              UUID(uuidString: String(parts[1])) != nil else { return false }
+        return kill(pid, 0) == -1 && errno == ESRCH
+    }
+
+    private static func sweep(_ folder: URL, matching: (String) -> Bool) throws {
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey]
-        guard let entries = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: Array(keys)) else { return }
+        let entries = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: Array(keys))
         let stale = Date().addingTimeInterval(-lifetime)
         for entry in entries {
             guard let values = try? entry.resourceValues(forKeys: keys), values.isDirectory == true,
-                  values.isSymbolicLink == false, let date = values.contentModificationDate, date < stale else { continue }
-            let name = entry.lastPathComponent.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
-            if name.count == 2, let pid = pid_t(name[0]), pid > 0, String(pid) == name[0],
-               UUID(uuidString: String(name[1])) != nil {
-                guard kill(pid, 0) == -1, errno == ESRCH else { continue }
-            } else if UUID(uuidString: entry.lastPathComponent) == nil {
-                continue
-            }
-            removeHandoff(entry)
+                  values.isSymbolicLink == false, let date = values.contentModificationDate, date < stale,
+                  matching(entry.lastPathComponent) else { continue }
+            remove(entry)
         }
     }
 
     static func write(_ data: Data, name: String) throws -> URL {
         prepare()
         let fm = FileManager.default
-        let privateDirectory: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
-        try fm.createDirectory(at: directory, withIntermediateDirectories: true, attributes: privateDirectory)
-        let stale = Date().addingTimeInterval(-lifetime)
-        let entries = try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey])
-        for entry in entries {
-            if let date = try? entry.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate, date < stale {
-                removeHandoff(entry)
-            }
-        }
+        try fm.createDirectory(at: launch, withIntermediateDirectories: true, attributes: permissions)
+        try sweep(launch) { UUID(uuidString: $0) != nil }
 
-        let folder = directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try fm.createDirectory(at: folder, withIntermediateDirectories: false, attributes: privateDirectory)
+        let folder = launch.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: false, attributes: permissions)
         let url = folder.appendingPathComponent(name)
         do {
             let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
@@ -538,10 +522,10 @@ enum PolishHandoffs {
             try file.write(contentsOf: data)
             try file.close()
         } catch {
-            removeHandoff(folder)
+            remove(folder)
             throw error
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + lifetime) { removeHandoff(folder) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + lifetime) { remove(folder) }
         return url
     }
 }

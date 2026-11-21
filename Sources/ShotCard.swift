@@ -78,9 +78,7 @@ final class ShotCard {
             } else {
                 self.state.copyFeedback = .failed
                 self.schedule(after: 6)
-                let work = DispatchWorkItem { [weak self] in self?.state.copyFeedback = nil }
-                self.copyFeedbackWork = work
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+                self.copyFeedbackWork = .onMain(after: 1.5) { [weak self] in self?.state.copyFeedback = nil }
             }
         }
         state.close = { [weak self] in self?.hide() }
@@ -100,12 +98,10 @@ final class ShotCard {
             if let thumbnail { self.state.polishedThumbnail = thumbnail }
             self.schedule(after: 6)
             if thumbnail == nil {
-                let reset = DispatchWorkItem { [weak self] in
+                self.polishFeedbackWork = .onMain(after: 1.5) { [weak self] in
                     guard let self else { return }
                     self.state.polishStatus = self.state.polishedThumbnail == nil ? nil : .copied
                 }
-                self.polishFeedbackWork = reset
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: reset)
             }
         }) else { return }
         polishFeedbackWork?.cancel()
@@ -178,9 +174,7 @@ final class ShotCard {
     private func schedule(after s: Double) {
         hideWork?.cancel()
         guard !hovering, state.polishStatus != .rendering else { return }
-        let w = DispatchWorkItem { [weak self] in self?.hide() }
-        hideWork = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + s, execute: w)
+        hideWork = .onMain(after: s) { [weak self] in self?.hide() }
     }
 }
 

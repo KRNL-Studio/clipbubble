@@ -60,21 +60,7 @@ enum PolishTool: String, CaseIterable, Identifiable {
         }
     }
 
-    var kind: Mark.Kind? {
-        switch self {
-        case .select, .crop: return nil
-        case .arrow: return .arrow
-        case .line: return .line
-        case .rect: return .rect
-        case .ellipse: return .ellipse
-        case .pen: return .pen
-        case .text: return .text
-        case .step: return .step
-        case .measure: return .measure
-        case .highlight: return .highlight
-        case .redact: return .redact
-        }
-    }
+    var kind: Mark.Kind? { Mark.Kind(rawValue: rawValue) }
 
     /// The toolbar's groups.
     static let groups: [[PolishTool]] = [[.select, .crop], [.arrow, .line, .rect, .ellipse, .pen], [.text, .step, .measure], [.highlight, .redact]]
@@ -474,8 +460,10 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
     // MARK: Handles
 
     private func rotationArm(_ mk: Mark, _ g: Geometry) -> (start: CGPoint, end: CGPoint)? {
-        guard mk.canRotate, mk.unrotatedBounds.hasFiniteBounds, g.layout.scale.isFinite, g.layout.scale > 0 else { return nil }
-        let r = mk.unrotatedBounds, transform = mk.rotationTransform
+        guard mk.canRotate else { return nil }
+        let r = mk.unrotatedBounds
+        guard r.hasFiniteBounds else { return nil }
+        let transform = mk.rotationTransform
         let top = CGPoint(x: r.midX, y: r.minY)
         let knob = CGPoint(x: top.x, y: top.y - 18 / g.layout.scale)
         let start = top.applying(transform), end = knob.applying(transform)
@@ -560,7 +548,7 @@ final class PolishCanvas: NSView, NSTextViewDelegate {
             if let hit {
                 m.selection = hit.id
                 if e.clickCount == 2, hit.kind == .text { beginTextEdit(hit.id, new: false); return }
-                if e.clickCount == 2, hit.kind == .step { m.focusInspector(); return }
+                if e.clickCount == 2, hit.kind == .step { return }
                 drag = .move(hit.id, p)
             } else {
                 m.selection = nil

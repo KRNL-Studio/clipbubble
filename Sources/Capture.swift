@@ -56,17 +56,21 @@ final class Capture {
         if let own = Self.ownWrite(count) { last = (own, now, false); previousHash = nil; return }
         let types = Set((pb.types ?? []).map(\.rawValue))
         guard !types.isEmpty, types.isDisjoint(with: Self.skipTypes), let clip = read(pb) else { return }
-        // The same copy again is a no-op, unless it was deleted from history in between.
-        if clip.hash == last?.hash, db.exists(hash: clip.hash) { return }
-        let source = types.contains("com.apple.is-remote-clipboard")
-            ? "iPhone" : (NSWorkspace.shared.frontmostApplication?.localizedName ?? "Mac")
+        let polished = clip.kind == "image" && types.contains(Board.polishedType.rawValue)
+        // The same copy again is a no-op unless it was deleted or needs the Polished source.
+        if clip.hash == last?.hash,
+           polished ? db.clip(hash: clip.hash)?.source == "Polished" : db.exists(hash: clip.hash) { return }
+        let source: String
+        if polished { source = "Polished" }
+        else if types.contains("com.apple.is-remote-clipboard") { source = "iPhone" }
+        else { source = NSWorkspace.shared.frontmostApplication?.localizedName ?? "Mac" }
         let category = source == "iPhone" ? "iphone" : (["image": "images", "file": "files"][clip.kind] ?? "text")
         guard Prefs.on(category) else { return }
         if source == "iPhone", clip.kind == "file", Self.isEcho(clip.text.components(separatedBy: "\n"), db: db) { return }
 
         // The previous contents came straight back, so what we just saw was a paste-through: drop it,
         // and don't bump the restored item.
-        if clip.hash == previousHash, let l = last, now.timeIntervalSince(l.at) < 2.5 {
+        if !polished, clip.hash == previousHash, let l = last, now.timeIntervalSince(l.at) < 2.5 {
             if l.inserted { db.delete(hash: l.hash) }
             last = (clip.hash, now, false)
             previousHash = nil
@@ -79,7 +83,7 @@ final class Capture {
         }
         let inserted = !db.exists(hash: clip.hash)
         db.upsert(kind: clip.kind, text: clip.text, file: clip.file, source: source, hash: clip.hash)
-        previousHash = last?.hash
+        previousHash = polished ? nil : last?.hash
         last = (clip.hash, now, inserted)
         onChange(true)
     }

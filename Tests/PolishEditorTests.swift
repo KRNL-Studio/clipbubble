@@ -142,8 +142,6 @@ private func editorExports(_ dir: URL) throws {
                                               ofItemAtPath: first.deletingLastPathComponent().path)
         check(model.exportFile() != nil && !FileManager.default.fileExists(atPath: first.path)
               && FileManager.default.fileExists(atPath: second.path), "handoffs older than an hour are removed")
-        AppDelegate().applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
-        check(!FileManager.default.fileExists(atPath: second.path), "app quit removes the remaining handoffs")
     }
 
     model.doc.crop = CGRect(x: 0, y: 0, width: 800, height: 320)
@@ -166,7 +164,7 @@ private func editorExports(_ dir: URL) throws {
     check(!closed, "Return keeps the editor open when Copy fails")
 }
 
-private func editorHandoffIsolation() throws {
+func editorHandoffIsolation() throws {
     let fm = FileManager.default
     let root = PolishHandoffs.root
     let defaults = UserDefaults.standard
@@ -187,6 +185,9 @@ private func editorHandoffIsolation() throws {
     let legacy = try makeFolder(age: 3601)
     let youngLegacy = try makeFolder(age: 0)
     let project = try makeFolder(name: "Project exports", age: 3601)
+    let link = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try fm.createSymbolicLink(at: link, withDestinationURL: project.deletingLastPathComponent())
+    defer { try? fm.removeItem(at: link) }
     let protected = try makeFolder(age: 3601)
     let protectedFolder = protected.deletingLastPathComponent()
     let saveFolder = protectedFolder.appendingPathComponent("Chosen save folder")
@@ -200,20 +201,46 @@ private func editorHandoffIsolation() throws {
             try? fm.removeItem(at: file.deletingLastPathComponent())
         }
     }
-    let own = try PolishHandoffs.write(Data([2]), name: "mine.png")
+    PolishHandoffs.prepare()
     check(fm.fileExists(atPath: live.path) && fm.fileExists(atPath: young.path) && !fm.fileExists(atPath: stale.path),
           "handoff startup removes only expired files from dead processes")
     check(!fm.fileExists(atPath: legacy.path) && fm.fileExists(atPath: youngLegacy.path),
           "handoff startup removes only expired legacy folders")
-    check(fm.fileExists(atPath: project.path), "handoff cleanup keeps aged Project exports")
+    check(fm.fileExists(atPath: project.path) && fm.fileExists(atPath: link.path),
+          "handoff cleanup keeps aged Project exports and skips a UUID folder symlink")
     check(fm.fileExists(atPath: savedPNG.path), "handoff cleanup keeps an aged UUID folder containing the save location")
-    defaults.set(own.deletingLastPathComponent().path, forKey: "polish.folder")
-    PolishHandoffs.clear()
-    check(fm.fileExists(atPath: own.path), "handoff quit preserves the current save location")
-    defaults.set(saveFolder.path, forKey: "polish.folder")
-    PolishHandoffs.clear()
-    check(!fm.fileExists(atPath: own.path) && fm.fileExists(atPath: live.path) && fm.fileExists(atPath: young.path),
-          "handoff quit clears only this launch's files")
+}
+
+func editorHandoffQuit() throws {
+    let fm = FileManager.default
+    let defaults = UserDefaults.standard
+    let previous = defaults.object(forKey: "polish.folder")
+    defer { defaults.set(previous, forKey: "polish.folder") }
+    let folder = testHome.appendingPathComponent("quit exports", isDirectory: true)
+    defaults.set(folder.path, forKey: "polish.folder")
+    let image = editorImage()
+    let png = editorPNG(image)
+    let handoff = try PolishHandoffs.write(png, name: "quit.png")
+    let launch = handoff.deletingLastPathComponent().deletingLastPathComponent()
+    let otherLaunch = PolishHandoffs.root.appendingPathComponent("\(getpid())-\(UUID())", isDirectory: true)
+    try fm.createDirectory(at: otherLaunch, withIntermediateDirectories: false)
+    defer { try? fm.removeItem(at: otherLaunch) }
+    let model = PolishModel(url: handoff, image: image)
+    model.save()
+
+    let app = AppDelegate()
+    let quit = Notification(name: NSApplication.willTerminateNotification)
+    defaults.set(handoff.deletingLastPathComponent().path, forKey: "polish.folder")
+    app.applicationWillTerminate(quit)
+    check(fm.fileExists(atPath: handoff.path), "handoff quit preserves the current save location")
+    defaults.set(folder.path, forKey: "polish.folder")
+    app.applicationWillTerminate(quit)
+    check(PolishRenderer.load(folder.appendingPathComponent("quit polished.png")) != nil,
+          "the editor's saved copy of a handoff original survives app quit")
+    check(!fm.fileExists(atPath: launch.path) && fm.fileExists(atPath: otherLaunch.path),
+          "app quit removes this launch folder and keeps other launches")
+    check((try? PolishHandoffs.write(png, name: "late.png")) == nil && !fm.fileExists(atPath: launch.path),
+          "a late handoff write after quit cannot recreate the launch folder")
 }
 
 private func editorCropBadgeChecks(_ dir: URL) throws {
@@ -664,7 +691,7 @@ private func editorCardChecks(_ dir: URL) throws {
     let first = NSRect(x: x, y: 0, width: 1300, height: 900)
     let second = first.offsetBy(dx: 1400, dy: 0)
     let app = AppDelegate()
-    app.screenshotClipboardChangeCount = { 0 }
+    app.clipboardCount = { 0 }
     app.displays = { [Display(id: 801, frame: first, visible: first), Display(id: 802, frame: second, visible: second)] }
     var pointer = CGPoint(x: second.midX, y: second.midY)
     app.pointer = { pointer }
@@ -722,8 +749,8 @@ private func editorCardChecks(_ dir: URL) throws {
     try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: saved)
     let lock = NSLock()
     var lookups: [Bool] = []
-    let resolve = app.polishedFileAt
-    app.polishedFileAt = { url in
+    let resolve = app.fileIdentity
+    app.fileIdentity = { url in
         lock.withLock { lookups.append(Thread.isMainThread) }
         return resolve(url)
     }
@@ -733,7 +760,7 @@ private func editorCardChecks(_ dir: URL) throws {
           && app.model.db.clip(hash: "f:" + sha(alias.path)) == nil
           && lock.withLock { lookups == [false, false] },
           "screenshot backfill resolves files off main and skips editor aliases")
-    app.polishedFileAt = resolve
+    app.fileIdentity = resolve
 
     try editorPNG(editorImage(.blue)).write(to: saved, options: .atomic)
     var replacementCopied = false
@@ -752,17 +779,17 @@ private func editorScreenshotLookupChecks(_ app: AppDelegate, _ dir: URL) throws
     let savedFolder = defaults.object(forKey: "screenshotFolder")
     let savedPref = defaults.object(forKey: "save.screenshots")
     let board = NSPasteboard(name: .init("polish-screenshot-lookup-" + UUID().uuidString))
-    let clipboardChange = app.screenshotClipboardChangeCount, putOnClipboard = app.putOnClipboard
+    let clipboardChange = app.clipboardCount, putOnClipboard = app.putOnClipboard
     let folder = dir.appendingPathComponent("watch"), replacement = dir.appendingPathComponent("watch replacement")
     for url in [folder, replacement] { try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true) }
-    let read = app.polishedFileAt
+    let read = app.fileIdentity
     defer {
         Prefs.set("screenshots", false)
         app.syncScreenshots()
         defaults.set(savedFolder, forKey: "screenshotFolder")
         defaults.set(savedPref, forKey: "save.screenshots")
-        app.polishedFileAt = read
-        app.screenshotClipboardChangeCount = clipboardChange
+        app.fileIdentity = read
+        app.clipboardCount = clipboardChange
         app.putOnClipboard = putOnClipboard
         app.shotCard.hide(animated: false)
         board.releaseGlobally()
@@ -770,7 +797,7 @@ private func editorScreenshotLookupChecks(_ app: AppDelegate, _ dir: URL) throws
     defaults.set(folder.path, forKey: "screenshotFolder")
     Prefs.set("screenshots", true)
     app.syncScreenshots()
-    app.screenshotClipboardChangeCount = { board.changeCount }
+    app.clipboardCount = { board.changeCount }
     var copiedShots: [String] = []
     app.putOnClipboard = { clip in
         copiedShots.append(clip.text)
@@ -787,7 +814,7 @@ private func editorScreenshotLookupChecks(_ app: AppDelegate, _ dir: URL) throws
         try png.write(to: url)
         let entered = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
         let drained = DispatchSemaphore(value: 0)
-        app.polishedFileAt = { candidate in
+        app.fileIdentity = { candidate in
             if candidate == url { entered.signal(); _ = resume.wait(timeout: .now() + 4) }
             if candidate == sentinel { drained.signal() }
             return read(candidate)
@@ -824,7 +851,7 @@ private func editorScreenshotLookupChecks(_ app: AppDelegate, _ dir: URL) throws
     let first = dir.appendingPathComponent("burst first.png"), second = dir.appendingPathComponent("burst second.png")
     try png.write(to: first)
     let firstLookup = DispatchSemaphore(value: 0), resumeFirst = DispatchSemaphore(value: 0)
-    app.polishedFileAt = { candidate in
+    app.fileIdentity = { candidate in
         if candidate == first { firstLookup.signal(); _ = resumeFirst.wait(timeout: .now() + 4) }
         return read(candidate)
     }
@@ -851,10 +878,9 @@ func polishEditorTests() {
     let dir = testHome.appendingPathComponent("editor")
     let defaults = UserDefaults.standard
     let last = defaults.object(forKey: "polish.last")
-    defer { defaults.set(last, forKey: "polish.last"); PolishHandoffs.clear() }
+    defer { defaults.set(last, forKey: "polish.last") }
     do {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try editorHandoffIsolation()
         try editorExports(dir)
         try editorCropBadgeChecks(dir)
         MainActor.assumeIsolated { inspectorHintChecks() }

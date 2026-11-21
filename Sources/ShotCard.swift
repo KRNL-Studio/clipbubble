@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 // The card that slides out beside the bubble when you take a screenshot: drag it, polish it, or copy it.
 // It leaves on its own after a few seconds, but never while the pointer is on it.
@@ -9,11 +10,24 @@ final class ShotCardState: ObservableObject {
 
     @Published var url: URL?
     @Published var copyFeedback: CopyFeedback?
+    @Published var polishStatus: OneShotStatus?
+    @Published var polished: OneShot.Output? {
+        didSet { polishedDragFile = nil }
+    }
+    private var polishedDragFile: PolishedDragFile?
+    var polishedThumbnail: NSImage? { polished?.thumbnail }
+    var polishLabel: String {
+        switch polishStatus {
+        case .copied: return "Copied"
+        case .failed: return "Polish failed"
+        default: return "Polish"
+        }
+    }
     var copyLabel: String {
         switch copyFeedback {
         case .copied: return "Copied"
         case .failed: return "Copy failed"
-        case nil: return "Copy"
+        case nil: return polished == nil ? "Copy" : "Copy original"
         }
     }
     var copyIcon: String {
@@ -23,7 +37,61 @@ final class ShotCardState: ObservableObject {
         case nil: return "doc.on.doc"
         }
     }
+
+    func dragItem() -> NSItemProvider {
+        guard let url else { return NSItemProvider() }
+        guard let polished else { return NSItemProvider(contentsOf: url) ?? NSItemProvider() }
+        let name = PolishRenderer.polishedFilename(base: url.deletingPathExtension().lastPathComponent)
+        let png = polished.png
+        let file = polishedDragFile ?? PolishedDragFile()
+        polishedDragFile = file
+
+        let provider = NSItemProvider()
+        provider.suggestedName = name
+        provider.registerFileRepresentation(forTypeIdentifier: UTType.png.identifier, fileOptions: [], visibility: .all) { complete in
+            file.load(png, name: name) { url, error in complete(url, false, error) }
+            return nil
+        }
+        provider.registerDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier, visibility: .all) { complete in
+            file.load(png, name: name) { url, error in complete(url?.dataRepresentation, error) }
+            return nil
+        }
+        // Foundation keeps one representation per identifier. Advertise the PNG bytes as an image as well.
+        provider.registerDataRepresentation(forTypeIdentifier: UTType.image.identifier, visibility: .all) { complete in
+            complete(png, nil)
+            return nil
+        }
+        return provider
+    }
+
+    /// Providers keep their cache even after the card closes or shows a new screenshot.
+    private final class PolishedDragFile: @unchecked Sendable {
+        private static let queue = DispatchQueue(label: "clipbubble.polish-drag", qos: .userInitiated)
+        private var result: URL?
+
+        func load(_ png: Data, name: String, completion: @escaping @Sendable (URL?, Error?) -> Void) {
+            Self.queue.async {
+                let fm = FileManager.default
+                if let url = self.result, fm.fileExists(atPath: url.path),
+                   let written = (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
+                   Date().timeIntervalSince(written) < 50 * 60 {
+                    completion(url, nil)
+                    return
+                }
+                self.result = nil
+                do {
+                    let url = try PolishHandoffs.write(png, name: name)
+                    self.result = url
+                    completion(url, nil)
+                } catch {
+                    completion(nil, error)
+                }
+            }
+        }
+    }
+
     var polish: () -> Void = {}
+    var edit: () -> Void = {}
     var copy: () -> Void = {}
     var close: () -> Void = {}
     var hovered: (Bool) -> Void = { _ in }
@@ -35,9 +103,12 @@ final class ShotCard {
     let state = ShotCardState()
     private var hideWork: DispatchWorkItem?
     private var copyFeedbackWork: DispatchWorkItem?
+    private var polishFeedbackWork: DispatchWorkItem?
+    private var presentation = UUID()
     private var hovering = false
 
-    var onPolish: (URL) -> Void = { _ in }
+    var onPolish: (URL, @escaping (OneShot.Output?) -> Void) -> Bool = { _, _ in false }
+    var onEdit: (URL) -> Void = { _ in }
     var onCopy: (URL) -> Bool = { _ in false }
     var onHidden: () -> Void = {}
 
@@ -51,10 +122,10 @@ final class ShotCard {
         host.autoresizingMask = [.width, .height]
         container.addSubview(host)
         panel.contentView = container
-        state.polish = { [weak self] in
+        state.polish = { [weak self] in self?.polish() }
+        state.edit = { [weak self] in
             guard let self, let url = self.state.url else { return }
-            self.hide()
-            self.onPolish(url)
+            self.onEdit(url)
         }
         state.copy = { [weak self] in
             guard let self, let url = self.state.url else { return }
@@ -65,9 +136,7 @@ final class ShotCard {
             } else {
                 self.state.copyFeedback = .failed
                 self.schedule(after: 6)
-                let work = DispatchWorkItem { [weak self] in self?.state.copyFeedback = nil }
-                self.copyFeedbackWork = work
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+                self.copyFeedbackWork = .onMain(after: 1.5) { [weak self] in self?.state.copyFeedback = nil }
             }
         }
         state.close = { [weak self] in self?.hide() }
@@ -78,11 +147,38 @@ final class ShotCard {
         }
     }
 
+    private func polish() {
+        guard let url = state.url else { return }
+        let presentation = self.presentation
+        guard onPolish(url, { [weak self] output in
+            guard let self, self.presentation == presentation else { return }
+            if output != nil {
+                self.copyFeedbackWork?.cancel()
+                self.state.copyFeedback = nil
+            }
+            self.state.polished = output
+            self.state.polishStatus = output == nil ? .failed : .copied
+            self.schedule(after: 6)
+            if output == nil {
+                self.polishFeedbackWork = .onMain(after: 1.5) { [weak self] in self?.state.polishStatus = nil }
+            }
+        }) else { return }
+        polishFeedbackWork?.cancel()
+        copyFeedbackWork?.cancel()
+        hideWork?.cancel()
+        state.copyFeedback = nil
+        state.polishStatus = .rendering
+    }
+
     /// Slides out of the bubble's side of the screen, level with the bubble.
     func show(_ url: URL, beside b: NSRect, in area: NSRect) {
+        presentation = UUID()
         state.url = url
         copyFeedbackWork?.cancel()
+        polishFeedbackWork?.cancel()
         state.copyFeedback = nil
+        state.polishStatus = nil
+        state.polished = nil
         let s = ShotCard.size
         let right = b.midX > area.midX, top = b.midY > area.midY
         var x = right ? b.minX - s.width - 6 : b.maxX + 6
@@ -125,17 +221,19 @@ final class ShotCard {
     private func finishHide() {
         panel.orderOut(nil)
         copyFeedbackWork?.cancel()
+        polishFeedbackWork?.cancel()
+        presentation = UUID()
         state.url = nil
+        state.polishStatus = nil
+        state.polished = nil
         hovering = false
         onHidden()
     }
 
     private func schedule(after s: Double) {
         hideWork?.cancel()
-        guard !hovering else { return }
-        let w = DispatchWorkItem { [weak self] in self?.hide() }
-        hideWork = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + s, execute: w)
+        guard !hovering, state.polishStatus != .rendering else { return }
+        hideWork = .onMain(after: s) { [weak self] in self?.hide() }
     }
 }
 
@@ -147,13 +245,21 @@ private struct ShotCardView: View {
         VStack(spacing: 10) {
             ZStack(alignment: .topTrailing) {
                 if let url = state.url {
-                    Thumb(path: url.path, px: 640, fit: true)
-                        .id(url)
+                    ZStack {
+                        Thumb(path: url.path, px: 640, fit: true)
+                            .id(url)
+                            .opacity(state.polishedThumbnail == nil ? 1 : 0)
+                        if let thumbnail = state.polishedThumbnail {
+                            Image(nsImage: thumbnail).resizable().scaledToFit()
+                                .transition(.opacity)
+                        }
+                    }
+                        .animation(.easeInOut(duration: 0.22), value: state.polishedThumbnail != nil)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .padding(6)
                         .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.white.opacity(0.05)))
                         .overlay(alignment: .bottomLeading) {
-                            Label("Drag me", systemImage: "hand.draw")
+                            Label("Drag", systemImage: "hand.draw")
                                 .font(.system(size: 10, weight: .medium))
                                 .padding(.horizontal, 7).padding(.vertical, 3)
                                 .background(.black.opacity(0.55), in: Capsule())
@@ -163,8 +269,8 @@ private struct ShotCardView: View {
                         .scaleEffect(hoverThumb ? 1.015 : 1)
                         .animation(.spring(response: 0.25, dampingFraction: 0.8), value: hoverThumb)
                         .onHover { hoverThumb = $0 }
-                        .onDrag { NSItemProvider(contentsOf: url) ?? NSItemProvider() }
-                        .help("Drag it anywhere")
+                        .onDrag { state.dragItem() }
+                        .help("Drag")
                 }
                 Button(action: state.close) {
                     Image(systemName: "xmark")
@@ -180,7 +286,18 @@ private struct ShotCardView: View {
             .frame(height: 150)
             HStack(spacing: 8) {
                 Button(action: state.polish) {
-                    Label("Polish", systemImage: "sparkles")
+                    Group {
+                        if state.polishStatus == .rendering {
+                            ProgressView().controlSize(.small).colorScheme(.dark)
+                        } else if state.polishStatus == .copied {
+                            HStack(spacing: 4) {
+                                Text("Copied")
+                                Image(systemName: "checkmark")
+                            }
+                        } else {
+                            Label(state.polishLabel, systemImage: state.polishStatus?.symbol ?? "sparkles")
+                        }
+                    }
                         .font(.system(size: 12.5, weight: .semibold))
                         .frame(maxWidth: .infinity).frame(height: 30)
                         .background(LinearGradient(colors: [Color(red: 0.42, green: 0.36, blue: 0.98), Color(red: 0.84, green: 0.43, blue: 0.99)],
@@ -189,16 +306,24 @@ private struct ShotCardView: View {
                         .foregroundStyle(.white)
                 }
                 .buttonStyle(PressStyle())
-                .help("Open in the editor")
+                .disabled(state.polishStatus == .rendering)
+                .accessibilityLabel(state.polishLabel)
+                .help("Polish and copy")
+                Button("Edit", action: state.edit)
+                    .buttonStyle(.link)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .help("Edit in Polish")
                 Button(action: state.copy) {
                     Label(state.copyLabel, systemImage: state.copyIcon)
                         .font(.system(size: 12.5, weight: .medium))
-                        .frame(width: 92, height: 30)
-                        .background(Color.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        .foregroundStyle(.white)
+                        .frame(width: state.polished == nil ? 92 : 108, height: 30)
+                        .background(Color.primary.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .foregroundStyle(.primary)
                         .contentTransition(.symbolEffect(.replace))
                 }
                 .buttonStyle(PressStyle())
+                .help("Copy the original screenshot")
             }
         }
         .padding(12)

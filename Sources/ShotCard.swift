@@ -11,7 +11,10 @@ final class ShotCardState: ObservableObject {
     @Published var url: URL?
     @Published var copyFeedback: CopyFeedback?
     @Published var polishStatus: OneShotStatus?
-    @Published var polished: OneShot.Output?
+    @Published var polished: OneShot.Output? {
+        didSet { polishedDragFile = nil }
+    }
+    private var polishedDragFile: PolishedDragFile?
     var polishedThumbnail: NSImage? { polished?.thumbnail }
     var polishLabel: String {
         switch polishStatus {
@@ -39,11 +42,43 @@ final class ShotCardState: ObservableObject {
         guard let url else { return NSItemProvider() }
         guard let polished else { return NSItemProvider(contentsOf: url) ?? NSItemProvider() }
         let name = url.deletingPathExtension().lastPathComponent + " polished.png"
-        if let file = try? PolishHandoffs.write(polished.png, name: name),
-           let provider = NSItemProvider(contentsOf: file) {
-            return provider
+        let png = polished.png
+        let file = polishedDragFile ?? PolishedDragFile()
+        polishedDragFile = file
+
+        let provider = NSItemProvider()
+        provider.suggestedName = name
+        provider.registerFileRepresentation(forTypeIdentifier: UTType.png.identifier, fileOptions: [], visibility: .all) { complete in
+            file.load(png, name: name) { url, error in complete(url, false, error) }
+            return nil
         }
-        return NSItemProvider(item: polished.png as NSData, typeIdentifier: UTType.png.identifier)
+        provider.registerDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier, visibility: .all) { complete in
+            file.load(png, name: name) { url, error in complete(url?.dataRepresentation, error) }
+            return nil
+        }
+        // Foundation keeps one representation per identifier. Advertise the PNG bytes as an image as well.
+        provider.registerDataRepresentation(forTypeIdentifier: UTType.image.identifier, visibility: .all) { complete in
+            complete(png, nil)
+            return nil
+        }
+        return provider
+    }
+
+    /// Providers keep their result even after the card closes or shows a new screenshot.
+    private final class PolishedDragFile: @unchecked Sendable {
+        private static let queue = DispatchQueue(label: "clipbubble.polish-drag", qos: .userInitiated)
+        private var result: Result<URL, Error>?
+
+        func load(_ png: Data, name: String, completion: @escaping @Sendable (URL?, Error?) -> Void) {
+            Self.queue.async {
+                let result = self.result ?? Result { try PolishHandoffs.write(png, name: name) }
+                self.result = result
+                switch result {
+                case .success(let url): completion(url, nil)
+                case .failure(let error): completion(nil, error)
+                }
+            }
+        }
     }
 
     var polish: () -> Void = {}

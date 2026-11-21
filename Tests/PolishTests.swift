@@ -138,6 +138,12 @@ func polishTests() {
           "1× export is half the pixels")
     guard let saved = PolishRenderer.saveURL(for: url) else { check(false, "a local screenshot has a save location"); return }
     check(saved.lastPathComponent == "shot polished.png", "saved copies are named after the original: \(saved.lastPathComponent)")
+    do {
+        try FileManager.default.createSymbolicLink(at: saved, withDestinationURL: dir.appendingPathComponent("missing.png"))
+        check(PolishRenderer.saveURL(for: url)?.lastPathComponent == "shot polished 2.png",
+              "a dangling symlink takes up the first save name")
+        try FileManager.default.removeItem(at: saved)
+    } catch { check(false, "could not set up the dangling save symlink: \(error)") }
     FileManager.default.createFile(atPath: saved.path, contents: Data())
     let nextSave = PolishRenderer.saveURL(for: url)
     check(nextSave?.lastPathComponent == "shot polished 2.png", "and never overwrite one")

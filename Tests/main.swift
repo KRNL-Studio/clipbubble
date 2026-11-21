@@ -23,10 +23,6 @@ if CommandLine.arguments.contains("--write-fixtures") {
     writeFixtures(to: URL(fileURLWithPath: CommandLine.arguments.last!))
     exit(0)
 }
-if child && CommandLine.arguments.contains("--write-handoff") {
-    print(try PolishHandoffs.write(Data([1]), name: "tracked polished.png").path)
-    exit(0)
-}
 if child { runChild() }
 
 syncTests()

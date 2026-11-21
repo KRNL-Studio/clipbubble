@@ -417,11 +417,11 @@ enum PolishRenderer {
         let custom = saveFolder
         let originalFolder = source.deletingLastPathComponent()
         let inApp = originalFolder.resolvingSymlinksInPath().path == Paths.images.resolvingSymlinksInPath().path
-        let screenshots = FolderWatcher.screenshotFolder
-        let preferred = custom ?? (inApp ? screenshots : originalFolder)
+        let preferred = custom ?? originalFolder
         let fm = FileManager.default
         let dir: URL
-        if PolishHandoffs.contains(preferred) || (custom == nil && PolishHandoffs.contains(source)) {
+        if PolishHandoffs.contains(preferred) || (custom == nil && (inApp || PolishHandoffs.contains(source))) {
+            let screenshots = FolderWatcher.screenshotFolder
             if !PolishHandoffs.contains(screenshots), FolderWatcher.canRead(screenshots),
                fm.isWritableFile(atPath: screenshots.path) {
                 dir = screenshots
@@ -435,7 +435,8 @@ enum PolishRenderer {
         let base = (inApp ? "Image" : source.deletingPathExtension().lastPathComponent) + " polished"
         var url = dir.appendingPathComponent(base + ".png")
         var n = 2
-        while fm.fileExists(atPath: url.path) {
+        var info = stat()
+        while lstat(url.path, &info) == 0 {
             url = dir.appendingPathComponent("\(base) \(n).png")
             n += 1
         }

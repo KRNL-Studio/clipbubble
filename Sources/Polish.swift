@@ -412,16 +412,30 @@ enum PolishRenderer {
         return URL(fileURLWithPath: path)
     }
 
-    /// Where a saved copy goes: next to the original unless Settings picked a folder, never over another file.
-    /// A copied image lives in ClipBubble's own data, so its copy goes to the screenshot folder instead.
-    static func saveURL(for source: URL) -> URL {
+    /// Temporary originals default to the watched screenshot folder. A saved copy always outlives the handoff.
+    static func saveURL(for source: URL) -> URL? {
         let custom = saveFolder
-        let inApp = source.deletingLastPathComponent().resolvingSymlinksInPath().path == Paths.images.resolvingSymlinksInPath().path
-        let dir = custom ?? (inApp ? FolderWatcher.screenshotFolder : source.deletingLastPathComponent())
+        let originalFolder = source.deletingLastPathComponent()
+        let inApp = originalFolder.resolvingSymlinksInPath().path == Paths.images.resolvingSymlinksInPath().path
+        let screenshots = FolderWatcher.screenshotFolder
+        let preferred = custom ?? (inApp ? screenshots : originalFolder)
+        let fm = FileManager.default
+        let dir: URL
+        if PolishHandoffs.contains(preferred) || (custom == nil && PolishHandoffs.contains(source)) {
+            if !PolishHandoffs.contains(screenshots), FolderWatcher.canRead(screenshots),
+               fm.isWritableFile(atPath: screenshots.path) {
+                dir = screenshots
+            } else {
+                dir = fm.homeDirectoryForCurrentUser.appendingPathComponent("Desktop", isDirectory: true)
+            }
+        } else {
+            dir = preferred
+        }
+        guard !PolishHandoffs.contains(dir) else { return nil }
         let base = (inApp ? "Image" : source.deletingPathExtension().lastPathComponent) + " polished"
         var url = dir.appendingPathComponent(base + ".png")
         var n = 2
-        while FileManager.default.fileExists(atPath: url.path) {
+        while fm.fileExists(atPath: url.path) {
             url = dir.appendingPathComponent("\(base) \(n).png")
             n += 1
         }

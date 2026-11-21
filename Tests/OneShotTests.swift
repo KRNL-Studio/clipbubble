@@ -159,6 +159,50 @@ private func checkOneShot() throws {
     let files = try FileManager.default.contentsOfDirectory(atPath: folder.path)
     check(files == [source.lastPathComponent],
           "one-shot leaves the screenshot and editor output folders untouched")
+
+    guard let polishedFile, let polishedImage = PolishRenderer.load(polishedFile) else {
+        check(false, "the polished drag file is available to edit and save")
+        return
+    }
+    defaults.removeObject(forKey: "polish.folder")
+    let handoffEditor = PolishWindow(url: polishedFile, image: polishedImage)
+    defer { handoffEditor.window.close() }
+    guard let saved = PolishRenderer.saveURL(for: polishedFile) else {
+        check(false, "a handoff original has a save location")
+        return
+    }
+    handoffEditor.model.save()
+    check(PolishRenderer.load(saved) != nil && app.model.db.clip(hash: "f:" + sha(saved.path))?.source == "Polished",
+          "Save writes the handoff original's edited copy and records it in history as Polished")
+    check(saved.deletingLastPathComponent().path == FolderWatcher.screenshotFolder.path,
+          "Save puts the handoff original's edited copy in the watched screenshot folder")
+
+    let fm = FileManager.default
+    let alias = folder.appendingPathComponent("drag alias.png")
+    try fm.createSymbolicLink(at: alias, withDestinationURL: polishedFile)
+    check(PolishRenderer.saveURL(for: alias)?.deletingLastPathComponent().path == folder.path,
+          "a symlink to a handoff original uses the watched screenshot folder")
+    let handoffAlias = folder.appendingPathComponent("handoff alias", isDirectory: true)
+    try fm.createSymbolicLink(at: handoffAlias, withDestinationURL: polishedFile.deletingLastPathComponent())
+    let custom = folder.appendingPathComponent("Polish exports", isDirectory: true)
+    defaults.set(custom.path, forKey: "polish.folder")
+    check(PolishRenderer.saveURL(for: polishedFile)?.deletingLastPathComponent().path == custom.path,
+          "a handoff original honors a custom destination outside the handoff root")
+    defaults.set(handoffAlias.appendingPathComponent("missing").path, forKey: "polish.folder")
+    check(PolishRenderer.saveURL(for: polishedFile)?.deletingLastPathComponent().path == folder.path,
+          "a custom destination below a symlink into a handoff uses the watched folder")
+    defaults.removeObject(forKey: "polish.folder")
+    let desktop = fm.homeDirectoryForCurrentUser.appendingPathComponent("Desktop", isDirectory: true)
+    for unavailable in [folder.appendingPathComponent("missing"), source, handoffAlias] {
+        defaults.set(unavailable.path, forKey: "screenshotFolder")
+        check(PolishRenderer.saveURL(for: polishedFile)?.deletingLastPathComponent().path == desktop.path,
+              "a missing, non-directory, or temporary screenshot location falls back to Desktop (\(unavailable.lastPathComponent))")
+    }
+    defaults.set(folder.path, forKey: "screenshotFolder")
+
+    app.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+    check(PolishRenderer.load(saved) != nil, "the editor's saved copy of a handoff original survives app quit")
+    check(!FileManager.default.fileExists(atPath: polishedFile.path), "app quit removes the polished drag file")
 }
 
 private func draggedFile(_ item: NSItemProvider) -> URL? {

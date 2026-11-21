@@ -138,12 +138,32 @@ private func editorExports(_ dir: URL) throws {
     }
     check(modes == [0o600, 0o600], "handoff files are created with mode 0600")
     if let first, let second {
-        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-3601)],
-                                              ofItemAtPath: first.deletingLastPathComponent().path)
-        check(model.exportFile() != nil && !FileManager.default.fileExists(atPath: first.path)
-              && FileManager.default.fileExists(atPath: second.path), "handoffs older than an hour are removed")
+        let fm = FileManager.default
+        let expired = first.deletingLastPathComponent(), launch = expired.deletingLastPathComponent()
+        let quitFolder = second.deletingLastPathComponent()
+        let foreignInExpired = expired.appendingPathComponent("personal polished.png")
+        let foreignInLaunch = launch.appendingPathComponent("personal.png")
+        let foreignDirectory = launch.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let foreignNested = foreignDirectory.appendingPathComponent("personal polished.png")
+        let bytes = Data([3, 1, 4])
+        defer { try? fm.removeItem(at: launch) }
+        try fm.createDirectory(at: foreignDirectory, withIntermediateDirectories: false)
+        for url in [foreignInExpired, foreignInLaunch, foreignNested] {
+            try bytes.write(to: url)
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        }
+        for url in [expired, foreignDirectory] {
+            try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-3601)], ofItemAtPath: url.path)
+        }
+        check(model.exportFile() != nil && !fm.fileExists(atPath: first.path)
+              && fm.fileExists(atPath: second.path), "expiry removes the old handoff and keeps a recent one")
+        check([foreignInExpired, foreignInLaunch, foreignNested].allSatisfy { (try? Data(contentsOf: $0)) == bytes },
+              "expiry preserves foreign files in the launch and handoff folders, including names that look generated")
         AppDelegate().applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
-        check(!FileManager.default.fileExists(atPath: second.path), "app quit removes the remaining handoffs")
+        check(!fm.fileExists(atPath: second.path) && !fm.fileExists(atPath: quitFolder.path),
+              "app quit removes the remaining handoff and its empty folder")
+        check([foreignInExpired, foreignInLaunch, foreignNested].allSatisfy { (try? Data(contentsOf: $0)) == bytes },
+              "app quit preserves the foreign files and their folders")
     }
 
     model.doc.crop = CGRect(x: 0, y: 0, width: 800, height: 320)
@@ -166,54 +186,107 @@ private func editorExports(_ dir: URL) throws {
     check(!closed, "Return keeps the editor open when Copy fails")
 }
 
+private func editorExitedHandoff() throws -> URL {
+    let process = Process(), output = Pipe()
+    process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+    process.arguments = ["--write-handoff"]
+    var env = ProcessInfo.processInfo.environment
+    env["CLIPBUBBLE_CHILD"] = "handoff"
+    env["CLIPBUBBLE_HOME"] = testHome.path
+    process.environment = env
+    process.standardOutput = output
+    try process.run()
+    guard editorUntil(5, { !process.isRunning }) else {
+        process.terminate()
+        throw CocoaError(.fileWriteUnknown)
+    }
+    let path = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .trimmingCharacters(in: .newlines)
+    guard process.terminationStatus == 0, path.hasPrefix("/") else { throw CocoaError(.fileWriteUnknown) }
+    return URL(fileURLWithPath: path)
+}
+
 func editorHandoffIsolation() throws {
     let fm = FileManager.default
     let root = PolishHandoffs.root
     let defaults = UserDefaults.standard
     let previous = defaults.object(forKey: "polish.folder")
     defer { defaults.set(previous, forKey: "polish.folder") }
-    func makeFolder(pid: pid_t? = nil, name: String = UUID().uuidString, age: TimeInterval) throws -> URL {
+    func makeFolder(pid: pid_t? = nil, name: String = UUID().uuidString,
+                    age: TimeInterval) throws -> (folder: URL, file: URL) {
         let name = (pid.map { "\($0)-" } ?? "") + name
         let folder = root.appendingPathComponent(name, isDirectory: true)
-        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
-        let file = folder.appendingPathComponent("handoff.png")
+        let handoff = pid == nil ? folder : folder.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fm.createDirectory(at: handoff, withIntermediateDirectories: true)
+        let file = handoff.appendingPathComponent("fixture polished.png")
         try Data([1]).write(to: file)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
         try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-age)], ofItemAtPath: folder.path)
-        return file
+        return (folder, file)
     }
+    let tracked = try editorExitedHandoff()
+    let trackedFolder = tracked.deletingLastPathComponent(), trackedLaunch = trackedFolder.deletingLastPathComponent()
+    let foreignInTracked = trackedFolder.appendingPathComponent("personal polished.png")
+    try Data([9]).write(to: foreignInTracked)
+    try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-3601)], ofItemAtPath: trackedLaunch.path)
+    defer { try? fm.removeItem(at: trackedLaunch) }
+
     let live = try makeFolder(pid: getpid(), age: 3601)
     let young = try makeFolder(pid: Int32.max, age: 0)
     let stale = try makeFolder(pid: Int32.max, age: 3601)
     let legacy = try makeFolder(age: 3601)
     let youngLegacy = try makeFolder(age: 0)
     let project = try makeFolder(name: "Project exports", age: 3601)
+    let link = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try fm.createSymbolicLink(at: link, withDestinationURL: project.folder)
+    defer { try? fm.removeItem(at: link) }
     let protected = try makeFolder(age: 3601)
-    let protectedFolder = protected.deletingLastPathComponent()
-    let saveFolder = protectedFolder.appendingPathComponent("Chosen save folder")
+    let foreignInLegacy = legacy.folder.appendingPathComponent("personal.png")
+    let foreignInStale = stale.folder.appendingPathComponent("personal.png")
+    for (folder, file) in [(legacy.folder, foreignInLegacy), (stale.folder, foreignInStale)] {
+        try Data([9]).write(to: file)
+        try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-3601)], ofItemAtPath: folder.path)
+    }
+    let saveFolder = protected.folder.appendingPathComponent("Chosen save folder")
     try fm.createDirectory(at: saveFolder, withIntermediateDirectories: false)
     let savedPNG = saveFolder.appendingPathComponent("project polished.png")
     try editorPNG(editorImage()).write(to: savedPNG)
-    try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-3601)], ofItemAtPath: protectedFolder.path)
+    try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-3601)], ofItemAtPath: protected.folder.path)
     defaults.set(saveFolder.path, forKey: "polish.folder")
     defer {
-        for file in [live, young, stale, legacy, youngLegacy, project, protected] {
-            try? fm.removeItem(at: file.deletingLastPathComponent())
+        for fixture in [live, young, stale, legacy, youngLegacy, project, protected] {
+            try? fm.removeItem(at: fixture.folder)
         }
     }
     let own = try PolishHandoffs.write(Data([2]), name: "mine.png")
-    check(fm.fileExists(atPath: live.path) && fm.fileExists(atPath: young.path) && !fm.fileExists(atPath: stale.path),
+    check(fm.fileExists(atPath: live.file.path) && fm.fileExists(atPath: young.file.path) && !fm.fileExists(atPath: stale.file.path),
           "handoff startup removes only expired files from dead processes")
-    check(!fm.fileExists(atPath: legacy.path) && fm.fileExists(atPath: youngLegacy.path),
-          "handoff startup removes only expired legacy folders")
-    check(fm.fileExists(atPath: project.path), "handoff cleanup keeps aged Project exports")
-    check(fm.fileExists(atPath: savedPNG.path), "handoff cleanup keeps an aged UUID folder containing the save location")
+    check(!fm.fileExists(atPath: legacy.file.path) && fm.fileExists(atPath: youngLegacy.file.path),
+          "handoff startup removes the generated PNG in an expired legacy UUID folder")
+    check(!fm.fileExists(atPath: tracked.path) && [foreignInTracked, foreignInLegacy, foreignInStale].allSatisfy {
+        (try? Data(contentsOf: $0)) == Data([9])
+    }, "startup expires the tracked handoff from a dead process and keeps foreign files in all launch layouts")
+    check(fm.fileExists(atPath: link.path) && fm.fileExists(atPath: project.file.path),
+          "handoff cleanup preserves aged Project exports and never follows a UUID folder symlink")
+    check(fm.fileExists(atPath: savedPNG.path) && fm.fileExists(atPath: protected.file.path),
+          "handoff cleanup keeps an aged UUID folder containing the save location")
     defaults.set(own.deletingLastPathComponent().path, forKey: "polish.folder")
     PolishHandoffs.clear()
     check(fm.fileExists(atPath: own.path), "handoff quit preserves the current save location")
     defaults.set(saveFolder.path, forKey: "polish.folder")
+    let replaced = try PolishHandoffs.write(Data([2]), name: "replaced polished.png")
+    let edited = try PolishHandoffs.write(Data([2]), name: "edited polished.png")
+    let replacedFolder = replaced.deletingLastPathComponent()
+    defer { try? fm.removeItem(at: replacedFolder.deletingLastPathComponent()) }
+    try Data([9]).write(to: replaced, options: .atomic)
+    let handle = try FileHandle(forWritingTo: edited)
+    try handle.write(contentsOf: Data([8, 9]))
+    try handle.close()
     PolishHandoffs.clear()
-    check(!fm.fileExists(atPath: own.path) && fm.fileExists(atPath: live.path) && fm.fileExists(atPath: young.path),
+    check(!fm.fileExists(atPath: own.path) && fm.fileExists(atPath: live.file.path) && fm.fileExists(atPath: young.file.path),
           "handoff quit clears only this launch's files")
+    check((try? Data(contentsOf: replaced)) == Data([9]), "handoff cleanup preserves a foreign replacement with the exact handoff name")
+    check((try? Data(contentsOf: edited)) == Data([8, 9]), "handoff cleanup preserves a file edited in place after export")
 }
 
 private func editorCropBadgeChecks(_ dir: URL) throws {

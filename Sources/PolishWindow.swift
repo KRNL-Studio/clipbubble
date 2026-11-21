@@ -334,7 +334,10 @@ final class PolishModel: ObservableObject {
 
     func save() {
         exportWhenReady { model, data in
-            let url = PolishRenderer.saveURL(for: model.doc.source)
+            guard let url = PolishRenderer.saveURL(for: model.doc.source) else {
+                model.say("Couldn't find a folder for the saved copy", "exclamationmark.triangle")
+                return
+            }
             do {
                 try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try data.write(to: url, options: .withoutOverwriting)
@@ -457,33 +460,150 @@ final class PolishModel: ObservableObject {
 enum PolishHandoffs {
     private static let lifetime: TimeInterval = 3600
     private static let permissions: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
+    private static let lock = NSLock()
+    private static let ownershipKey = "studio.krnl.clipbubble.polish-handoff"
     static let root: URL = {
         // A second instance with its own data folder also has its own handoffs.
         let suffix = ProcessInfo.processInfo.environment["CLIPBUBBLE_HOME"].map { "-" + sha($0) } ?? ""
         return FileManager.default.temporaryDirectory.appendingPathComponent("ClipBubble Polish" + suffix, isDirectory: true)
     }()
     private static let launch = root.appendingPathComponent("\(getpid())-\(UUID())", isDirectory: true)
-    private static let startup: Void? = try? sweep(root, matching: canRemoveLaunch)
+    private static let startup: Void = {
+        guard isDirectory(root) else { return }
+        for folder in expiredDirectories(in: root) where canRemoveLaunch(folder.lastPathComponent) {
+            if UUID(uuidString: folder.lastPathComponent) != nil {
+                removeLegacyHandoff(folder)
+            } else {
+                removeLaunch(folder, allowLegacy: true)
+            }
+        }
+    }()
 
     static func prepare() { _ = startup }
 
-    static func clear() { remove(launch) }
+    static func clear() {
+        lock.withLock { removeLaunch(launch) }
+    }
 
-    private static func remove(_ folder: URL) {
-        // Never follow a redirect out of the handoff root or launch folder.
-        guard ![root, folder.deletingLastPathComponent()].contains(where: {
-            (try? $0.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true
-        }) else { return }
-        if let destination = PolishRenderer.saveFolder {
-            func contains(_ parent: URL, _ child: URL) -> Bool {
-                child.standardizedFileURL.pathComponents.starts(with: parent.standardizedFileURL.pathComponents) {
-                    $0.caseInsensitiveCompare($1) == .orderedSame
-                }
+    static func contains(_ child: URL, in parent: URL = root) -> Bool {
+        func hasPrefix(_ child: URL, _ parent: URL) -> Bool {
+            child.standardizedFileURL.pathComponents.starts(with: parent.standardizedFileURL.pathComponents) {
+                $0.caseInsensitiveCompare($1) == .orderedSame
             }
-            if contains(folder, destination) ||
-                contains(folder.resolvingSymlinksInPath(), destination.resolvingSymlinksInPath()) { return }
         }
-        try? FileManager.default.removeItem(at: folder)
+        return hasPrefix(child, parent) || hasPrefix(resolvingSymlinks(child), resolvingSymlinks(parent))
+    }
+
+    // Foundation resolves only existing paths. A save can create a missing directory below a symlink.
+    private static func resolvingSymlinks(_ url: URL) -> URL {
+        var ancestor = url
+        var missing: [String] = []
+        while !FileManager.default.fileExists(atPath: ancestor.path) {
+            let parent = ancestor.deletingLastPathComponent()
+            guard parent.path != ancestor.path else { return url }
+            missing.append(ancestor.lastPathComponent)
+            ancestor = parent
+        }
+        return missing.reversed().reduce(ancestor.resolvingSymlinksInPath()) { $0.appendingPathComponent($1) }
+    }
+
+    private static func canClean(_ folder: URL) -> Bool {
+        // lstat checks the directories themselves, so cleanup never follows a handoff symlink.
+        guard isDirectory(root), isDirectory(folder.deletingLastPathComponent()), isDirectory(folder) else { return false }
+        return PolishRenderer.saveFolder.map { !contains($0, in: folder) } ?? true
+    }
+
+    private static func removeLaunch(_ folder: URL, allowLegacy: Bool = false) {
+        guard canClean(folder) else { return }
+        let owned = owns(folder, type: S_IFDIR)
+        guard owned || allowLegacy else { return }
+        var removedLegacy = false
+        for entry in entries(in: folder) {
+            if owned {
+                removeHandoff(entry)
+            } else if UUID(uuidString: entry.lastPathComponent) != nil, removeLegacyHandoff(entry) {
+                removedLegacy = true
+            }
+        }
+        if owned || removedLegacy { _ = rmdir(folder.path) }
+    }
+
+    private static func removeHandoff(_ folder: URL) {
+        guard canClean(folder), owns(folder, type: S_IFDIR) else { return }
+        for file in entries(in: folder) where owns(file, type: S_IFREG) { _ = unlink(file.path) }
+        _ = rmdir(folder.path)
+    }
+
+    /// Older releases created one private PNG per UUID folder, with no ownership record.
+    @discardableResult private static func removeLegacyHandoff(_ folder: URL) -> Bool {
+        guard canClean(folder) else { return false }
+        let generated = entries(in: folder).filter { file in
+            guard file.lastPathComponent.hasSuffix(" polished.png"), let info = entryInfo(file) else { return false }
+            return info.st_mode & S_IFMT == S_IFREG && info.st_mode & 0o777 == 0o600
+        }
+        guard generated.count == 1, unlink(generated[0].path) == 0 else { return false }
+        _ = rmdir(folder.path)
+        return true
+    }
+
+    private static func entryInfo(_ url: URL) -> stat? {
+        var info = stat()
+        return lstat(url.path, &info) == 0 ? info : nil
+    }
+
+    private static func isDirectory(_ url: URL) -> Bool {
+        guard let info = entryInfo(url) else { return false }
+        return info.st_mode & S_IFMT == S_IFDIR
+    }
+
+    // The extended attribute survives a crash. Check the entry's identity and the file's last written state.
+    private static func ownership(of url: URL, info: stat) -> Data {
+        let name = (url.deletingLastPathComponent().lastPathComponent + "/" + url.lastPathComponent)
+            .precomposedStringWithCanonicalMapping
+        var value = "\(info.st_ino):\(name)"
+        if info.st_mode & S_IFMT == S_IFREG {
+            let birth = info.st_birthtimespec
+            let modified = info.st_mtimespec
+            value += ":\(birth.tv_sec):\(birth.tv_nsec):\(modified.tv_sec):\(modified.tv_nsec):\(info.st_size)"
+        }
+        return Data(value.utf8)
+    }
+
+    private static func owns(_ url: URL, type: mode_t) -> Bool {
+        guard let info = entryInfo(url), info.st_mode & S_IFMT == type else { return false }
+        let expected = ownership(of: url, info: info)
+        var value = Data(count: expected.count)
+        let count = value.withUnsafeMutableBytes {
+            getxattr(url.path, ownershipKey, $0.baseAddress, $0.count, 0, XATTR_NOFOLLOW)
+        }
+        return count == expected.count && value == expected
+    }
+
+    private static func markOwned(_ url: URL, fd: Int32) throws {
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { throw posixError() }
+        let value = ownership(of: url, info: info)
+        let result = value.withUnsafeBytes {
+            fsetxattr(fd, ownershipKey, $0.baseAddress, $0.count, 0, XATTR_CREATE)
+        }
+        guard result == 0 else { throw posixError() }
+    }
+
+    private static func posixError() -> POSIXError {
+        POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+
+    private static func createOwnedFolder(_ folder: URL) throws {
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false, attributes: permissions)
+        do {
+            let fd = open(folder.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+            guard fd >= 0 else { throw posixError() }
+            defer { close(fd) }
+            try markOwned(folder, fd: fd)
+        } catch {
+            _ = rmdir(folder.path)
+            throw error
+        }
     }
 
     private static func canRemoveLaunch(_ name: String) -> Bool {
@@ -494,39 +614,54 @@ enum PolishHandoffs {
         return kill(pid, 0) == -1 && errno == ESRCH
     }
 
-    private static func sweep(_ folder: URL, matching: (String) -> Bool) throws {
-        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey]
-        let entries = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: Array(keys))
+    private static func entries(in folder: URL, keys: [URLResourceKey] = []) -> [URL] {
+        (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: keys)) ?? []
+    }
+
+    private static func expiredDirectories(in folder: URL) -> [URL] {
+        let key: URLResourceKey = .contentModificationDateKey
         let stale = Date().addingTimeInterval(-lifetime)
-        for entry in entries {
-            guard let values = try? entry.resourceValues(forKeys: keys), values.isDirectory == true,
-                  values.isSymbolicLink == false, let date = values.contentModificationDate, date < stale,
-                  matching(entry.lastPathComponent) else { continue }
-            remove(entry)
+        return entries(in: folder, keys: [key]).filter { entry in
+            guard isDirectory(entry), let date = try? entry.resourceValues(forKeys: [key]).contentModificationDate else { return false }
+            return date < stale
         }
     }
 
     static func write(_ data: Data, name: String) throws -> URL {
-        prepare()
-        let fm = FileManager.default
-        try fm.createDirectory(at: launch, withIntermediateDirectories: true, attributes: permissions)
-        try sweep(launch) { UUID(uuidString: $0) != nil }
-
-        let folder = launch.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try fm.createDirectory(at: folder, withIntermediateDirectories: false, attributes: permissions)
-        let url = folder.appendingPathComponent(name)
-        do {
-            let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
-            guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-            let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-            try file.write(contentsOf: data)
-            try file.close()
-        } catch {
-            remove(folder)
-            throw error
+        guard !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.contains("\0") else {
+            throw POSIXError(.EINVAL)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + lifetime) { remove(folder) }
-        return url
+        prepare()
+        return try lock.withLock {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: permissions)
+            guard isDirectory(root) else { throw POSIXError(.ENOTDIR) }
+            if !owns(launch, type: S_IFDIR) { try createOwnedFolder(launch) }
+            for folder in expiredDirectories(in: launch) { removeHandoff(folder) }
+
+            let folder = launch.appendingPathComponent("handoff-\(UUID())", isDirectory: true)
+            try createOwnedFolder(folder)
+            let url = folder.appendingPathComponent(name)
+            do {
+                let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+                guard fd >= 0 else { throw posixError() }
+                let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+                do {
+                    try file.write(contentsOf: data)
+                    try markOwned(url, fd: fd)
+                    try file.close()
+                } catch {
+                    _ = unlink(url.path)
+                    throw error
+                }
+            } catch {
+                _ = rmdir(folder.path)
+                throw error
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + lifetime) {
+                lock.withLock { removeHandoff(folder) }
+            }
+            return url
+        }
     }
 }
 

@@ -1001,8 +1001,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func polish(_ c: Clip) {
         guard let path = c.polishPath else { return }
         let source = URL(fileURLWithPath: path)
-        guard oneShot.start(source, putOnClipboard: putPolishedOnClipboard, done: { [weak self] thumbnail in
+        guard oneShot.start(source, putOnClipboard: putPolishedOnClipboard, done: { [weak self] output in
             guard let self else { return }
+            let thumbnail = output?.thumbnail
             self.model.polishActivity = (c.id, thumbnail == nil ? .failed : .copied)
             self.model.polishToast = (source, thumbnail)
             self.polishRowReset = .onMain(after: 1.5) { [weak self] in self?.model.polishActivity = nil }

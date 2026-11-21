@@ -22,12 +22,17 @@ enum OneShotStatus: Equatable {
 
 /// A single export shared by the panel, History and the screenshot card. Call from the main thread.
 final class OneShot {
+    struct Output {
+        let png: Data
+        let thumbnail: NSImage
+    }
+
     private static let queue = DispatchQueue(label: "clipbubble.oneshot", qos: .userInitiated)
     private var inFlight = false
 
     @discardableResult
     func start(_ url: URL, putOnClipboard: @escaping (Data) -> Bool,
-               done: @escaping (NSImage?) -> Void) -> Bool {
+               done: @escaping (Output?) -> Void) -> Bool {
         guard !inFlight else { return false }
         inFlight = true
         let startingStyle = PolishPreset.last
@@ -39,7 +44,7 @@ final class OneShot {
                 guard let self else { return }
                 defer { self.inFlight = false }
                 guard let (png, preview) = result, putOnClipboard(png) else { done(nil); return }
-                done(NSImage(cgImage: preview, size: .zero))
+                done(Output(png: png, thumbnail: NSImage(cgImage: preview, size: .zero)))
             }
         }
         return true

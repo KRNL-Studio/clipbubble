@@ -456,7 +456,9 @@ struct HistoryPage: View {
             }
             if let c = browser.selected {
                 Divider()
-                HistoryInspector(clip: c, model: model, browser: browser)
+                HistoryInspector(clip: c, device: model.devices[c.origin], linked: model.linked,
+                                 copyFeedback: browser.copyFeedback, polishStatus: model.polishStatus(for: c),
+                                 model: model, browser: browser)
                     .frame(width: 280)
                     .transition(.move(edge: .trailing).combined(with: .opacity))
             }
@@ -518,7 +520,10 @@ struct HistoryPage: View {
                             .onTapGesture(count: 2) { model.pick(c, false) }
                             .simultaneousGesture(TapGesture().onEnded { browser.selection = c.id })
                             .onDrag { dragItem(c) }
-                            .contextMenu { HistoryActions(clip: c, model: model, browser: browser) }
+                            .contextMenu {
+                                HistoryActions(clip: c, device: model.devices[c.origin], linked: model.linked,
+                                               model: model, browser: browser)
+                            }
                             .onAppear { browser.loadMore(after: c.id) }
                     }
                 }
@@ -605,12 +610,14 @@ struct HistoryCard: View {
 /// Copy, open, send and delete, the same for a card's menu and the inspector.
 struct HistoryActions: View {
     let clip: Clip
+    let device: String?
+    let linked: [Hello]
     let model: Model
     let browser: HistoryBrowser
 
     var body: some View {
         if clip.remote {
-            Button("Get from \(model.devices[clip.origin] ?? "other device")") { SyncEngine.shared.get(clip.hash) }
+            Button("Get from \(device ?? "other device")") { SyncEngine.shared.get(clip.hash) }
         } else {
             Button("Copy") { model.pick(clip, false) }
             if clip.polishPath != nil {
@@ -621,9 +628,9 @@ struct HistoryActions: View {
                 Button("Open") { NSWorkspace.shared.open(URL(fileURLWithPath: p)) }
                 Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p)]) }
             }
-            if clip.kind != "text", !model.linked.isEmpty {
+            if clip.kind != "text", !linked.isEmpty {
                 Menu("Send to") {
-                    ForEach(model.linked, id: \.device) { h in Button(h.name) { SyncEngine.shared.send(clip.hash, toDevice: h.device) } }
+                    ForEach(linked, id: \.device) { h in Button(h.name) { SyncEngine.shared.send(clip.hash, toDevice: h.device) } }
                 }
             }
         }
@@ -634,7 +641,11 @@ struct HistoryActions: View {
 
 struct HistoryInspector: View {
     let clip: Clip
-    @ObservedObject var model: Model
+    let device: String?
+    let linked: [Hello]
+    let copyFeedback: Bool?
+    let polishStatus: OneShotStatus?
+    let model: Model
     let browser: HistoryBrowser
 
     var body: some View {
@@ -650,7 +661,7 @@ struct HistoryInspector: View {
                 .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.05)))
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             VStack(alignment: .leading, spacing: 6) {
-                fact("From", [model.devices[clip.origin], clip.source].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
+                fact("From", [device, clip.source].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
                 fact("Copied", clip.created.formatted(date: .abbreviated, time: .shortened))
                 if let s = size { fact("Size", s) }
                 if let p = clip.imagePath ?? clip.paths.first { fact("Where", (p as NSString).abbreviatingWithTildeInPath) }
@@ -662,18 +673,16 @@ struct HistoryInspector: View {
                         .controlSize(.large).buttonStyle(.borderedProminent)
                 } else {
                     Button { browser.copySelected() } label: {
-                        let feedback = browser.copyFeedback
-                        Label(feedback.map { $0 ? "Copied" : "Couldn't copy" } ?? "Copy",
-                              systemImage: feedback.map { $0 ? "checkmark" : "exclamationmark.circle" } ?? "doc.on.doc").frame(maxWidth: .infinity)
+                        Label(copyFeedback.map { $0 ? "Copied" : "Couldn't copy" } ?? "Copy",
+                              systemImage: copyFeedback.map { $0 ? "checkmark" : "exclamationmark.circle" } ?? "doc.on.doc").frame(maxWidth: .infinity)
                     }
                     .controlSize(.large).buttonStyle(.borderedProminent)
                     if clip.polishPath != nil {
-                        let status = model.polishStatus(for: clip)
                         Button { model.polish(clip) } label: {
-                            if status == .rendering { ProgressView().controlSize(.small).frame(width: 52) }
+                            if polishStatus == .rendering { ProgressView().controlSize(.small).frame(width: 52) }
                             else {
-                                Label(status == .copied ? "Copied" : status == .failed ? "Failed" : "Polish",
-                                      systemImage: status?.symbol ?? "sparkles")
+                                Label(polishStatus == .copied ? "Copied" : polishStatus == .failed ? "Failed" : "Polish",
+                                      systemImage: polishStatus?.symbol ?? "sparkles")
                             }
                         }
                         .controlSize(.large).keyboardShortcut("e", modifiers: .command)
@@ -682,7 +691,7 @@ struct HistoryInspector: View {
                     }
                 }
                 Menu {
-                    HistoryActions(clip: clip, model: model, browser: browser)
+                    HistoryActions(clip: clip, device: device, linked: linked, model: model, browser: browser)
                 } label: { Image(systemName: "ellipsis") }
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                     .controlSize(.large)

@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 
 func oneShotTests() {
     do { try checkOneShot() }
@@ -47,6 +48,7 @@ private func checkOneShot() throws {
     let editorBoard = NSPasteboard(name: .init("polish-one-shot-editor-" + UUID().uuidString))
     defer {
         app.shotCard.hide(animated: false)
+        PolishHandoffs.clear()
         windows.forEach { $0.orderOut(nil) }
         board.releaseGlobally()
         editorBoard.releaseGlobally()
@@ -118,16 +120,37 @@ private func checkOneShot() throws {
     check(PolishPreset.last.isPlain, "the starting style can be set to None")
     app.screenshotAdded(source, at: Date())
     check(app.shotCard.isVisible, "a new screenshot still shows its card")
+    check(draggedFile(app.shotCard.state.dragItem()) == source, "the card drags the original file before polishing")
+    check(app.shotCard.state.copyLabel == "Copy", "the card labels its Copy button before polishing")
     app.shotCard.state.polish()
     app.shotCard.state.polish()
     check(app.shotCard.state.polishStatus == .rendering, "the card shows its render state")
+    app.shotCard.state.copyFeedback = .copied
     check(waitForOneShot { app.shotCard.state.polishStatus == .copied }, "the card confirms the copy")
     check(writes == 2, "the card ignores repeat clicks")
     check(matchesGradient(board.data(forType: .png), gradient), "the card uses Gradient for a plain style")
     check(app.shotCard.isVisible && app.shotCard.state.url == source && app.shotCard.state.polishedThumbnail != nil,
           "the card keeps the original URL and displays the polished thumbnail")
     check(Set(NSApp.windows.map(ObjectIdentifier.init)) == before, "the card's Polish action opens no window")
+    check(app.shotCard.state.copyLabel == "Copy original", "the card distinguishes Copy original after polishing")
+    let polishedItem = app.shotCard.state.dragItem()
+    let polishedPNG = board.data(forType: .png)
+
+    let copyPolished = app.putPolishedOnClipboard
+    app.putPolishedOnClipboard = { _ in false }
+    app.shotCard.state.polish()
+    check(waitForOneShot { app.shotCard.state.polishStatus == .failed }, "the card reports a failed retry")
+    check(draggedFile(app.shotCard.state.dragItem()) == source, "the card drags the original file after polishing fails")
+    check(app.shotCard.state.polishedThumbnail == nil && app.shotCard.state.copyLabel == "Copy",
+          "a failed retry restores the original thumbnail and Copy label")
     app.shotCard.hide(animated: false)
+    app.putPolishedOnClipboard = copyPolished
+
+    let polishedFile = draggedFile(polishedItem)
+    check(polishedItem.hasItemConformingToTypeIdentifier(UTType.png.identifier) &&
+          polishedFile != source && polishedFile?.pathExtension == "png" &&
+          polishedFile.flatMap { try? Data(contentsOf: $0) } == polishedPNG,
+          "the successful drag provides the full polished PNG and its file URL after the card closes")
 
     defaults.removeObject(forKey: "polish.last")
     app.model.polish(clip)
@@ -136,6 +159,19 @@ private func checkOneShot() throws {
     let files = try FileManager.default.contentsOfDirectory(atPath: folder.path)
     check(files == [source.lastPathComponent],
           "one-shot leaves the screenshot and editor output folders untouched")
+}
+
+private func draggedFile(_ item: NSItemProvider) -> URL? {
+    var url: URL?
+    var finished = false
+    _ = item.loadObject(ofClass: NSURL.self) { object, _ in
+        DispatchQueue.main.async {
+            url = object as? URL
+            finished = true
+        }
+    }
+    _ = waitForOneShot { finished }
+    return url
 }
 
 private func matchesGradient(_ actual: Data?, _ expected: Data?) -> Bool {

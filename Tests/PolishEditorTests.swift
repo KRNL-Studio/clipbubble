@@ -166,7 +166,7 @@ private func editorExports(_ dir: URL) throws {
     check(!closed, "Return keeps the editor open when Copy fails")
 }
 
-private func editorHandoffIsolation() throws {
+func editorHandoffIsolation() throws {
     let fm = FileManager.default
     let root = PolishHandoffs.root
     let defaults = UserDefaults.standard
@@ -854,7 +854,6 @@ func polishEditorTests() {
     defer { defaults.set(last, forKey: "polish.last"); PolishHandoffs.clear() }
     do {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try editorHandoffIsolation()
         try editorExports(dir)
         try editorCropBadgeChecks(dir)
         MainActor.assumeIsolated { inspectorHintChecks() }

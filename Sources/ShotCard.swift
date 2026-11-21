@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 // The card that slides out beside the bubble when you take a screenshot: drag it, polish it, or copy it.
 // It leaves on its own after a few seconds, but never while the pointer is on it.
@@ -10,7 +11,8 @@ final class ShotCardState: ObservableObject {
     @Published var url: URL?
     @Published var copyFeedback: CopyFeedback?
     @Published var polishStatus: OneShotStatus?
-    @Published var polishedThumbnail: NSImage?
+    @Published var polished: OneShot.Output?
+    var polishedThumbnail: NSImage? { polished?.thumbnail }
     var polishLabel: String {
         switch polishStatus {
         case .copied: return "Copied"
@@ -22,7 +24,7 @@ final class ShotCardState: ObservableObject {
         switch copyFeedback {
         case .copied: return "Copied"
         case .failed: return "Copy failed"
-        case nil: return "Copy"
+        case nil: return polished == nil ? "Copy" : "Copy original"
         }
     }
     var copyIcon: String {
@@ -32,6 +34,18 @@ final class ShotCardState: ObservableObject {
         case nil: return "doc.on.doc"
         }
     }
+
+    func dragItem() -> NSItemProvider {
+        guard let url else { return NSItemProvider() }
+        guard let polished else { return NSItemProvider(contentsOf: url) ?? NSItemProvider() }
+        let name = url.deletingPathExtension().lastPathComponent + " polished.png"
+        if let file = try? PolishHandoffs.write(polished.png, name: name),
+           let provider = NSItemProvider(contentsOf: file) {
+            return provider
+        }
+        return NSItemProvider(item: polished.png as NSData, typeIdentifier: UTType.png.identifier)
+    }
+
     var polish: () -> Void = {}
     var edit: () -> Void = {}
     var copy: () -> Void = {}
@@ -49,7 +63,7 @@ final class ShotCard {
     private var presentation = UUID()
     private var hovering = false
 
-    var onPolish: (URL, @escaping (NSImage?) -> Void) -> Bool = { _, _ in false }
+    var onPolish: (URL, @escaping (OneShot.Output?) -> Void) -> Bool = { _, _ in false }
     var onEdit: (URL) -> Void = { _ in }
     var onCopy: (URL) -> Bool = { _ in false }
     var onHidden: () -> Void = {}
@@ -92,16 +106,17 @@ final class ShotCard {
     private func polish() {
         guard let url = state.url else { return }
         let presentation = self.presentation
-        guard onPolish(url, { [weak self] thumbnail in
+        guard onPolish(url, { [weak self] output in
             guard let self, self.presentation == presentation else { return }
-            self.state.polishStatus = thumbnail == nil ? .failed : .copied
-            if let thumbnail { self.state.polishedThumbnail = thumbnail }
+            if output != nil {
+                self.copyFeedbackWork?.cancel()
+                self.state.copyFeedback = nil
+            }
+            self.state.polished = output
+            self.state.polishStatus = output == nil ? .failed : .copied
             self.schedule(after: 6)
-            if thumbnail == nil {
-                self.polishFeedbackWork = .onMain(after: 1.5) { [weak self] in
-                    guard let self else { return }
-                    self.state.polishStatus = self.state.polishedThumbnail == nil ? nil : .copied
-                }
+            if output == nil {
+                self.polishFeedbackWork = .onMain(after: 1.5) { [weak self] in self?.state.polishStatus = nil }
             }
         }) else { return }
         polishFeedbackWork?.cancel()
@@ -119,7 +134,7 @@ final class ShotCard {
         polishFeedbackWork?.cancel()
         state.copyFeedback = nil
         state.polishStatus = nil
-        state.polishedThumbnail = nil
+        state.polished = nil
         let s = ShotCard.size
         let right = b.midX > area.midX, top = b.midY > area.midY
         var x = right ? b.minX - s.width - 6 : b.maxX + 6
@@ -166,7 +181,7 @@ final class ShotCard {
         presentation = UUID()
         state.url = nil
         state.polishStatus = nil
-        state.polishedThumbnail = nil
+        state.polished = nil
         hovering = false
         onHidden()
     }
@@ -200,7 +215,7 @@ private struct ShotCardView: View {
                         .padding(6)
                         .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.white.opacity(0.05)))
                         .overlay(alignment: .bottomLeading) {
-                            Label(state.polishedThumbnail == nil ? "Drag me" : "Drag original", systemImage: "hand.draw")
+                            Label("Drag", systemImage: "hand.draw")
                                 .font(.system(size: 10, weight: .medium))
                                 .padding(.horizontal, 7).padding(.vertical, 3)
                                 .background(.black.opacity(0.55), in: Capsule())
@@ -210,8 +225,8 @@ private struct ShotCardView: View {
                         .scaleEffect(hoverThumb ? 1.015 : 1)
                         .animation(.spring(response: 0.25, dampingFraction: 0.8), value: hoverThumb)
                         .onHover { hoverThumb = $0 }
-                        .onDrag { NSItemProvider(contentsOf: url) ?? NSItemProvider() }
-                        .help(state.polishedThumbnail == nil ? "Drag it anywhere" : "Drag the original screenshot")
+                        .onDrag { state.dragItem() }
+                        .help("Drag")
                 }
                 Button(action: state.close) {
                     Image(systemName: "xmark")
@@ -258,7 +273,7 @@ private struct ShotCardView: View {
                 Button(action: state.copy) {
                     Label(state.copyLabel, systemImage: state.copyIcon)
                         .font(.system(size: 12.5, weight: .medium))
-                        .frame(width: 92, height: 30)
+                        .frame(width: state.polished == nil ? 92 : 108, height: 30)
                         .background(Color.primary.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                         .foregroundStyle(.primary)
                         .contentTransition(.symbolEffect(.replace))

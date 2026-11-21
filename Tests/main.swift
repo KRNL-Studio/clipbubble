@@ -35,6 +35,9 @@ peerTests()
 updaterTests()
 syncBadgeTests()
 shortcutTests()
+// Exercise the startup sweep before any drag creates a handoff.
+do { try editorHandoffIsolation() }
+catch { check(false, "handoff fixtures: \(error)") }
 oneShotTests()
 bubbleTests()
 polishTests()

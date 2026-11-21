@@ -180,15 +180,29 @@ private func checkOneShot() throws {
     defaults.removeObject(forKey: "polish.folder")
     let handoffEditor = PolishWindow(url: polishedFile, image: polishedImage)
     defer { handoffEditor.window.close() }
-    guard let saved = PolishRenderer.saveURL(for: polishedFile) else {
+    guard let destination = PolishRenderer.saveURL(for: polishedFile), let path = realpath(folder.path, nil) else {
         check(false, "a handoff original has a save location")
         return
     }
+    defer { free(path) }
+    let resolvedFolder = URL(fileURLWithPath: String(cString: path), isDirectory: true)
+    let saved = resolvedFolder.appendingPathComponent(destination.lastPathComponent)
     handoffEditor.model.save()
     check(PolishRenderer.load(saved) != nil && app.model.db.clip(hash: "f:" + sha(saved.path))?.source == "Polished",
           "Save writes the handoff original's edited copy and records it in history as Polished")
-    check(saved.deletingLastPathComponent().path == FolderWatcher.screenshotFolder.path,
+    check(destination.deletingLastPathComponent().path == FolderWatcher.screenshotFolder.path,
           "Save puts the handoff original's edited copy in the watched screenshot folder")
+
+    let saveAlias = folder.appendingPathComponent("save alias")
+    try fm.createSymbolicLink(at: saveAlias, withDestinationURL: folder)
+    defaults.set(saveAlias.path, forKey: "polish.folder")
+    handoffEditor.model.save()
+    defaults.removeObject(forKey: "polish.folder")
+    let linkedSave = resolvedFolder.appendingPathComponent(PolishRenderer.polishedFilename(base: handoffEditor.model.name, copy: 2))
+    check(PolishRenderer.load(linkedSave) != nil
+          && app.model.db.clip(hash: "f:" + sha(linkedSave.path))?.text == linkedSave.path
+          && handoffEditor.model.toast?.text == "Saved as “\(linkedSave.lastPathComponent)”",
+          "Save records the resolved path in history for a symlink destination")
 
     let otherRoot = fm.temporaryDirectory.appendingPathComponent("ClipBubble Polish-" + UUID().uuidString, isDirectory: true)
     try fm.createDirectory(at: otherRoot, withIntermediateDirectories: false)
@@ -242,6 +256,29 @@ private func checkOneShot() throws {
     }
     check(refreshed != polishedFile && (try? Data(contentsOf: refreshed)) == polishedPNG && draggedFile(secondItem) == refreshed,
           "two providers share a fresh handoff after their cached file expires")
+
+    try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-50 * 60)], ofItemAtPath: refreshed.path)
+    let replacement = draggedFile(polishedItem)
+    check(fm.fileExists(atPath: refreshed.path) && replacement != nil && replacement != refreshed
+          && replacement.flatMap { try? Data(contentsOf: $0) } == polishedPNG,
+          "a drag replaces a 50-minute-old handoff that still exists")
+
+    let state = ShotCardState()
+    state.url = source
+    state.polished = output
+    let launch = refreshed.deletingLastPathComponent().deletingLastPathComponent()
+    let backup = launch.appendingPathExtension("backup")
+    let failed: Bool
+    do {
+        try fm.moveItem(at: launch, to: backup)
+        defer { try? fm.moveItem(at: backup, to: launch) }
+        try Data().write(to: launch, options: .withoutOverwriting)
+        defer { try? fm.removeItem(at: launch) }
+        failed = draggedFile(state.dragItem()) == nil
+    }
+    let retried = draggedFile(state.dragItem())
+    check(failed && retried != nil && retried.flatMap { try? Data(contentsOf: $0) } == polishedPNG,
+          "a new drag retries after a temporary handoff write failure")
 }
 
 private func checkLongPolishedNames(source: URL, image: CGImage, output: OneShot.Output?) throws {

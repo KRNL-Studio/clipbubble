@@ -351,9 +351,10 @@ final class PolishModel: ObservableObject {
                     model.say("Couldn't find a folder for the saved copy", "exclamationmark.triangle")
                     return
                 }
-                try data.write(to: resolvedParent.appendingPathComponent(url.lastPathComponent), options: .withoutOverwriting)
-                model.onSaved(url)
-                model.say("Saved as “\(url.lastPathComponent)”", "square.and.arrow.down")
+                let resolvedURL = resolvedParent.appendingPathComponent(url.lastPathComponent)
+                try data.write(to: resolvedURL, options: .withoutOverwriting)
+                model.onSaved(resolvedURL)
+                model.say("Saved as “\(resolvedURL.lastPathComponent)”", "square.and.arrow.down")
             } catch {
                 model.say("Couldn't save: \(error.localizedDescription)", "exclamationmark.triangle")
             }

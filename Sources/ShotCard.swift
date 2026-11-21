@@ -67,18 +67,24 @@ final class ShotCardState: ObservableObject {
     /// Providers keep their cache even after the card closes or shows a new screenshot.
     private final class PolishedDragFile: @unchecked Sendable {
         private static let queue = DispatchQueue(label: "clipbubble.polish-drag", qos: .userInitiated)
-        private var result: Result<URL, Error>?
+        private var result: URL?
 
         func load(_ png: Data, name: String, completion: @escaping @Sendable (URL?, Error?) -> Void) {
             Self.queue.async {
-                if case .success(let url) = self.result, !FileManager.default.fileExists(atPath: url.path) {
-                    self.result = nil
+                let fm = FileManager.default
+                if let url = self.result, fm.fileExists(atPath: url.path),
+                   let written = (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
+                   Date().timeIntervalSince(written) < 50 * 60 {
+                    completion(url, nil)
+                    return
                 }
-                let result = self.result ?? Result { try PolishHandoffs.write(png, name: name) }
-                self.result = result
-                switch result {
-                case .success(let url): completion(url, nil)
-                case .failure(let error): completion(nil, error)
+                self.result = nil
+                do {
+                    let url = try PolishHandoffs.write(png, name: name)
+                    self.result = url
+                    completion(url, nil)
+                } catch {
+                    completion(nil, error)
                 }
             }
         }

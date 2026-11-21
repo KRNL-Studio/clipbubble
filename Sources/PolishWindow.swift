@@ -1,8 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
-import ImageIO
 import SwiftUI
-import UniformTypeIdentifiers
 
 // The Polish editor window: a toolbar of tools across the top, the canvas, an inspector on the right,
 // and presets plus the ways out (drag, share, save, copy) along the bottom.
@@ -303,18 +301,14 @@ final class PolishModel: ObservableObject {
     // MARK: Out
 
     var exportScale: CGFloat {
-        doc.style.size.pixels != nil || !UserDefaults.standard.bool(forKey: "polish.export1x") ? 1 : 0.5
+        PolishRenderer.exportScale(for: doc.style, retina: !UserDefaults.standard.bool(forKey: "polish.export1x"))
     }
 
     private func png() -> Data? {
         guard !findingRedactions else { return nil }
         if tool == .crop { tool = .select }
         PolishPreset.last = doc.style
-        guard let image = PolishRenderer.render(doc, source: source, scale: exportScale, marks: true) else { return nil }
-        let data = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil) else { return nil }
-        CGImageDestinationAddImage(destination, image, nil)
-        return CGImageDestinationFinalize(destination) ? data as Data : nil
+        return PolishRenderer.render(doc, source: source, scale: exportScale).flatMap(PolishRenderer.png)
     }
 
     private func exportWhenReady(_ action: @escaping (PolishModel, Data) -> Void) {
@@ -555,8 +549,7 @@ enum PolishHandoffs {
 extension Clip {
     /// The image Polish can open: a copied image or an image file, here on this Mac.
     var polishPath: String? {
-        guard !remote, let p = imagePath, FileManager.default.fileExists(atPath: p) else { return nil }
-        return p
+        remote ? nil : imagePath
     }
 }
 
@@ -589,7 +582,7 @@ final class PolishWindow: NSObject, NSWindowDelegate {
 
     init(url: URL, image: CGImage) {
         model = PolishModel(url: url, image: image)
-        window = EditorWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 720),
+        window = EditorWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                               backing: .buffered, defer: false)
         super.init()
@@ -599,28 +592,23 @@ final class PolishWindow: NSObject, NSWindowDelegate {
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 860, height: 560)
         window.delegate = self
         window.contentView = NSHostingView(rootView: Optional(PolishView(model: model, canvas: canvas)))
-        window.setContentSize(idealSize(for: image))
         model.onClose = { [weak self] in self?.window.performClose(nil) }
         model.onSaved = { PolishWindow.onSaved($0) }
     }
 
-    /// Big enough to see the screenshot well, never bigger than the screen.
-    private func idealSize(for img: CGImage) -> NSSize {
-        let screen = (NSScreen.main ?? NSScreen.screens[0]).visibleFrame
-        let chrome = NSSize(width: 290, height: 140)
-        let one = PolishLayout(doc: model.doc, scale: 1).canvas
-        let backing = max(1, NSScreen.main?.backingScaleFactor ?? 2)
-        let maxW = screen.width * 0.86 - chrome.width, maxH = screen.height * 0.86 - chrome.height
-        let k = min(maxW / one.width, maxH / one.height, 1 / backing * 1.4)
-        return NSSize(width: max(860, one.width * k + chrome.width + 72), height: max(560, one.height * k + chrome.height + 60))
-    }
-
     private func show() {
+        let pointer = NSEvent.mouseLocation
+        if let screen = NSScreen.screens.first(where: { NSMouseInRect(pointer, $0.frame, false) }) ?? NSScreen.main {
+            let area = screen.visibleFrame
+            window.minSize = NSSize(width: min(900, area.width), height: min(600, area.height))
+            let width = min(area.width, 1280, max(900, (area.width * 0.7).rounded()))
+            let height = min(area.height, 820, max(600, (area.height * 0.7).rounded()))
+            window.setFrame(NSRect(x: area.midX - width / 2, y: area.midY - height / 2,
+                                   width: width, height: height), display: false)
+        }
         Presence.opened(window)
-        window.center()
         window.alphaValue = 0
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)

@@ -114,8 +114,14 @@ final class AppWindow: NSObject, NSWindowDelegate {
     }
 
     func handleKey(_ e: NSEvent) -> NSEvent? {
-        guard e.window != nil, e.window === window, nav.page == .history,
-              e.modifierFlags.intersection([.command, .control, .option, .shift]) == .command,
+        guard e.window != nil, e.window === window, nav.page == .history else { return e }
+        let modifiers = e.modifierFlags.intersection([.command, .control, .option, .shift])
+        if modifiers == [.command, .shift], e.charactersIgnoringModifiers?.lowercased() == "e",
+           let clip = history.selected, clip.polishPath != nil {
+            model.editInPolish(clip)
+            return nil
+        }
+        guard modifiers == .command,
               e.charactersIgnoringModifiers?.lowercased() == "c" else { return e }
         let responder = window?.firstResponder
         if responder is NSText || responder is NSTextField { return e }
@@ -645,7 +651,10 @@ struct HistoryActions: View {
             Button("Get from \(model.devices[clip.origin] ?? "other device")") { SyncEngine.shared.get(clip.hash) }
         } else {
             Button("Copy") { model.pick(clip, false) }
-            if clip.polishPath != nil { Button("Polish…") { model.polish(clip) } }
+            if clip.polishPath != nil {
+                Button("Polish") { model.polish(clip) }
+                Button("Edit in Polish…") { model.editInPolish(clip) }
+            }
             if let p = clip.imagePath ?? clip.paths.first {
                 Button("Open") { NSWorkspace.shared.open(URL(fileURLWithPath: p)) }
                 Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p)]) }
@@ -663,7 +672,7 @@ struct HistoryActions: View {
 
 struct HistoryInspector: View {
     let clip: Clip
-    let model: Model
+    @ObservedObject var model: Model
     let browser: HistoryBrowser
 
     var body: some View {
@@ -697,8 +706,17 @@ struct HistoryInspector: View {
                     }
                     .controlSize(.large).buttonStyle(.borderedProminent)
                     if clip.polishPath != nil {
-                        Button { model.polish(clip) } label: { Label("Polish", systemImage: "sparkles") }
-                            .controlSize(.large).keyboardShortcut("e", modifiers: .command).help("Open in the editor  ⌘E")
+                        let status = model.polishStatus(for: clip)
+                        Button { model.polish(clip) } label: {
+                            if status == .rendering { ProgressView().controlSize(.small).frame(width: 52) }
+                            else {
+                                Label(status == .copied ? "Copied" : status == .failed ? "Failed" : "Polish",
+                                      systemImage: status?.symbol ?? "sparkles")
+                            }
+                        }
+                        .controlSize(.large).keyboardShortcut("e", modifiers: .command)
+                        .accessibilityLabel("Polish and copy")
+                        .help("Polish and copy  ⌘E")
                     }
                 }
                 Menu {

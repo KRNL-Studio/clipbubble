@@ -49,8 +49,18 @@ final class Model: ObservableObject {
     var bubbleModeChanged: () -> Void = {}
     var openApp: (AppPage) -> Void = { _ in }
     var historyChanged: () -> Void = {}
-    /// Opens an image in the Polish editor.
     var polish: (Clip) -> Void = { _ in }
+    var openPolishEditor: (URL) -> Void = { _ in }
+    @Published var polishActivity: (clipID: Int64, status: OneShotStatus)?
+    @Published var polishToast: (source: URL, thumbnail: NSImage?)?
+
+    func polishStatus(for clip: Clip) -> OneShotStatus? {
+        polishActivity?.clipID == clip.id ? polishActivity?.status : nil
+    }
+
+    func editInPolish(_ clip: Clip) {
+        if let path = clip.polishPath { openPolishEditor(URL(fileURLWithPath: path)) }
+    }
 
     var selected: Clip? { clips.first { $0.id == selection } ?? clips.first }
 
@@ -422,11 +432,13 @@ struct Row: View, Equatable {
     let selected: Bool
     let tick: Int
     let transfer: Transfer?
+    let polishStatus: OneShotStatus?
     let model: Model        // not observed, so a row redraws only when its own inputs change
     @State private var hover = false
 
     static func == (a: Row, b: Row) -> Bool {
-        a.clip == b.clip && a.index == b.index && a.selected == b.selected && a.tick == b.tick && a.transfer == b.transfer
+        a.clip == b.clip && a.index == b.index && a.selected == b.selected && a.tick == b.tick
+            && a.transfer == b.transfer && a.polishStatus == b.polishStatus
     }
 
     var body: some View {
@@ -465,12 +477,21 @@ struct Row: View, Equatable {
                 }
                 .buttonStyle(.borderless).help("Download it from \(model.devices[clip.origin] ?? "the other device")")
             }
-            if hover, transfer == nil, clip.polishPath != nil {
-                Button { model.polish(clip) } label: {
-                    Image(systemName: "sparkles").font(.system(size: 12, weight: .medium)).frame(width: 24, height: 24)
+            if hover || polishStatus != nil, transfer == nil, clip.polishPath != nil {
+                Button {
+                    if NSEvent.modifierFlags.contains(.option) { model.editInPolish(clip) }
+                    else { model.polish(clip) }
+                } label: {
+                    Group {
+                        if polishStatus == .rendering { ProgressView().controlSize(.mini) }
+                        else { Image(systemName: polishStatus?.symbol ?? "sparkles").font(.system(size: 12, weight: .medium)) }
+                    }
+                        .frame(width: 24, height: 24)
                         .background(Circle().fill(Color.white.opacity(0.1)))
                 }
-                .buttonStyle(.plain).help("Polish  ⌘E")
+                .buttonStyle(.plain)
+                .accessibilityLabel("Polish and copy")
+                .help("Polish and copy  ⌘E\nEdit in Polish  ⇧⌘E or ⌥-click")
                 .transition(.scale(scale: 0.6).combined(with: .opacity))
             }
             if index >= 0 && index < 9 {
@@ -489,7 +510,10 @@ struct Row: View, Equatable {
             if !clip.remote {
                 Button("Paste") { model.pick(clip, true) }
                 Button("Copy") { model.pick(clip, false) }
-                if clip.polishPath != nil { Button("Polish…") { model.polish(clip) } }
+                if clip.polishPath != nil {
+                    Button("Polish") { model.polish(clip) }
+                    Button("Edit in Polish…") { model.editInPolish(clip) }
+                }
                 if let p = clip.imagePath ?? clip.paths.first {
                     Button("Open") { NSWorkspace.shared.open(URL(fileURLWithPath: p)) }
                     Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p)]) }
@@ -645,6 +669,10 @@ struct PanelView: View {
             }
             .frame(maxHeight: .infinity)
 
+            if let toast = model.polishToast {
+                polishToast(source: toast.source, thumbnail: toast.thumbnail)
+                    .padding(.horizontal, 12).padding(.bottom, 8)
+            }
             Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1)
             footer
         }
@@ -663,7 +691,7 @@ struct PanelView: View {
                     LazyVStack(spacing: 1) {
                         ForEach(Array(model.clips.enumerated()), id: \.element.id) { i, c in
                             Row(clip: c, index: i, selected: c.id == model.selection, tick: model.shown,
-                                transfer: model.transfers[c.hash], model: model)
+                                transfer: model.transfers[c.hash], polishStatus: model.polishStatus(for: c), model: model)
                                 .equatable().id(c.id)
                         }
                     }
@@ -677,6 +705,30 @@ struct PanelView: View {
     }
 
     private var updateAvailable: Bool { if case .available = updater.state { return true } else { return false } }
+
+    private func polishToast(source: URL, thumbnail: NSImage?) -> some View {
+        HStack(spacing: 8) {
+            if let thumbnail {
+                Image(nsImage: thumbnail)
+                    .resizable().scaledToFit()
+                    .frame(width: 32, height: 22)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .accessibilityHidden(true)
+            } else {
+                Image(systemName: "exclamationmark.triangle").foregroundStyle(.secondary)
+            }
+            Text(thumbnail == nil ? "Couldn’t polish image" : "Polished and copied")
+                .font(.system(size: 12, weight: .medium))
+            if thumbnail != nil {
+                Button("Edit") { model.openPolishEditor(source) }
+                    .controlSize(.small)
+                    .help("Edit in Polish")
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9))
+        .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(.primary.opacity(0.12)))
+    }
 
     private var footer: some View {
         HStack(spacing: 14) {
@@ -695,7 +747,9 @@ struct PanelView: View {
             Key(keys: "↩", label: "Paste")
             Key(keys: "⌥↩", label: "Copy")
             Key(keys: "⌘Y", label: "Preview")
-            if model.selected?.polishPath != nil { Key(keys: "⌘E", label: "Polish") } else { Key(keys: "⌘⌫", label: "Delete") }
+            if model.selected?.polishPath != nil {
+                Key(keys: "⌘E", label: "Polish")
+            } else { Key(keys: "⌘⌫", label: "Delete") }
         }
         .padding(.horizontal, 14).frame(height: 36)
     }
@@ -776,7 +830,10 @@ struct PeekView: View {
             if model.recent.isEmpty {
                 Text("Nothing copied yet").font(.system(size: 12)).foregroundStyle(.secondary).padding(8)
             }
-            ForEach(model.recent) { Row(clip: $0, index: -1, selected: false, tick: model.shown, transfer: model.transfers[$0.hash], model: model) }
+            ForEach(model.recent) { c in
+                Row(clip: c, index: -1, selected: false, tick: model.shown, transfer: model.transfers[c.hash],
+                    polishStatus: model.polishStatus(for: c), model: model)
+            }
         }
         .padding(6)
         .frame(width: 300)
@@ -815,6 +872,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var peekHost: NSView!
     private(set) var appWindow: AppWindow!
     private(set) var shotCard = ShotCard()
+    private let oneShot = OneShot()
+    private var polishRowReset: DispatchWorkItem?
+    private var polishToastReset: DispatchWorkItem?
+    var putPolishedOnClipboard: (Data) -> Bool = { Board.writePNG($0, polished: true) }
     private var polishedPaths: [String: PolishedFile] = [:]
     var polishedFileAt: (URL) -> PolishedFile? = PolishedFile.read
     var screenshotClipboardChangeCount: () -> Int = { NSPasteboard.general.changeCount }
@@ -921,8 +982,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.historyChanged = { [weak self] in self?.appWindow.historyChanged() }
         view.onMenu = { [weak self] in self?.bubbleMenu() ?? NSMenu() }
         model.polish = { [weak self] in self?.polish($0) }
+        model.openPolishEditor = { [weak self] in self?.editInPolish($0) }
         PolishWindow.onSaved = { [weak self] in self?.polishedSaved($0) }
-        shotCard.onPolish = { [weak self] in self?.polish(file: $0) }
+        shotCard.onPolish = { [weak self] url, done in
+            guard let self else { return false }
+            return self.oneShot.start(url, putOnClipboard: self.putPolishedOnClipboard, done: done)
+        }
+        shotCard.onEdit = { [weak self] in self?.editInPolish($0) }
         shotCard.onCopy = { [weak self] url in
             guard let self, let c = self.model.db.clip(hash: "f:" + sha(url.path)) else { return false }
             return self.model.pick(c, false)
@@ -933,11 +999,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Polish
 
     func polish(_ c: Clip) {
-        guard let p = c.polishPath else { NSSound.beep(); return }
-        polish(file: URL(fileURLWithPath: p))
+        guard let path = c.polishPath else { return }
+        let source = URL(fileURLWithPath: path)
+        guard oneShot.start(source, putOnClipboard: putPolishedOnClipboard, done: { [weak self] thumbnail in
+            guard let self else { return }
+            self.model.polishActivity = (c.id, thumbnail == nil ? .failed : .copied)
+            self.model.polishToast = (source, thumbnail)
+            let resetRow = DispatchWorkItem { [weak self] in self?.model.polishActivity = nil }
+            let resetToast = DispatchWorkItem { [weak self] in self?.model.polishToast = nil }
+            self.polishRowReset = resetRow
+            self.polishToastReset = resetToast
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: resetRow)
+            DispatchQueue.main.asyncAfter(deadline: .now() + (thumbnail == nil ? 1.5 : 4), execute: resetToast)
+        }) else { return }
+        polishRowReset?.cancel()
+        polishToastReset?.cancel()
+        model.polishToast = nil
+        model.polishActivity = (c.id, .rendering)
     }
 
-    private func polish(file url: URL) {
+    private func editInPolish(_ url: URL) {
         hidePanel()
         hidePeek()
         shotCard.hide()
@@ -1202,7 +1283,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             else { hidePanel() }
         case kVK_Delete where cmd: if let c = model.selected { model.delete(c) }
         case kVK_ANSI_Y where cmd: model.previewing.toggle()
-        case kVK_ANSI_E where cmd: if let c = model.selected { polish(c) }
+        case kVK_ANSI_E where cmd && !opt && !e.modifierFlags.contains(.control):
+            if let c = model.selected {
+                if e.modifierFlags.contains(.shift) { model.editInPolish(c) }
+                else { model.polish(c) }
+            }
         default:
             if cmd, let d = Int(e.charactersIgnoringModifiers ?? ""), (1...9).contains(d), d <= model.clips.count {
                 pick(model.clips[d - 1], paste: !opt)

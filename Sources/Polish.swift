@@ -116,10 +116,12 @@ struct PolishPreset: Codable, Equatable, Identifiable {
     var name: String
     var style: PolishStyle
 
+    static let gradient = PolishPreset(name: "Gradient", style: PolishStyle(background: .gradient(0), padding: 0.09, radius: 0.022, shadow: 0.55))
+
     static let builtIn: [PolishPreset] = [
         PolishPreset(name: "None", style: PolishStyle(background: .none, padding: 0, radius: 0, shadow: 0, frame: .none, size: .auto)),
         PolishPreset(name: "Clean", style: PolishStyle(background: .solid(RGBA(hex: 0xF2F2F7)), padding: 0.07, radius: 0.018, shadow: 0.35)),
-        PolishPreset(name: "Gradient", style: PolishStyle(background: .gradient(0), padding: 0.09, radius: 0.022, shadow: 0.55)),
+        gradient,
         PolishPreset(name: "Window", style: PolishStyle(background: .gradient(2), padding: 0.08, radius: 0.02, shadow: 0.6, frame: .light)),
         PolishPreset(name: "Dark", style: PolishStyle(background: .gradient(6), padding: 0.08, radius: 0.02, shadow: 0.7, frame: .dark)),
         PolishPreset(name: "Social", style: PolishStyle(background: .gradient(1), padding: 0.07, radius: 0.022, shadow: 0.55, size: .x)),
@@ -137,7 +139,7 @@ struct PolishPreset: Codable, Equatable, Identifiable {
 
     /// The style the editor opens with: the last one used, else the default from Settings.
     static var last: PolishStyle {
-        get { UserDefaults.standard.data(forKey: lastKey).flatMap { try? JSONDecoder().decode(PolishStyle.self, from: $0) } ?? builtIn[2].style }
+        get { UserDefaults.standard.data(forKey: lastKey).flatMap { try? JSONDecoder().decode(PolishStyle.self, from: $0) } ?? gradient.style }
         set { UserDefaults.standard.set(try? JSONEncoder().encode(newValue), forKey: lastKey) }
     }
 }
@@ -374,11 +376,18 @@ enum PolishRenderer {
 
     // MARK: Export
 
+    static func exportScale(for style: PolishStyle, retina: Bool) -> CGFloat {
+        retina || style.size.pixels != nil ? 1 : 0.5
+    }
+
     /// A finished PNG. `retina: false` halves a 2× screenshot for a smaller file.
     static func png(_ doc: PolishDoc, retina: Bool = true) -> Data? {
         guard let src = load(doc.source) else { return nil }
-        let scale: CGFloat = retina || doc.style.size.pixels != nil ? 1 : 0.5
-        guard let img = render(doc, source: src, scale: scale) else { return nil }
+        guard let img = render(doc, source: src, scale: exportScale(for: doc.style, retina: retina)) else { return nil }
+        return png(img)
+    }
+
+    static func png(_ img: CGImage) -> Data? {
         let data = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil) else { return nil }
         CGImageDestinationAddImage(dest, img, nil)

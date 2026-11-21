@@ -698,7 +698,7 @@ struct ScreenshotsPage: View {
                 ToggleRow(icon: "doc.on.clipboard", tint: .pink, title: "Also copy new ones to the clipboard",
                           detail: "Ready to paste the moment you take one.", isOn: $copyShots)
             }
-            SettingsCard(title: "Polish", footer: "Polish gives a screenshot a background, a frame and a shadow, and lets you mark it up and hide private details before you share it.") {
+            SettingsCard(title: "Polish", footer: "Polish copies an image using your starting style and export scale. Choose Edit to mark it up or hide private details in the editor.") {
                 ToggleRow(icon: "sparkles", tint: .purple, title: "Offer to polish new screenshots",
                           detail: "A card with Polish and Copy slides out by the bubble for a few seconds.", isOn: $polishCard)
                 RowDivider()

@@ -8,6 +8,7 @@ final class ShareViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        view.backgroundColor = .clear
         let host = UIHostingController(rootView: ShareCard(state: state) { [weak self] in self?.close() })
         host.view.backgroundColor = .clear
         addChild(host)
@@ -28,6 +29,16 @@ final class ShareViewController: UIViewController {
             state.done = true
             try? await Task.sleep(nanoseconds: 1_400_000_000)
             close()
+        }
+    }
+
+    override func viewIsAppearing(_ animated: Bool) {
+        super.viewIsAppearing(animated)
+        // Keep the sharing app visible behind the card when UIKit adds an opaque extension container.
+        var container: UIView? = view
+        while let current = container {
+            current.backgroundColor = .clear
+            container = current.superview
         }
     }
 

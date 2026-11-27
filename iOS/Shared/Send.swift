@@ -1,3 +1,4 @@
+import ImageIO
 import UIKit
 import UniformTypeIdentifiers
 
@@ -12,26 +13,76 @@ enum Inbox {
 
     /// Stored as PNG, which computers check against the hash and paste as a picture.
     static func image(_ data: Data, source: String) -> String? {
-        let png = data.starts(with: [0x89, 0x50, 0x4E, 0x47]) ? data : UIImage(data: data)?.pngData()
-        guard let png else { return nil }
-        let url = Paths.images.appendingPathComponent(sha(png) + ".png")
+        autoreleasepool {
+            guard let image = CGImageSourceCreateWithData(data as CFData, imageSourceOptions),
+                  let png = pngData(image, original: { data }) else { return nil }
+            return saveImage(png, source: source)
+        }
+    }
+
+    /// Read directly from the picker's file so large originals stay on disk.
+    static func image(_ url: URL, source: String) -> String? {
+        autoreleasepool {
+            guard let image = CGImageSourceCreateWithURL(url as CFURL, imageSourceOptions),
+                  let png = pngData(image, original: {
+                      guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                            size <= Sync.autoFetchLimit else { return nil }
+                      return try? Data(contentsOf: url, options: .mappedIfSafe)
+                  }) else { return nil }
+            return saveImage(png, source: source)
+        }
+    }
+
+    private static let imageSourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+
+    private static func pngData(_ image: CGImageSource, original: () -> Data?) -> Data? {
+        if CGImageSourceGetType(image) == UTType.png.identifier as CFString,
+           let data = original(), data.count <= Sync.autoFetchLimit {
+            return data
+        }
+
+        // Decode at thumbnail size and apply EXIF orientation before saving the pixels.
+        var pixels = 2560
+        while pixels > 0 {
+            guard let png = autoreleasepool(invoking: { () -> NSMutableData? in
+                guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(image, 0, [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceShouldCacheImmediately: true,
+                    kCGImageSourceThumbnailMaxPixelSize: pixels,
+                ] as CFDictionary) else { return nil }
+                let data = NSMutableData()
+                guard let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil) else { return nil }
+                CGImageDestinationAddImage(destination, thumbnail, nil)
+                return CGImageDestinationFinalize(destination) ? data : nil
+            }) else { return nil }
+            if png.length <= Sync.autoFetchLimit { return png as Data }
+            pixels /= 2
+        }
+        return nil
+    }
+
+    private static func saveImage(_ png: Data, source: String) -> String? {
+        let digest = sha(png)
+        let url = Paths.images.appendingPathComponent(digest + ".png")
         try? FileManager.default.createDirectory(at: Paths.images, withIntermediateDirectories: true)
-        guard (try? png.write(to: url)) != nil else { return nil }
-        let hash = "i:" + sha(png)
+        guard (try? png.write(to: url, options: .atomic)) != nil else { return nil }
+        let hash = "i:" + digest
         DB().upsert(kind: "image", text: "", file: url.path, source: source, hash: hash)
         return hash
     }
 
     /// A copy in ClipBubble's own folder, since what the share sheet hands over is gone once it closes.
     static func file(_ src: URL, source: String) -> String? {
-        if src.pathExtension.lowercased() == "png", let d = try? Data(contentsOf: src), d.count < Int(Sync.autoFetchLimit) {
-            return image(d, source: source)
+        let scoped = src.startAccessingSecurityScopedResource()
+        defer { if scoped { src.stopAccessingSecurityScopedResource() } }
+        if src.pathExtension.lowercased() == "png",
+           let size = try? src.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= Sync.autoFetchLimit {
+            return image(src, source: source)
         }
         let dir = Paths.dir.appendingPathComponent("sent").appendingPathComponent(UUID().uuidString)
         let dest = dir.appendingPathComponent(safeFileName(src.lastPathComponent))
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let scoped = src.startAccessingSecurityScopedResource()
-        defer { if scoped { src.stopAccessingSecurityScopedResource() } }
         guard (try? FileManager.default.copyItem(at: src, to: dest)) != nil else { return nil }
         let hash = "f:" + sha(dest.path)
         DB().upsert(kind: "file", text: dest.path, file: nil, source: source, hash: hash)
@@ -78,13 +129,29 @@ enum Inbox {
 
     /// The provider's file, moved somewhere that outlives its callback.
     private static func fileCopy(_ p: NSItemProvider, _ t: UTType) async -> URL? {
-        await withCheckedContinuation { c in
+        let suggested = p.suggestedName
+        return await withCheckedContinuation { c in
             _ = p.loadFileRepresentation(for: t, openInPlace: false) { url, _, _ in
                 guard let url else { return c.resume(returning: nil) }
                 let keep = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-                try? FileManager.default.createDirectory(at: keep, withIntermediateDirectories: true)
-                let dest = keep.appendingPathComponent(p.suggestedName.map { $0 + (url.pathExtension.isEmpty ? "" : "." + url.pathExtension) } ?? url.lastPathComponent)
-                c.resume(returning: (try? FileManager.default.copyItem(at: url, to: dest)) != nil ? dest : nil)
+                var name = safeFileName(suggested ?? url.lastPathComponent)
+                let ext = url.pathExtension.lowercased()
+                let nameExt = (name as NSString).pathExtension.lowercased()
+                if !ext.isEmpty, nameExt != ext {
+                    let existingType = UTType(filenameExtension: nameExt)
+                    if existingType == nil || existingType != UTType(filenameExtension: ext) {
+                        name = safeFileName(name + "." + url.pathExtension)
+                    }
+                }
+                let dest = keep.appendingPathComponent(name)
+                do {
+                    try FileManager.default.createDirectory(at: keep, withIntermediateDirectories: true)
+                    try FileManager.default.copyItem(at: url, to: dest)
+                    c.resume(returning: dest)
+                } catch {
+                    try? FileManager.default.removeItem(at: keep)
+                    c.resume(returning: nil)
+                }
             }
         }
     }

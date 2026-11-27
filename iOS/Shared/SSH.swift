@@ -146,7 +146,12 @@ final class SSHTunnel: Tunnel {
             let d = h.availableData
             guard !d.isEmpty else { h.readabilityHandler = nil; child.close(promise: nil); return }
             // Waiting backs up into the pipe and then the session, which keeps a big upload out of memory and lets a ping overtake it.
-            try? child.writeAndFlush(SSHChannelData(type: .channel, data: .byteBuffer(ByteBuffer(bytes: d)))).wait()
+            do {
+                try child.writeAndFlush(SSHChannelData(type: .channel, data: .byteBuffer(ByteBuffer(bytes: d)))).wait()
+            } catch {
+                h.readabilityHandler = nil
+                child.close(promise: nil)
+            }
         }
     }
 

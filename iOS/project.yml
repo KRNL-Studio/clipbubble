@@ -92,6 +92,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: studio.krnl.clipbubble.share
+        # Only the main app declares App Intents.
+        LM_SKIP_METADATA_EXTRACTION: YES
   ClipBubbleKeyboard:
     type: app-extension
     platform: iOS
@@ -114,3 +116,4 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: studio.krnl.clipbubble.keyboard
+        LM_SKIP_METADATA_EXTRACTION: YES

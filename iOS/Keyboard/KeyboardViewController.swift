@@ -143,10 +143,12 @@ final class KeyboardModel: ObservableObject {
 struct KeyboardView: View {
     @ObservedObject var model: KeyboardModel
     @State private var deleting: Timer?
+    @GestureState private var touchingDelete = false
     @State private var typing = false
     @State private var symbols = false
     @State private var more = false
     @State private var shift = false
+    private var showsKeys: Bool { !model.fullAccess || typing }
 
     var body: some View {
         VStack(spacing: 6) {
@@ -158,7 +160,7 @@ struct KeyboardView: View {
             .padding(.horizontal, 10).padding(.top, 6)
             .accessibilityElement(children: .combine)
 
-            if !model.fullAccess || typing {
+            if showsKeys {
                 // Without Full Access there's no history to show, so it's a plain keyboard until that's turned on.
                 VStack(spacing: 8) {
                     if !model.fullAccess {
@@ -212,7 +214,7 @@ struct KeyboardView: View {
                     key(Image(systemName: typing ? "doc.on.clipboard" : "keyboard"), width: 44, function: true) { typing.toggle() }
                         .accessibilityLabel(typing ? "Show history" : "Show keyboard")
                 }
-                if !model.fullAccess || typing {
+                if showsKeys {
                     key(Text(symbols ? "ABC" : "123"), width: 48, function: true) { symbols.toggle(); more = false }
                 }
                 if model.globe {
@@ -221,13 +223,26 @@ struct KeyboardView: View {
                 key(Text("space"), width: nil) { model.type(" ") }
                 key(Image(systemName: "delete.left"), width: 52, function: true) { model.backspace() }.accessibilityLabel("Delete")
                     .simultaneousGesture(LongPressGesture(minimumDuration: 0.4).onEnded { _ in
-                        deleting = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { _ in Task { @MainActor in model.backspace() } }
+                        stopDeleting()
+                        deleting = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak model = model] _ in
+                            MainActor.assumeIsolated { model?.backspace() }
+                        }
                     })
-                    .simultaneousGesture(DragGesture(minimumDistance: 0).onEnded { _ in deleting?.invalidate(); deleting = nil })
+                    .simultaneousGesture(DragGesture(minimumDistance: 0).updating($touchingDelete) { _, touching, _ in
+                        touching = true
+                    })
                 key(Image(systemName: "return"), width: 60, function: true) { model.type("\n") }.accessibilityLabel("Return")
             }
             .padding(.horizontal, 6).padding(.bottom, 6)
         }
+        .onChange(of: touchingDelete) { if !touchingDelete { stopDeleting() } }
+        .onChange(of: showsKeys) { stopDeleting() }
+        .onDisappear { stopDeleting() }
+    }
+
+    private func stopDeleting() {
+        deleting?.invalidate()
+        deleting = nil
     }
 
     private static let letters = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]

@@ -47,22 +47,37 @@ enum Appearance: String, CaseIterable {
 @MainActor
 enum Prompt {
     private static var window: UIWindow?
+    private static var pendingAnswer: ((Bool) -> Void)?
 
     static func show(_ title: String, _ message: String, ok: String = "OK", cancel: String? = nil, answer: @escaping (Bool) -> Void = { _ in }) {
-        guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first else { return answer(false) }
+        finish(false)
+        guard window == nil,
+              let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first else { return answer(false) }
         let w = UIWindow(windowScene: scene)
         w.windowLevel = .alert
         w.overrideUserInterfaceStyle = scene.windows.first?.overrideUserInterfaceStyle ?? .unspecified
         w.rootViewController = UIViewController()
         w.isHidden = false
         window = w
+        pendingAnswer = answer
         func button(_ title: String, _ style: UIAlertAction.Style, _ yes: Bool) -> UIAlertAction {
-            UIAlertAction(title: title, style: style) { _ in window = nil; answer(yes) }
+            UIAlertAction(title: title, style: style) { [weak w] _ in
+                guard let w, window === w else { return }
+                finish(yes)
+            }
         }
         let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
         if let cancel { alert.addAction(button(cancel, .cancel, false)) }
         alert.addAction(button(ok, .default, true))
         w.rootViewController?.present(alert, animated: true)
+    }
+
+    private static func finish(_ yes: Bool) {
+        let answer = pendingAnswer
+        pendingAnswer = nil
+        window?.isHidden = true
+        window = nil
+        answer?(yes)
     }
 }
 
@@ -207,12 +222,13 @@ final class Model: ObservableObject {
         Task {
             var hashes: [String] = []
             for item in items {
-                let h: String?
-                if item.supportedContentTypes.contains(where: { $0.conforms(to: .image) }), let d = try? await item.loadTransferable(type: Data.self) {
-                    h = await Task.detached { Inbox.image(d, source: "iPhone") }.value
-                } else if let f = try? await item.loadTransferable(type: PickedFile.self) {
-                    h = await Task.detached { Inbox.moved(f.url, source: "iPhone") }.value
-                } else { h = nil }
+                guard let f = try? await item.loadTransferable(type: PickedFile.self) else { continue }
+                let isImage = item.supportedContentTypes.contains { $0.conforms(to: .image) }
+                let h = await Task.detached {
+                    if !isImage { return Inbox.moved(f.url, source: "iPhone") }
+                    defer { try? FileManager.default.removeItem(at: f.url.deletingLastPathComponent()) }
+                    return Inbox.image(f.url, source: "iPhone")
+                }.value
                 if let h { hashes.append(h) }
             }
             added(hashes)
@@ -308,7 +324,8 @@ struct HistoryView: View {
             Welcome { welcomed = true; tab = .settings }
         }
         .onChange(of: model.linking) { if model.linking { welcomed = true } }
-        .photosPicker(isPresented: shows(.photos), selection: $photos, maxSelectionCount: 20, matching: .any(of: [.images, .videos]))
+        .photosPicker(isPresented: shows(.photos), selection: $photos, maxSelectionCount: 20,
+                      matching: .any(of: [.images, .videos]), preferredItemEncoding: .current)
         .onChange(of: photos) {
             guard !photos.isEmpty else { return }
             model.addPhotos(photos)
@@ -541,7 +558,7 @@ struct TextComposer: View {
     }
 }
 
-/// A video or other file from the photo library, copied somewhere that outlives the picker.
+/// A photo or video copied somewhere that outlives the picker.
 struct PickedFile: Transferable {
     let url: URL
 
@@ -550,8 +567,13 @@ struct PickedFile: Transferable {
             let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let dest = dir.appendingPathComponent(received.file.lastPathComponent)
-            try FileManager.default.copyItem(at: received.file, to: dest)
-            return PickedFile(url: dest)
+            do {
+                try FileManager.default.copyItem(at: received.file, to: dest)
+                return PickedFile(url: dest)
+            } catch {
+                try? FileManager.default.removeItem(at: dir)
+                throw error
+            }
         }
     }
 }
@@ -565,11 +587,14 @@ struct HostRow: View {
             Image(systemName: "laptopcomputer").font(.title3).foregroundStyle(.secondary).frame(minWidth: 32).accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 Text(name).font(.subheadline.weight(.semibold))
-                // On a timer because "retrying in 8 s" counts down with nothing else changing.
-                TimelineView(.periodic(from: .now, by: 1)) { _ in
-                    Text(state.map { if case .live = $0 { return "Linked" }; return $0.phoneText } ?? "Connecting…")
-                        .font(.caption).foregroundStyle(.secondary)
+                Group {
+                    if case .offline? = state {
+                        TimelineView(.periodic(from: .now, by: 1)) { _ in Text(subtitle) }
+                    } else {
+                        Text(subtitle)
+                    }
                 }
+                .font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
             if stuck { Button("Retry") { SyncEngine.shared.redial(alias) }.buttonStyle(.borderless).font(.caption) }
@@ -578,6 +603,11 @@ struct HostRow: View {
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
         .onChange(of: state) { if case .live(let h) = state { Self.remember(h.name, for: alias) } }
+    }
+
+    private var subtitle: String {
+        if case .live? = state { return "Linked" }
+        return state?.phoneText ?? "Connecting…"
     }
 
     private var stuck: Bool {
@@ -654,7 +684,7 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    step(1, "On your Mac, Windows PC or Linux computer, open ClipBubble → Settings → Sync over SSH → Link iPhone…")
+                    step(1, "On your computer, open ClipBubble → Devices (or Settings on Windows/Linux) → Sync over SSH → Link iPhone…")
                     step(2, DataScannerViewController.isSupported ? "Tap Scan code below, or point this iPhone's Camera at the code."
                          : "Point this iPhone's Camera at the code.")
                     if DataScannerViewController.isSupported {

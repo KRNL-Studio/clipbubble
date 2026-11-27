@@ -50,7 +50,7 @@ Without a computer:
 4. In Safari, share a page to ClipBubble.
 5. In Settings, go to General, Keyboard, Keyboards, Add New Keyboard, ClipBubble. In Notes, switch to it. Turn on Allow Full Access and it lists your history. Tap an item to type it.
 
-With a computer: install ClipBubble from https://clipbubble.krnl.studio on a Mac, and turn on Remote Login in System Settings, General, Sharing. Open ClipBubble, Settings, Sync over SSH, Link iPhone. On the same Wi-Fi, scan the code with the iPhone Camera, tap Link, and allow Local Network.
+Install ClipBubble from https://clipbubble.krnl.studio on a Mac and turn on Remote Login in System Settings → General → Sharing. On the Mac, open ClipBubble → Devices → Sync over SSH → Link iPhone… On the same Wi-Fi, scan the code with the iPhone Camera, tap Link, and allow Local Network.
 
 Local Network is used only to reach the user's own computer. Full Access is used only to read the local history and link to the user's computers.
 

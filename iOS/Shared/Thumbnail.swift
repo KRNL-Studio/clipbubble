@@ -8,7 +8,8 @@ enum Thumbnails {
     /// Capped well under the keyboard's memory limit; a 540-pixel thumbnail costs about 1 MB.
     private static let cache: NSCache<NSString, UIImage> = {
         let c = NSCache<NSString, UIImage>()
-        c.totalCostLimit = 24 << 20
+        let isExtension = Bundle.main.bundleURL.pathExtension == "appex"
+        c.totalCostLimit = (isExtension ? 8 : 24) << 20
         return c
     }()
 

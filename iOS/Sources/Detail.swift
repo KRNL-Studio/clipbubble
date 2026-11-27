@@ -1,3 +1,4 @@
+import ImageIO
 import SwiftUI
 
 extension View {
@@ -43,7 +44,10 @@ struct ClipPreview: View {
 
     var body: some View {
         if let p = clip.imagePath, !clip.remote {
-            Color.clear.frame(width: 340, height: 260).overlay { Thumb(p, pixels: 900).scaledToFit() }
+            let size = imageSize(p)
+            Color.clear.frame(width: size.width, height: size.height)
+                .overlay { Thumb(p, pixels: 900).scaledToFill() }
+                .clipped()
         } else if clip.kind == "text" {
             Text(clip.text.trimmingCharacters(in: .whitespacesAndNewlines))
                 .font(.body).lineLimit(18)
@@ -55,6 +59,20 @@ struct ClipPreview: View {
             }
             .padding(24).frame(width: 300)
         }
+    }
+
+    private func imageSize(_ path: String) -> CGSize {
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let image = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, options),
+              let properties = CGImageSourceCopyPropertiesAtIndex(image, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? CGFloat, width > 0,
+              let height = properties[kCGImagePropertyPixelHeight] as? CGFloat, height > 0 else {
+            return CGSize(width: 340, height: 260)
+        }
+        let orientation = properties[kCGImagePropertyOrientation] as? Int ?? 1
+        let (w, h) = (5...8).contains(orientation) ? (height, width) : (width, height)
+        let scale = min(340 / w, 420 / h)
+        return CGSize(width: w * scale, height: h * scale)
     }
 }
 
@@ -88,7 +106,7 @@ struct ClipDetail: View {
             if !clip.remote {
                 ToolbarItem(placement: .topBarTrailing) {
                     if clip.kind == "text" {
-                        ShareLink(item: clip.text)
+                        ShareLink(item: model.whole(clip).text)
                     } else if let p = clip.file ?? clip.paths.first {
                         ShareLink(item: URL(fileURLWithPath: p))
                     }

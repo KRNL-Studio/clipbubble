@@ -11,6 +11,15 @@ enum Sync {
     static let chunkSize = 256 << 10
     /// Files and images up to this size move on their own; bigger ones wait for Get or Send to.
     static let autoFetchLimit: Int64 = 25 << 20
+
+    static func blobSize(_ sizes: some Sequence<Int64>) -> Int64? {
+        var total: Int64 = 0
+        for size in sizes {
+            guard size >= 0, size <= Int64.max - total else { return nil }
+            total += size
+        }
+        return total
+    }
 }
 
 struct Stamp: Equatable {
@@ -44,7 +53,7 @@ struct Entry: Equatable {
     var blobs: [Blob]
 
     var stamp: Stamp { Stamp(hash: hash, time: time, deleted: false) }
-    var size: Int64 { blobs.reduce(0) { $0 + $1.size } }
+    var size: Int64 { Sync.blobSize(blobs.lazy.map(\.size)) ?? .max }
 }
 
 struct Hello: Equatable {
@@ -154,7 +163,8 @@ enum Frame: Equatable {
             let n = Int(try r.u32())
             guard n <= r.remaining / 16 else { throw SyncError.malformed }
             let blobs = try (0..<n).map { _ in Blob(name: try r.str(), size: try r.i64(), sha: try r.str()) }
-            guard ["text", "image", "file"].contains(kind), blobs.allSatisfy({ $0.size >= 0 }) else { throw SyncError.malformed }
+            guard ["text", "image", "file"].contains(kind),
+                  Sync.blobSize(blobs.lazy.map(\.size)) != nil else { throw SyncError.malformed }
             f = .put(Entry(hash: hash, time: time, kind: kind, text: text, source: source, origin: origin, blobs: blobs))
         case 4: f = .tombstone(try r.stamp())
         case 5: f = .fetch(hash: try r.str(), index: Int(try r.u32()), offset: try r.i64())

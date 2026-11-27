@@ -53,6 +53,9 @@ func peerTests() {
     let args = Peers.sshArguments(alias) ?? []
     check(args.contains("StrictHostKeyChecking=yes") && args.contains("HostKeyAlias=\(alias)") && args.contains("IdentitiesOnly=yes"),
           "strict checking against the pinned key")
+    check(Array(args.prefix(2)) == ["-F", "/dev/null"] && args.contains("ControlMaster=no")
+          && args.contains("ControlPath=none") && args.contains("ClearAllForwardings=yes"),
+          "paired SSH ignores local config, existing control sockets and forwarding rules")
     check(Array(args.suffix(4)) == ["-l", "rohit", "--", "air.local"], "connects as the user it reported")
     check(Peers.sshArguments("some-config-host") == nil, "other hosts keep ~/.ssh/config")
     check(Peers.keyPath.path.hasPrefix(Paths.dir.path), "tests never touch ~/.ssh")

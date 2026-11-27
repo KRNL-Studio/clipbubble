@@ -54,7 +54,13 @@ final class ProcessTunnel: Tunnel {
         self.output = output
     }
 
-    func close() { process.terminate() }
+    func close() {
+        guard process.isRunning else { return }
+        process.terminate()
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) { [process] in
+            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        }
+    }
 }
 
 // MARK: - Local endpoint

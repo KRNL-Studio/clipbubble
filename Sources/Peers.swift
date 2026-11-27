@@ -107,7 +107,8 @@ enum Peers {
     /// ssh arguments for a linked computer: this key only, its pinned identity only, strict checking always.
     static func sshArguments(_ alias: String) -> [String]? {
         guard let p = peer(alias) else { return nil }
-        return ["-i", keyPath.path, "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
+        return ["-F", "/dev/null", "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ClearAllForwardings=yes",
+                "-i", keyPath.path, "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
                 "-o", "UserKnownHostsFile=\(knownHosts.path)", "-o", "GlobalKnownHostsFile=/dev/null",
                 "-o", "StrictHostKeyChecking=yes", "-o", "HostKeyAlias=\(p.alias)", "-l", p.user, "--", p.host]
     }

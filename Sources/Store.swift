@@ -51,34 +51,40 @@ final class DB {
         // Clipboard history is private: keep the folder readable by this user only.
         try? FileManager.default.createDirectory(at: Paths.images, withIntermediateDirectories: true)
         try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: Paths.dir.path)
-        sqlite3_open(Paths.db.path, &h)
+        guard sqlite3_open(Paths.db.path, &h) == SQLITE_OK else { return }
         sqlite3_busy_timeout(h, 3000)
-        // `forgotten` holds deletes with their time. A clip is only kept if it was copied after its delete,
-        // so a deleted screenshot isn't re-imported and a delete on another device sticks.
-        sqlite3_exec(h, """
-            PRAGMA journal_mode=WAL;
-            CREATE TABLE IF NOT EXISTS clips(
-              id INTEGER PRIMARY KEY, kind TEXT NOT NULL, text TEXT NOT NULL DEFAULT '',
-              file TEXT, source TEXT NOT NULL DEFAULT '', hash TEXT UNIQUE NOT NULL, created REAL NOT NULL);
-            CREATE INDEX IF NOT EXISTS clips_created ON clips(created);
-            CREATE TABLE IF NOT EXISTS forgotten(hash TEXT PRIMARY KEY, at REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY, name TEXT NOT NULL, os TEXT NOT NULL DEFAULT '');
-            """, nil, nil, nil)
-        if scalar("PRAGMA user_version") < 1 {
-            sqlite3_exec(h, """
-                BEGIN;
-                ALTER TABLE clips ADD COLUMN origin TEXT NOT NULL DEFAULT '';
-                ALTER TABLE clips ADD COLUMN remote INTEGER NOT NULL DEFAULT 0;
-                PRAGMA user_version = 1;
-                COMMIT;
-                """, nil, nil, nil)
+        sqlite3_exec(h, "PRAGMA journal_mode=WAL", nil, nil, nil)
+        // A second process may have completed the schema while this one waited for the write lock.
+        if let version = schemaVersion(), version >= 1 { return }
+        _ = transaction {
+            guard let version = schemaVersion() else { return false }
+            guard version < 1 else { return true }
+            // Keep existing row IDs when upgrading. Fresh databases never recycle deleted IDs.
+            return run("""
+                CREATE TABLE IF NOT EXISTS clips(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, text TEXT NOT NULL DEFAULT '',
+                  file TEXT, source TEXT NOT NULL DEFAULT '', hash TEXT UNIQUE NOT NULL, created REAL NOT NULL)
+                """)
+                && run("CREATE INDEX IF NOT EXISTS clips_created ON clips(created)")
+                && run("CREATE TABLE IF NOT EXISTS forgotten(hash TEXT PRIMARY KEY, at REAL NOT NULL)")
+                && run("CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY, name TEXT NOT NULL, os TEXT NOT NULL DEFAULT '')")
+                && run("ALTER TABLE clips ADD COLUMN origin TEXT NOT NULL DEFAULT ''")
+                && run("ALTER TABLE clips ADD COLUMN remote INTEGER NOT NULL DEFAULT 0")
+                && run("PRAGMA user_version = 1")
         }
     }
 
-    private func scalar(_ sql: String) -> Int {
-        let s = prepare(sql, [])
+    private func schemaVersion() -> Int? {
+        let s = prepare("PRAGMA user_version", [])
         defer { sqlite3_finalize(s) }
-        return sqlite3_step(s) == SQLITE_ROW ? Int(sqlite3_column_int64(s, 0)) : 0
+        return sqlite3_step(s) == SQLITE_ROW ? Int(sqlite3_column_int(s, 0)) : nil
+    }
+
+    private func transaction(_ body: () -> Bool) -> Bool {
+        guard run("BEGIN IMMEDIATE") else { return false }
+        if body(), run("COMMIT") { return true }
+        _ = run("ROLLBACK")
+        return false
     }
 
     private func prepare(_ sql: String, _ args: [Any?]) -> OpaquePointer? {
@@ -86,24 +92,32 @@ final class DB {
         guard sqlite3_prepare_v2(h, sql, -1, &s, nil) == SQLITE_OK else { return nil }
         for (i, a) in args.enumerated() {
             let idx = Int32(i + 1)
+            let result: Int32
             switch a {
-            case let v as String: sqlite3_bind_text(s, idx, v, -1, SQLITE_TRANSIENT)
-            case let v as Double: sqlite3_bind_double(s, idx, v)
-            case let v as Int64: sqlite3_bind_int64(s, idx, v)
-            case let v as Int: sqlite3_bind_int64(s, idx, Int64(v))
-            default: sqlite3_bind_null(s, idx)
+            case let v as String: result = sqlite3_bind_text(s, idx, v, -1, SQLITE_TRANSIENT)
+            case let v as Double: result = sqlite3_bind_double(s, idx, v)
+            case let v as Int64: result = sqlite3_bind_int64(s, idx, v)
+            case let v as Int: result = sqlite3_bind_int64(s, idx, Int64(v))
+            default: result = sqlite3_bind_null(s, idx)
             }
+            guard result == SQLITE_OK else { sqlite3_finalize(s); return nil }
         }
         return s
     }
 
-    private func run(_ sql: String, _ args: Any?...) {
-        let s = prepare(sql, args)
-        sqlite3_step(s)
-        sqlite3_finalize(s)
+    private func run(_ sql: String, _ args: Any?...) -> Bool { execute(sql, args) }
+
+    private func execute(_ sql: String, _ args: [Any?]) -> Bool {
+        guard let s = prepare(sql, args) else { return false }
+        defer { sqlite3_finalize(s) }
+        return sqlite3_step(s) == SQLITE_DONE
     }
 
     private func select(_ tail: String, _ args: [Any?], preview: Bool = false) -> [Clip] {
+        selectChecked(tail, args, preview: preview) ?? []
+    }
+
+    private func selectChecked(_ tail: String, _ args: [Any?], preview: Bool = false) -> [Clip]? {
         let n = Self.previewLength
         let text = preview ? "CASE WHEN kind = 'text' THEN substr(text, 1, \(n)) ELSE text END" : "text"
         let partial = preview ? "kind = 'text' AND length(text) > \(n)" : "0"
@@ -111,34 +125,39 @@ final class DB {
         defer { sqlite3_finalize(s) }
         func col(_ i: Int32) -> String { sqlite3_column_text(s, i).map { String(cString: $0) } ?? "" }
         var out: [Clip] = []
-        while sqlite3_step(s) == SQLITE_ROW {
+        while true {
+            let result = sqlite3_step(s)
+            if result == SQLITE_DONE { return out }
+            guard result == SQLITE_ROW else { return nil }
             out.append(Clip(id: sqlite3_column_int64(s, 0), kind: col(1), text: col(2),
                             file: sqlite3_column_type(s, 3) == SQLITE_NULL ? nil : col(3),
                             source: col(4), created: Date(timeIntervalSince1970: sqlite3_column_double(s, 5)),
                             hash: col(6), origin: col(7), remote: sqlite3_column_int(s, 8) != 0,
                             partial: sqlite3_column_int(s, 9) != 0))
         }
-        return out
     }
 
     /// Inserts a clip, or moves an identical existing one to the top.
-    func upsert(kind: String, text: String, file: String?, source: String, hash: String) {
-        run("""
+    @discardableResult
+    func upsert(kind: String, text: String, file: String?, source: String, hash: String) -> Bool {
+        guard run("""
             INSERT INTO clips(kind,text,file,source,hash,created) VALUES(?,?,?,?,?,?)
-            ON CONFLICT(hash) DO UPDATE SET created=excluded.created,
+            ON CONFLICT(hash) DO UPDATE SET created=excluded.created, remote=0, origin='',
+              file=COALESCE(excluded.file, clips.file),
+              text=CASE WHEN clips.kind = 'file' THEN excluded.text ELSE clips.text END,
               source=CASE WHEN clips.source IN ('Screenshot', 'Downloads') THEN clips.source ELSE excluded.source END
-            """, kind, text, file, source, hash, Date().timeIntervalSince1970)
+            """, kind, text, file, source, hash, Date().timeIntervalSince1970) else { return false }
         DB.changed?([hash])
+        return true
     }
 
     /// Adds a clip with its own timestamp, leaving any existing identical clip untouched,
     /// unless it was deleted after that time (a screenshot or download you removed stays removed).
     func insertIfMissing(kind: String, text: String, source: String, hash: String, created: Date) {
-        run("""
+        if run("""
             INSERT OR IGNORE INTO clips(kind,text,source,hash,created)
             SELECT ?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM forgotten WHERE hash = ? AND at >= ?)
-            """, kind, text, source, hash, created.timeIntervalSince1970, hash, created.timeIntervalSince1970)
-        if DB.changed != nil, sqlite3_changes(h) > 0 { DB.changed?([hash]) }
+            """, kind, text, source, hash, created.timeIntervalSince1970, hash, created.timeIntervalSince1970), sqlite3_changes(h) > 0 { DB.changed?([hash]) }
     }
 
     /// `preview` trims long text for lists, which on iPhone can't hold thousands of megabyte-long items in memory.
@@ -183,57 +202,89 @@ final class DB {
     func exists(hash: String) -> Bool { !select("WHERE hash = ?", [hash]).isEmpty }
 
     /// Removes a clip the app captured itself (a paste-through). Recorded as a delete so linked devices drop it too.
-    func delete(hash: String) {
-        let rows = select("WHERE hash = ?", [hash])
-        forget(rows)
-        removeFiles(rows)
-        run("DELETE FROM clips WHERE hash = ?", hash)
-        if !rows.isEmpty { DB.changed?([hash]) }
+    func delete(hash: String) { delete("WHERE hash = ?", [hash]) }
+
+    func delete(id: Int64) { delete("WHERE id = ?", [id]) }
+
+    func deleteAll() { delete("", [], clearIncoming: true) }
+
+    private func delete(_ filter: String, _ args: [Any?], clearIncoming: Bool = false) {
+        guard let rows = removeRows(filter, args, at: Date().timeIntervalSince1970) else { return }
+        cleanFiles(rows, sweepBefore: clearIncoming ? .infinity : nil)
+        if !rows.isEmpty { DB.changed?(rows.map(\.hash)) }
     }
 
-    /// Only images ClipBubble stored itself are deleted; screenshots, downloads and copied files belong to the user.
-    /// Deletes only files ClipBubble made: stored images everywhere, and on iPhone what you added (sent/) or received.
-    /// A file you copied in Finder or that landed in ~/Downloads on a computer is yours and stays, whatever its path.
-    private func removeFiles(_ clips: [Clip]) {
+    /// Select the rows and record the delete while holding the same write lock.
+    private func removeRows(_ filter: String, _ args: [Any?], at: Double, tombstone: Stamp? = nil,
+                            expireForgottenBefore: Double? = nil) -> [Clip]? {
+        var removed: [Clip] = []
+        guard transaction({
+            guard let rows = selectChecked(filter, args, preview: true) else { return false }
+            removed = rows
+            let upsert = "ON CONFLICT(hash) DO UPDATE SET at = max(at, excluded.at)"
+            if let tombstone {
+                guard run("INSERT INTO forgotten(hash, at) VALUES(?, ?) " + upsert, tombstone.hash, tombstone.time) else {
+                    return false
+                }
+            } else if !rows.isEmpty {
+                let source = filter.isEmpty ? "WHERE 1" : filter
+                guard execute("INSERT INTO forgotten(hash, at) SELECT hash, ? FROM clips " + source + " " + upsert,
+                              [at] + args) else { return false }
+            }
+            guard execute("DELETE FROM clips " + filter, args) else { return false }
+            if let expireForgottenBefore { return run("DELETE FROM forgotten WHERE at < ?", expireForgottenBefore) }
+            return true
+        }) else { return nil }
+        return removed
+    }
+
+    /// Check references after the deletion commits, under a write lock so another row can't claim a file during cleanup.
+    private func cleanFiles(_ rows: [Clip], sweepBefore cutoff: Double? = nil) {
+        guard cutoff != nil || rows.contains(where: {
+            $0.kind == "image" && $0.file != nil || Platform.os == "ios" && $0.kind == "file"
+        }) else { return }
+        _ = transaction {
+            guard let kept = referencedFiles() else { return false }
+            removeFiles(rows, keeping: kept)
+            if let cutoff { sweep(before: cutoff, keeping: kept) }
+            return true
+        }
+    }
+
+    private func referencedFiles() -> Set<String>? {
+        var kept: Set<String> = []
+        for (query, isPathList) in [("SELECT DISTINCT file FROM clips WHERE file IS NOT NULL", false),
+                                    ("SELECT DISTINCT text FROM clips WHERE kind = 'file'", true)] {
+            guard let s = prepare(query, []) else { return nil }
+            defer { sqlite3_finalize(s) }
+            while true {
+                let result = sqlite3_step(s)
+                if result == SQLITE_DONE { break }
+                guard result == SQLITE_ROW, let value = sqlite3_column_text(s, 0) else { return nil }
+                let text = String(cString: value)
+                let paths = isPathList ? text.split(separator: "\n").map(String.init) : [text]
+                kept.formUnion(paths.filter { $0.hasPrefix("/") }.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path })
+            }
+        }
+        return kept
+    }
+
+    /// Only images ClipBubble stored itself and files sent or received on iOS belong to the store.
+    private func removeFiles(_ clips: [Clip], keeping kept: Set<String>) {
         let sent = Paths.dir.appendingPathComponent("sent").resolvingSymlinksInPath().path
         let managed = [Paths.images.resolvingSymlinksInPath().path]
             + (Platform.os == "ios" ? [sent, receivedFolder("").deletingLastPathComponent().resolvingSymlinksInPath().path] : [])
         for c in clips {
             let files = c.kind == "image" ? [c.file].compactMap { $0 } : Platform.os == "ios" ? c.paths : []
-            for f in files {
+            for f in files where f.hasPrefix("/") {
                 let real = URL(fileURLWithPath: f).resolvingSymlinksInPath().path
-                guard managed.contains(where: { real.hasPrefix($0 + "/") }) else { continue }
-                try? FileManager.default.removeItem(atPath: real)
-                // A file added on the iPhone sits alone in a folder under sent/.
+                guard !kept.contains(real), managed.contains(where: { real.hasPrefix($0 + "/") }) else { continue }
+                // unlink and rmdir won't recursively remove other entries sharing a folder.
+                unlink(real)
                 let parent = (real as NSString).deletingLastPathComponent
-                if (parent as NSString).deletingLastPathComponent == sent { try? FileManager.default.removeItem(atPath: parent) }
+                if (parent as NSString).deletingLastPathComponent == sent { rmdir(parent) }
             }
         }
-    }
-
-    /// Records each delete with its time: folders re-import, and linked devices need to hear about it.
-    private func forget(_ clips: [Clip], at: Double = Date().timeIntervalSince1970) {
-        guard !clips.isEmpty else { return }
-        run("BEGIN")
-        for c in clips { run("INSERT OR REPLACE INTO forgotten(hash, at) SELECT hash, ? FROM clips WHERE id = ?", at, c.id) }
-        run("COMMIT")
-    }
-
-    func delete(id: Int64) {
-        let rows = select("WHERE id = ?", [id])
-        forget(rows)
-        removeFiles(rows)
-        run("DELETE FROM clips WHERE id = ?", id)
-        if !rows.isEmpty { DB.changed?(rows.map(\.hash)) }
-    }
-
-    func deleteAll() {
-        let rows = select("", [])
-        forget(rows)
-        removeFiles(rows)
-        run("DELETE FROM clips")
-        try? FileManager.default.removeItem(at: Paths.dir.appendingPathComponent("incoming"))
-        if !rows.isEmpty { DB.changed?(rows.map(\.hash)) }
     }
 
     // MARK: Sync
@@ -280,44 +331,56 @@ final class DB {
     }
 
     /// Adds an item from a linked device. Its image or files are marked remote until they arrive.
-    func insert(_ e: Entry, origin: String) {
+    @discardableResult
+    func insert(_ e: Entry, origin: String) -> Bool {
         let names = e.kind == "file" ? e.text : ""
-        run("""
+        guard run("""
             INSERT INTO clips(kind,text,source,hash,created,origin,remote) VALUES(?,?,?,?,?,?,?)
             ON CONFLICT(hash) DO UPDATE SET created = max(created, excluded.created)
-            """, e.kind, e.kind == "text" ? e.text : names, e.source, e.hash, e.time, origin, e.blobs.isEmpty ? 0 : 1)
+            """, e.kind, e.kind == "text" ? e.text : names, e.source, e.hash, e.time, origin, e.blobs.isEmpty ? 0 : 1) else { return false }
         DB.changed?([e.hash])
+        return true
     }
 
-    func bump(hash: String, to time: Double) {
-        run("UPDATE clips SET created = ? WHERE hash = ? AND created < ?", time, hash, time)
+    @discardableResult
+    func bump(hash: String, to time: Double) -> Bool {
+        guard run("UPDATE clips SET created = ? WHERE hash = ? AND created < ?", time, hash, time),
+              sqlite3_changes(h) > 0 else { return false }
         DB.changed?([hash])
+        return true
     }
 
     /// A delete from a linked device: removes the item unless it was copied again after that.
-    func tombstone(_ st: Stamp) {
-        let rows = select("WHERE hash = ? AND created <= ?", [st.hash, st.time])
-        removeFiles(rows)
-        run("DELETE FROM clips WHERE hash = ? AND created <= ?", st.hash, st.time)
-        run("INSERT INTO forgotten(hash, at) VALUES(?, ?) ON CONFLICT(hash) DO UPDATE SET at = max(at, excluded.at)", st.hash, st.time)
+    @discardableResult
+    func tombstone(_ st: Stamp) -> Bool {
+        guard let rows = removeRows("WHERE hash = ? AND created <= ?", [st.hash, st.time], at: st.time,
+                                    tombstone: st) else { return false }
+        cleanFiles(rows)
         DB.changed?([st.hash])
+        return true
     }
 
     /// An image or files arrived: point the item at them and make it pasteable.
-    func received(hash: String, file: String?, text: String?) {
-        if let text { run("UPDATE clips SET remote = 0, text = ? WHERE hash = ?", text, hash) }
-        else { run("UPDATE clips SET remote = 0, file = ? WHERE hash = ?", file, hash) }
+    @discardableResult
+    func received(hash: String, file: String?, text: String?) -> Bool {
+        let saved: Bool
+        if let text {
+            saved = run("UPDATE clips SET remote = 0, text = ? WHERE hash = ? AND remote = 1", text, hash)
+        } else {
+            saved = run("UPDATE clips SET remote = 0, file = ? WHERE hash = ? AND remote = 1", file, hash)
+        }
+        guard saved, sqlite3_changes(h) > 0 else { return false }
         DB.changed?([hash])
+        return true
     }
 
     /// Whether this was news: a device not seen before, or one with a new name.
     @discardableResult
     func saveDevice(id: String, name: String, os: String) -> Bool {
-        run("""
+        return run("""
             INSERT INTO devices(id,name,os) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, os=excluded.os
             WHERE name != excluded.name OR os != excluded.os
-            """, id, name, os)
-        return sqlite3_changes(h) > 0
+            """, id, name, os) && sqlite3_changes(h) > 0
     }
 
     func devices() -> [(id: String, name: String, os: String)] {
@@ -343,26 +406,35 @@ final class DB {
     /// Drops everything older than the 7-day retention window.
     func prune() {
         let cutoff = Date().timeIntervalSince1970 - Self.retention
-        removeFiles(select("WHERE created < ?", [cutoff]))
-        run("DELETE FROM clips WHERE created < ?", cutoff)
-        // A file older than the window is never re-imported, so the reminder can go a day after.
-        run("DELETE FROM forgotten WHERE at < ?", cutoff - 86400)
-        sweep(before: cutoff)
+        // Expiration is local: its tombstones are already outside the sync window.
+        guard let rows = removeRows("WHERE created < ?", [cutoff], at: cutoff,
+                                    expireForgottenBefore: cutoff - 86400) else { return }
+        cleanFiles(rows, sweepBefore: cutoff)
+        if !rows.isEmpty { DB.changed?(rows.map(\.hash)) }
     }
 
-    /// Images with no row, which older versions saved with Copied images off, and downloads cut off and never resumed.
-    /// Only ones older than the window, so a capture or a transfer in progress is safe.
-    private func sweep(before cutoff: Double) {
-        let kept = Set(select("", []).compactMap { $0.file.map { ($0 as NSString).lastPathComponent } })
-        for dir in [Paths.images, Paths.dir.appendingPathComponent("incoming")] {
+    /// Clean orphan images and abandoned staging files. Clear all also removes recent staging files.
+    private func sweep(before cutoff: Double, keeping kept: Set<String>) {
+        let incoming = Paths.dir.appendingPathComponent("incoming")
+        let clearIncoming = cutoff == .infinity
+        for dir in clearIncoming ? [incoming] : [Paths.images, incoming] {
             for f in (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [] {
-                guard !kept.contains(f.lastPathComponent),
+                guard !kept.contains(f.resolvingSymlinksInPath().path),
                       let at = try? f.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
                       at.timeIntervalSince1970 < cutoff else { continue }
-                try? FileManager.default.removeItem(at: f)
+                if dir == incoming {
+                    let fd = open(f.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW)
+                    guard fd >= 0 else { continue }
+                    if flock(fd, LOCK_EX | LOCK_NB) == 0 { unlink(f.path) }
+                    close(fd)
+                } else {
+                    unlink(f.path)
+                }
             }
         }
+        if clearIncoming { rmdir(incoming.path) }
     }
+
 }
 
 /// What gets saved. Off means it isn't captured and existing items are hidden everywhere, MCP included.

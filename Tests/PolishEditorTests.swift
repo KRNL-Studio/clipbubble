@@ -51,6 +51,38 @@ private func editorPNG(_ image: CGImage) -> Data {
     NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])!
 }
 
+private func editorRedactionsOutsideCrop(_ dir: URL) {
+    let model = PolishModel(url: dir.appendingPathComponent("cropped-secrets.png"), image: editorImage())
+    model.doc.style = PolishPreset.builtIn[0].style
+    let previousInk = model.ink
+    model.ink.redaction = .solid
+    defer { model.ink = previousInk }
+
+    let left = CGRect(x: 20, y: 20, width: 100, height: 80)
+    let right = left.offsetBy(dx: 400, dy: 0)
+    model.detectRedactions = { _, _, _ in [(.email, left), (.email, right)] }
+    model.tool = .crop
+    model.cropDraft = CGRect(x: 0, y: 0, width: 200, height: 160)
+    model.autoRedact()
+    let scanFinished = editorUntil { model.busy == nil }
+    let masks = model.doc.marks.filter(\.auto).map(\.rect)
+    check(scanFinished && masks.count == 2 && masks.contains(left) && masks.contains(right)
+          && model.toast?.text == "Hid 2 things · 1 in this crop", "Find and Hide keeps all source masks and counts the visible draft crop")
+
+    model.cropDraft = CGRect(x: 200, y: 0, width: 200, height: 160)
+    model.finishCrop()
+    model.autoRedact()
+    check(editorUntil { model.busy == nil } && model.toast?.text == "Hid 2 things · 0 in this crop",
+          "Find and Hide reports matches even when all are outside the crop")
+
+    model.resetCrop()
+    let exported = model.exportFile().flatMap(PolishRenderer.load).map { NSBitmapImageRep(cgImage: $0) }
+    check(exported?.pixelsWide == 800 && (exported?.colorAt(x: 60, y: 60)?.redComponent ?? 1) < 0.2
+          && (exported?.colorAt(x: 460, y: 60)?.redComponent ?? 1) < 0.2
+          && (exported?.colorAt(x: 260, y: 60)?.redComponent ?? 0) > 0.9,
+          "resetting the crop exports both detected regions covered and leaves other pixels visible")
+}
+
 private func editorExports(_ dir: URL) throws {
     let defaults = UserDefaults.standard
     let oneX = defaults.object(forKey: "polish.export1x"), folder = defaults.object(forKey: "polish.folder")
@@ -856,6 +888,7 @@ func polishEditorTests() {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try editorHandoffIsolation()
         try editorExports(dir)
+        editorRedactionsOutsideCrop(dir)
         try editorCropBadgeChecks(dir)
         MainActor.assumeIsolated { inspectorHintChecks() }
         editorThumbnailChecks(dir)

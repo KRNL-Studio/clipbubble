@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 
 func onboardingTests() {
     let suite = "clipbubble-onboarding-tests-" + UUID().uuidString
@@ -75,6 +76,10 @@ func onboardingTests() {
     check(waitForOnboarding { state.checkingFolder == nil }, "screenshot probe result returns")
     check(state.folderAccess(.screenshots, at: shots) == .allowed && watcherSnapshots.last == [.screenshots],
           "a successful read starts only the requested watcher immediately")
+    state.cancel()
+    state.begin()
+    check(state.step == .folders && state.canWatch(.screenshots) && !state.canWatch(.downloads),
+          "reopening unfinished setup resumes on the same step with approved access intact")
 
     state.chooseScreenshotFolder(custom)
     check(state.displayedURL(.screenshots) == custom && state.checkingFolder == nil,
@@ -112,7 +117,7 @@ func onboardingTests() {
     state.next()
     check(state.isRunning && state.step == .accessibility && state.accessibility == true && !state.autoPaste,
           "running setup again shows existing Accessibility access and preserves the Auto-paste preference")
-    state.finish()
+    state.cancel()
     check(!state.needsSetup && completions == 1 && prefChanges.count == editsBeforeRerun
           && defaults.string(forKey: "screenshotFolder") == custom.path,
           "closing a setup rerun keeps completion and preferences intact")
@@ -146,6 +151,64 @@ func onboardingTests() {
     check(dragSource.acceptsFirstMouse(for: nil), "the app tile accepts the first click while System Settings has focus")
 
     accessibilityDragPanelTests(defaults: defaults)
+    onboardingWindowCloseTest()
+}
+
+private func onboardingWindowCloseTest() {
+    let suite = "clipbubble-onboarding-close-" + UUID().uuidString
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    defaults.set(true, forKey: "save.screenshots")
+    let screenshots = URL(fileURLWithPath: "/fake/Screenshots")
+    let downloads = URL(fileURLWithPath: "/fake/Downloads")
+    let custom = URL(fileURLWithPath: "/fake/Unconfirmed Screenshots")
+    let entered = DispatchSemaphore(value: 0)
+    let finishRead = DispatchSemaphore(value: 0)
+    let state = OnboardingState(defaults: defaults, isTrusted: { false }, readFolder: { url in
+        guard url == custom else { return false }
+        entered.signal()
+        return finishRead.wait(timeout: .now() + 2) == .success
+    }, folderURL: { $0 == .screenshots ? screenshots : downloads })
+    var completions = 0
+    state.didCompleteFirstRun = { completions += 1 }
+    state.setFolderPreference = { defaults.set($1, forKey: "save." + $0.rawValue) }
+
+    let controller = AppWindow(model: Model(), onboarding: state)
+    controller.show()
+    guard let window = controller.window else {
+        check(false, "opening unfinished setup creates a window")
+        return
+    }
+    defer { if window.isVisible { window.close() } }
+    state.next()
+    state.skip()
+    state.chooseScreenshotFolder(custom)
+    state.requestFolder(.screenshots)
+    check(entered.wait(timeout: .now() + 1) == .success && state.checkingFolder == .screenshots,
+          "the folder check is pending when the window closes")
+
+    window.performClose(nil)
+    check(!window.isVisible && !state.isRunning && state.checkingFolder == nil
+          && !(window.contentViewController is NSHostingController<OnboardingView>) && window.frameAutosaveName == "ClipBubbleWindow",
+          "closing setup restores the main window and ends the active session")
+    check(state.needsSetup && completions == 0 && !defaults.bool(forKey: OnboardingState.shownWindowKey)
+          && defaults.bool(forKey: "save.screenshots") && defaults.object(forKey: "save.downloads") == nil,
+          "closing first-run setup preserves completion and folder preferences")
+
+    controller.show()
+    check(window.isVisible && state.isRunning && state.step == .folders && state.displayedURL(.screenshots) == custom,
+          "reopening first-run setup resumes the folder step")
+    state.requestFolder(.downloads)
+    finishRead.signal()
+    check(waitForOnboarding { state.checkingFolder == nil } && state.folderAccess(.screenshots, at: custom) == .unchecked
+          && defaults.object(forKey: "screenshotFolder") == nil,
+          "a result from the closed session cannot approve a folder after reopening")
+
+    state.skip()
+    state.finish()
+    check(!state.needsSetup && completions == 1 && !defaults.bool(forKey: "save.screenshots")
+          && defaults.object(forKey: "save.downloads") as? Bool == false,
+          "explicitly finishing setup commits the decision to leave unapproved folders off")
 }
 
 private func accessibilityDragPanelTests(defaults: UserDefaults) {
@@ -191,6 +254,12 @@ private func accessibilityDragPanelTests(defaults: UserDefaults) {
     check(companion.panel == nil && returns == 1, "dismissing the companion suppresses automatic return to setup")
 
     trusted = false
+    check(companion.show(on: screen), "an untrusted setup can show the companion before cancelling")
+    state.cancel()
+    check(!state.isRunning && companion.panel == nil && returns == 1,
+          "cancelling setup dismisses the companion without reactivating ClipBubble")
+    state.begin()
+    state.next()
     check(companion.show(on: screen), "an untrusted setup can show the companion before finishing")
     state.finish()
     check(companion.panel == nil && returns == 1, "finishing setup dismisses the companion without reactivating ClipBubble")

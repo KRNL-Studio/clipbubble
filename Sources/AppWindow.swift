@@ -88,7 +88,7 @@ final class AppWindow: NSObject, NSWindowDelegate {
     let model: Model
     let nav = AppNav()
     let history: HistoryBrowser
-    let onboarding = OnboardingState()
+    let onboarding: OnboardingState
     private(set) var window: NSWindow?
     private var frameBeforeSetup: NSRect?
     private lazy var accessibilityDrag = AccessibilityDragPanelController(state: onboarding) { [weak self] in
@@ -96,8 +96,9 @@ final class AppWindow: NSObject, NSWindowDelegate {
         self.reveal(window)
     }
 
-    init(model: Model) {
+    init(model: Model, onboarding: OnboardingState = OnboardingState()) {
         self.model = model
+        self.onboarding = onboarding
         history = HistoryBrowser(model: model)
         super.init()
         nav.runSetup = { [weak self] in self?.showSetup() }
@@ -145,10 +146,21 @@ final class AppWindow: NSObject, NSWindowDelegate {
         if accessibilityDrag.show(on: window?.screen ?? NSScreen.main) { Access.openAccessibilitySettings() }
     }
 
-    private func finishSetup(landingOn page: AppPage? = nil) {
+    private func finishSetup(landingOn page: AppPage) {
         guard onboarding.isRunning, let w = window else { return }
         onboarding.finish()
-        if let page { nav.page = page }
+        nav.page = page
+        restoreMainWindow(w)
+        show(page)
+    }
+
+    private func cancelSetup() {
+        guard onboarding.isRunning, let w = window else { return }
+        onboarding.cancel()
+        restoreMainWindow(w)
+    }
+
+    private func restoreMainWindow(_ w: NSWindow) {
         installMainContent(in: w)
         if let frameBeforeSetup {
             w.minSize = NSSize(width: 760, height: 500)
@@ -156,7 +168,6 @@ final class AppWindow: NSObject, NSWindowDelegate {
             w.setFrameAutosaveName(Self.frameName)
             self.frameBeforeSetup = nil
         }
-        if let page { show(page) }
     }
 
     private func installMainContent(in w: NSWindow) {
@@ -200,7 +211,7 @@ final class AppWindow: NSObject, NSWindowDelegate {
     func windowWillClose(_ n: Notification) {
         cancelRecording()
         nav.windowVisibility.send(false)
-        finishSetup()
+        cancelSetup()
         if let w = n.object as? NSWindow { Presence.closed(w) }
     }
 

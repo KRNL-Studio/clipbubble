@@ -423,12 +423,11 @@ final class PolishModel: ObservableObject {
                     return
                 }
                 let crop = (self.tool == .crop ? self.validCropDraft : nil) ?? self.doc.crop
-                let found = detected.filter { crop.intersects($0.1) }
-                if !found.isEmpty || self.doc.marks.contains(where: \.auto) {
+                if !detected.isEmpty || self.doc.marks.contains(where: \.auto) {
                     self.history.record(self.doc)
                     self.doc.marks.removeAll(where: \.auto)
                 }
-                for (_, r) in found {
+                for (_, r) in detected {
                     var m = Mark(.redact, [r.origin, CGPoint(x: r.maxX, y: r.maxY)])
                     m.redaction = self.ink.redaction
                     m.color = RGBA(hex: 0x1C1C1E)
@@ -436,9 +435,14 @@ final class PolishModel: ObservableObject {
                     self.doc.marks.insert(m, at: 0)
                 }
                 self.selection = nil
-                let n = found.count
-                self.say(n == 0 ? "Nothing sensitive found" : "Hid \(n) \(n == 1 ? "thing" : "things") · select one to remove it",
-                         n == 0 ? "checkmark.shield" : "eye.slash")
+                if detected.isEmpty {
+                    self.say("Nothing sensitive found", "checkmark.shield")
+                } else {
+                    let visible = detected.filter { !crop.intersection($0.1).isEmpty }.count
+                    let total = detected.count
+                    let detail = visible == total ? "select one to remove it" : "\(visible) in this crop"
+                    self.say("Hid \(total) \(total == 1 ? "thing" : "things") · \(detail)", "eye.slash")
+                }
                 self.activity = nil
                 let exports = self.queuedExports
                 self.queuedExports.removeAll()

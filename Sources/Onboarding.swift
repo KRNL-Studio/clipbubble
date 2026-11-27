@@ -73,13 +73,16 @@ final class OnboardingState: ObservableObject {
     func begin() {
         guard !isRunning else { return }
         session = UUID()
-        step = .welcome
-        accessibility = nil
+        // Reopening unfinished setup keeps its place and confirmed folder access.
+        if !needsSetup {
+            step = .welcome
+            accessibility = nil
+            chosenScreenshotFolder = nil
+            folderResults = [:]
+        }
         autoPaste = defaults.object(forKey: "autoPaste") as? Bool ?? true
-        checkingFolder = nil
-        chosenScreenshotFolder = nil
-        folderResults = [:]
         isRunning = true
+        enterCurrentStep()
     }
 
     func next() { move(to: Step(rawValue: step.rawValue + 1)) }
@@ -90,7 +93,11 @@ final class OnboardingState: ObservableObject {
         guard isRunning, checkingFolder == nil, let target else { return }
         if step == .accessibility { endAccessibilityStep() }
         step = target
-        if target == .accessibility {
+        enterCurrentStep()
+    }
+
+    private func enterCurrentStep() {
+        if step == .accessibility {
             let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
                 self?.refreshAccessibility()
             }
@@ -98,12 +105,11 @@ final class OnboardingState: ObservableObject {
             // Keep polling during AppKit event tracking as well as normal run-loop activity.
             RunLoop.main.add(timer, forMode: .common)
         }
-        if target == .accessibility || target == .ready { refreshAccessibility() }
+        refreshAccessibility()
     }
 
     func finish() {
         guard isRunning else { return }
-        if step == .accessibility { endAccessibilityStep() }
         if needsSetup {
             // Materialize the choices before opening the gate for the normal capture services.
             for folder in OnboardingFolder.allCases where !canWatch(folder) {
@@ -113,6 +119,12 @@ final class OnboardingState: ObservableObject {
             defaults.set(true, forKey: Self.shownWindowKey)
             didCompleteFirstRun()
         }
+        cancel()
+    }
+
+    func cancel() {
+        guard isRunning else { return }
+        if step == .accessibility { endAccessibilityStep() }
         isRunning = false
         checkingFolder = nil
     }

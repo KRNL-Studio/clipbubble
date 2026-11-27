@@ -39,6 +39,7 @@ final class ShotCard {
     private var copyFeedbackWork: DispatchWorkItem?
     private var hovering = false
     private var dragging = false
+    private var generation = 0
 
     var onPolish: (URL) -> Void = { _ in }
     var onCopy: (URL) -> Bool = { _ in false }
@@ -79,21 +80,23 @@ final class ShotCard {
             self.hovering = on
             if on || self.dragging { self.hideWork?.cancel() } else { self.schedule(after: 2.5) }
         }
-        state.dragStarted = { [weak self] in
-            guard let self else { return }
-            self.dragging = true
-            self.hideWork?.cancel()
-        }
-        state.dragEnded = { [weak self] dropped in
-            guard let self else { return }
-            self.dragging = false
-            if dropped { self.hide() }
-            else if !self.hovering { self.schedule(after: 2.5) }
-        }
     }
 
     /// Slides out of the bubble's side of the screen, level with the bubble.
     func show(_ url: URL, beside b: NSRect, in area: NSRect) {
+        generation += 1
+        let generation = self.generation
+        state.dragStarted = { [weak self] in
+            guard let self, self.generation == generation else { return }
+            self.dragging = true
+            self.hideWork?.cancel()
+        }
+        state.dragEnded = { [weak self] dropped in
+            guard let self, self.generation == generation else { return }
+            self.dragging = false
+            if dropped { self.hide() }
+            else if !self.hovering { self.schedule(after: 2.5) }
+        }
         state.url = url
         dragging = false
         copyFeedbackWork?.cancel()
@@ -125,6 +128,7 @@ final class ShotCard {
         hideWork?.cancel()
         guard panel.isVisible else { return }
         guard animated else { finishHide(); return }
+        let generation = self.generation
         let f = panel.frame
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.18
@@ -132,7 +136,7 @@ final class ShotCard {
             panel.animator().alphaValue = 0
             panel.animator().setFrame(f.offsetBy(dx: 0, dy: -8), display: true)
         }, completionHandler: { [weak self] in
-            guard let self, self.panel.isVisible, self.panel.alphaValue < 0.01 else { return }
+            guard let self, self.generation == generation, self.panel.isVisible, self.panel.alphaValue < 0.01 else { return }
             self.finishHide()
         })
     }
@@ -240,6 +244,7 @@ private struct ShotDragView: NSViewRepresentable {
         var url: URL
         var onStart: () -> Void
         var onEnd: (_ dropped: Bool) -> Void
+        private var activeDragEnd: ((_ dropped: Bool) -> Void)?
 
         init(url: URL, onStart: @escaping () -> Void, onEnd: @escaping (_ dropped: Bool) -> Void) {
             self.url = url
@@ -257,6 +262,7 @@ private struct ShotDragView: NSViewRepresentable {
         override func mouseDown(with event: NSEvent) {}
 
         override func mouseDragged(with event: NSEvent) {
+            guard activeDragEnd == nil else { return }
             let item = NSDraggingItem(pasteboardWriter: url as NSURL)
             let preview = Thumbs.cached(url.path, 640) ?? NSImage(contentsOf: url) ?? NSWorkspace.shared.icon(forFile: url.path)
             let side: CGFloat = 110
@@ -266,6 +272,8 @@ private struct ShotDragView: NSViewRepresentable {
             let p = convert(event.locationInWindow, from: nil)
             item.setDraggingFrame(NSRect(x: p.x - size.width / 2, y: p.y - size.height / 2, width: size.width, height: size.height),
                                   contents: preview)
+            // SwiftUI may update this view before AppKit finishes the drag.
+            activeDragEnd = onEnd
             onStart()
             beginDraggingSession(with: [item], event: event, source: self)
         }
@@ -275,7 +283,9 @@ private struct ShotDragView: NSViewRepresentable {
         }
 
         func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
-            onEnd(operation != [])
+            let finish = activeDragEnd
+            activeDragEnd = nil
+            finish?(!operation.isEmpty)
         }
     }
 }

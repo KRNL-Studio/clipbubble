@@ -51,6 +51,7 @@ func windowTests() {
 
     historyRecycledIDTest(model)
     shotCardDragDismissTest()
+    shotCardReplacementTest()
 }
 
 private func shotCardDragDismissTest() {
@@ -72,6 +73,30 @@ private func shotCardDragDismissTest() {
         RunLoop.main.run(until: Date().addingTimeInterval(0.02))
     }
     check(!card.isVisible && hidden == 1, "dropping a dragged screenshot hides the shot card immediately")
+}
+
+private func shotCardReplacementTest() {
+    let card = ShotCard()
+    let bubble = NSRect(x: 900, y: 20, width: 64, height: 64)
+    let screen = NSRect(x: 0, y: 0, width: 1000, height: 800)
+    let first = testHome.appendingPathComponent("shot-first.png")
+    let second = testHome.appendingPathComponent("shot-second.png")
+    var hidden = 0
+    card.onHidden = { hidden += 1 }
+    defer { card.hide(animated: false) }
+
+    card.show(first, beside: bubble, in: screen)
+    card.state.dragStarted()
+    let finishFirstDrag = card.state.dragEnded
+    card.show(second, beside: bubble, in: screen)
+    finishFirstDrag(true)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+    check(card.isVisible && card.state.url == second && hidden == 0, "an older drag cannot dismiss the replacement shot card")
+
+    card.hide()
+    card.show(first, beside: bubble, in: screen)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+    check(card.isVisible && card.state.url == first && hidden == 0, "an older fade-out cannot dismiss the replacement shot card")
 }
 
 private func historyRecycledIDTest(_ model: Model) {

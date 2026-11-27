@@ -25,7 +25,7 @@ static class Program
         var failures = 0;
         try
         {
-            foreach (var (name, test) in All())
+            foreach (var (name, test) in All().Concat(DirectTests.All()))
             {
                 try { test(); Console.WriteLine("ok   " + name); }
                 catch (Exception e) { failures++; Console.WriteLine("FAIL " + name + "\n     " + e.Message); }

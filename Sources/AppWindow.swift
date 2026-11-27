@@ -91,6 +91,10 @@ final class AppWindow: NSObject, NSWindowDelegate {
     let onboarding = OnboardingState()
     private(set) var window: NSWindow?
     private var frameBeforeSetup: NSRect?
+    private lazy var accessibilityDrag = AccessibilityDragPanelController(state: onboarding) { [weak self] in
+        guard let self, let window = self.window else { return }
+        self.reveal(window)
+    }
 
     init(model: Model) {
         self.model = model
@@ -115,7 +119,7 @@ final class AppWindow: NSObject, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func showSetup() {
+    func showSetup() {
         let w = window ?? make()
         if !onboarding.isRunning {
             onboarding.begin()
@@ -138,16 +142,7 @@ final class AppWindow: NSObject, NSWindowDelegate {
     }
 
     private func openAccessibilitySettings() {
-        if let w = window, !w.styleMask.contains(.fullScreen), let screen = w.screen ?? NSScreen.main {
-            let area = screen.visibleFrame
-            var frame = w.frame
-            frame.size.width = min(frame.width, max(w.minSize.width, area.width / 2 - 24), area.width)
-            frame.size.height = min(frame.height, area.height)
-            frame.origin.x = area.minX + min(20, area.width - frame.width)
-            frame.origin.y = min(max(frame.minY, area.minY), area.maxY - frame.height)
-            w.setFrame(frame, display: true)
-        }
-        Access.openAccessibilitySettings()
+        if accessibilityDrag.show(on: window?.screen ?? NSScreen.main) { Access.openAccessibilitySettings() }
     }
 
     private func finishSetup(landingOn page: AppPage? = nil) {
@@ -246,6 +241,7 @@ enum Presence {
 /// while a window is open: ⌘Q or ⌘W pressed in the panel must not quit ClipBubble or close anything.
 enum MainMenu {
     static var openPage: (AppPage) -> Void = { _ in }
+    static var runSetup: () -> Void = {}
 
     static func install(full: Bool) {
         let main = NSMenu()
@@ -254,6 +250,7 @@ enum MainMenu {
             app.addItem(item("About ClipBubble", #selector(Actions.about), ""))
             app.addItem(.separator())
             app.addItem(item("Settings…", #selector(Actions.settings), ","))
+            app.addItem(item("Run Setup…", #selector(Actions.setup), ""))
             app.addItem(.separator())
             app.addItem(item("Quit ClipBubble", #selector(NSApplication.terminate(_:)), "q", target: NSApp))
             main.addItem(holder(app))
@@ -294,6 +291,7 @@ enum MainMenu {
         static let shared = Actions()
         @objc func about() { MainMenu.openPage(.about) }
         @objc func settings() { MainMenu.openPage(.general) }
+        @objc func setup() { MainMenu.runSetup() }
     }
 }
 

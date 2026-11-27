@@ -140,6 +140,60 @@ func onboardingTests() {
     let dragPasteboard = NSPasteboard(name: .init("clipbubble-onboarding-drag-" + UUID().uuidString))
     defer { dragPasteboard.releaseGlobally() }
     check(dragURL.writableTypes(for: dragPasteboard).contains(.fileURL), "the drag writer advertises a Finder-style file URL")
+
+    let dragSource = AppBundleDragView.DragSource(frame: .zero)
+    check(!dragSource.mouseDownCanMoveWindow, "dragging the app tile starts a file drag instead of moving the panel")
+    check(dragSource.acceptsFirstMouse(for: nil), "the app tile accepts the first click while System Settings has focus")
+
+    accessibilityDragPanelTests(defaults: defaults)
+}
+
+private func accessibilityDragPanelTests(defaults: UserDefaults) {
+    var trusted = false
+    let state = OnboardingState(defaults: defaults, isTrusted: { trusted })
+    var returns = 0
+    let companion = AccessibilityDragPanelController(state: state) { returns += 1 }
+    let screen = NSScreen.main
+
+    state.begin()
+    check(!companion.show(on: screen), "the companion only opens on the Accessibility step")
+    state.next()
+    check(companion.show(on: screen), "opening Accessibility Settings shows the drag companion")
+    let panel = companion.panel
+    check(panel?.isVisible == true && panel?.isFloatingPanel == true && panel?.level == .floating
+          && panel?.hidesOnDeactivate == false, "the companion stays visible above other apps when ClipBubble deactivates")
+    check(panel?.collectionBehavior.contains([.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]) == true,
+          "the companion can follow System Settings across Spaces and full-screen Spaces")
+    check(panel?.styleMask.contains(.nonactivatingPanel) == true && panel?.canBecomeKey == false
+          && panel?.isMovableByWindowBackground == true, "the companion can be moved without taking keyboard focus")
+    check(companion.show(on: screen) && companion.panel === panel, "opening Settings again reuses the same companion")
+
+    trusted = true
+    check(waitForOnboarding { returns == 1 }, "the state polls for access and returns to setup without a SwiftUI view")
+    check(state.accessibility == true && state.autoPaste && companion.panel == nil && panel?.isVisible == false,
+          "granting access enables auto-paste and dismisses the companion")
+    check(!companion.show(on: screen) && companion.panel == nil && returns == 1,
+          "existing access leaves the companion dismissed and returns to setup only once")
+
+    trusted = false
+    check(companion.show(on: screen), "reopening Settings refreshes a stale permission result")
+    state.back()
+    check(companion.panel == nil && returns == 1, "Back dismisses the companion without returning to setup")
+    state.next()
+    check(companion.show(on: screen), "returning to Accessibility allows reopening the companion")
+    state.skip()
+    check(companion.panel == nil && returns == 1, "Skip dismisses the companion without returning to setup")
+    state.back()
+    check(companion.show(on: screen), "the companion can reopen after skipping Accessibility")
+    companion.dismiss()
+    trusted = true
+    state.refreshAccessibility()
+    check(companion.panel == nil && returns == 1, "dismissing the companion suppresses automatic return to setup")
+
+    trusted = false
+    check(companion.show(on: screen), "an untrusted setup can show the companion before finishing")
+    state.finish()
+    check(companion.panel == nil && returns == 1, "finishing setup dismisses the companion without reactivating ClipBubble")
 }
 
 private func waitForOnboarding(_ test: () -> Bool) -> Bool {

@@ -278,11 +278,12 @@ final class FloatingPanel: NSPanel {
     override var canBecomeKey: Bool { keyable }
 }
 
-/// Dark frosted glass, masked to a rounded rectangle (a circle when radius is half the size).
-func glass(frame: NSRect, radius: CGFloat) -> NSVisualEffectView {
+/// Frosted glass masked to a rounded rectangle (a circle when radius is half the size).
+func glass(frame: NSRect, radius: CGFloat, material: NSVisualEffectView.Material = .hudWindow,
+           blendingMode: NSVisualEffectView.BlendingMode = .behindWindow) -> NSVisualEffectView {
     let v = NSVisualEffectView(frame: frame)
-    v.material = .hudWindow
-    v.blendingMode = .behindWindow
+    v.material = material
+    v.blendingMode = blendingMode
     v.state = .active
     v.autoresizingMask = [.width, .height]
     let side = radius * 2 + 1
@@ -888,6 +889,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appWindow.onboarding.setFolderPreference = { [weak model] folder, enabled in model?.setPref(folder.rawValue, enabled) }
         appWindow.onboarding.didCompleteFirstRun = { [weak self] in self?.refreshFolderServices() }
         MainMenu.openPage = { [weak self] in self?.appWindow.show($0) }
+        MainMenu.runSetup = { [weak self] in self?.openSetupWindow() }
 
         bubble = FloatingPanel(size: NSSize(width: 64, height: 64), keyable: false)
         let view = BubbleView(frame: NSRect(x: 0, y: 0, width: 64, height: 64))
@@ -1417,6 +1419,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appWindow.show(page)
     }
 
+    private func openSetupWindow() {
+        resumePanel = true
+        hidePanel()
+        appWindow.showSetup()
+    }
+
     /// Right-clicking the bubble.
     private func bubbleMenu() -> NSMenu {
         let m = NSMenu()
@@ -1425,6 +1433,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let i = MenuAction.item(title) { [weak self] in self?.openAppWindow(page) }
             m.addItem(i)
         }
+        m.addItem(MenuAction.item("Run Setup…") { [weak self] in self?.openSetupWindow() })
         m.addItem(.separator())
         m.addItem(MenuAction.item("Quit ClipBubble") { NSApp.terminate(nil) })
         return m

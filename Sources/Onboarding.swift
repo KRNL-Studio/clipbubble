@@ -47,8 +47,11 @@ final class OnboardingState: ObservableObject {
     private let folderURL: (OnboardingFolder) -> URL?
     private let probeQueue = DispatchQueue(label: "clipbubble.setup.folder", qos: .userInitiated)
     private var session = UUID()
+    private var accessibilityTimer: Timer?
     var setFolderPreference: (OnboardingFolder, Bool) -> Void = { Prefs.set($0.rawValue, $1) }
     var didCompleteFirstRun: () -> Void = {}
+    var didGrantAccessibility: () -> Void = {}
+    var didLeaveAccessibilityStep: () -> Void = {}
 
     init(defaults: UserDefaults = .standard, isTrusted: @escaping () -> Bool = AXIsProcessTrusted,
          readFolder: @escaping (URL?) -> Bool = FolderWatcher.canRead,
@@ -62,6 +65,8 @@ final class OnboardingState: ObservableObject {
             defaults.set(true, forKey: Self.completionKey)
         }
     }
+
+    deinit { accessibilityTimer?.invalidate() }
 
     var needsSetup: Bool { !defaults.bool(forKey: Self.completionKey) }
 
@@ -83,12 +88,22 @@ final class OnboardingState: ObservableObject {
 
     private func move(to target: Step?) {
         guard isRunning, checkingFolder == nil, let target else { return }
+        if step == .accessibility { endAccessibilityStep() }
         step = target
+        if target == .accessibility {
+            let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+                self?.refreshAccessibility()
+            }
+            accessibilityTimer = timer
+            // Keep polling during AppKit event tracking as well as normal run-loop activity.
+            RunLoop.main.add(timer, forMode: .common)
+        }
         if target == .accessibility || target == .ready { refreshAccessibility() }
     }
 
     func finish() {
         guard isRunning else { return }
+        if step == .accessibility { endAccessibilityStep() }
         if needsSetup {
             // Materialize the choices before opening the gate for the normal capture services.
             for folder in OnboardingFolder.allCases where !canWatch(folder) {
@@ -102,11 +117,19 @@ final class OnboardingState: ObservableObject {
         checkingFolder = nil
     }
 
+    private func endAccessibilityStep() {
+        accessibilityTimer?.invalidate()
+        accessibilityTimer = nil
+        didLeaveAccessibilityStep()
+    }
+
     func refreshAccessibility() {
         guard isRunning, step == .accessibility || step == .ready else { return }
         let trusted = isTrusted()
+        let granted = step == .accessibility && accessibility == false && trusted
         if step == .accessibility, trusted, accessibility == false || needsSetup { enableAutoPaste() }
         if accessibility != trusted { accessibility = trusted }
+        if granted { didGrantAccessibility() }
     }
 
     func enableAutoPaste() {
@@ -174,6 +197,7 @@ struct AppBundleDragView: NSViewRepresentable {
     final class DragSource: NSView, NSDraggingSource {
         override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
 
+        override var mouseDownCanMoveWindow: Bool { false }
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
         override func mouseDown(with event: NSEvent) {}
@@ -188,6 +212,146 @@ struct AppBundleDragView: NSViewRepresentable {
 
         func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
             context == .outsideApplication ? .copy : []
+        }
+    }
+}
+
+final class AccessibilityDragPanel: NSPanel {
+    init(dismiss: @escaping () -> Void) {
+        let frame = NSRect(x: 0, y: 0, width: 310, height: 136)
+        super.init(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        isFloatingPanel = true
+        level = .floating
+        hidesOnDeactivate = false
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        isMovableByWindowBackground = true
+
+        let container = glass(frame: frame, radius: 18, material: .popover, blendingMode: .behindWindow)
+        let host = ClickThroughHostingView(rootView: AccessibilityDragCard(dismiss: dismiss))
+        host.frame = container.bounds
+        host.autoresizingMask = [.width, .height]
+        container.addSubview(host)
+        contentView = container
+    }
+
+    override var canBecomeKey: Bool { false }
+}
+
+final class AccessibilityDragPanelController {
+    private let state: OnboardingState
+    private(set) var panel: AccessibilityDragPanel?
+
+    init(state: OnboardingState, returnToSetup: @escaping () -> Void) {
+        self.state = state
+        state.didLeaveAccessibilityStep = { [weak self] in self?.dismiss() }
+        state.didGrantAccessibility = { [weak self] in
+            guard let self, self.panel != nil else { return }
+            self.dismiss()
+            returnToSetup()
+        }
+    }
+
+    /// Returns whether setup is still waiting for access and should open System Settings.
+    func show(on screen: NSScreen?) -> Bool {
+        guard state.isRunning, state.step == .accessibility else { return false }
+        state.refreshAccessibility()
+        guard state.accessibility != true else {
+            dismiss()
+            return false
+        }
+        if let panel {
+            panel.orderFrontRegardless()
+            return true
+        }
+
+        let panel = AccessibilityDragPanel { [weak self] in self?.dismiss() }
+        if let area = screen?.visibleFrame {
+            panel.setFrameOrigin(NSPoint(x: area.minX + 24, y: area.midY - panel.frame.height / 2))
+        }
+        self.panel = panel
+        panel.orderFrontRegardless()
+        return true
+    }
+
+    func dismiss() {
+        panel?.orderOut(nil)
+        panel = nil
+    }
+}
+
+private struct AppBundleDragTile: View {
+    static let bundled = AppBundleDragView.bundleFileURL.pathExtension == "app"
+    static let name = bundled ? "ClipBubble.app" : Bundle.main.bundleURL.lastPathComponent
+    static let label = bundled ? "Drag ClipBubble into Accessibility" : "Drag \(name)"
+
+    var width: CGFloat = 106
+
+    var body: some View {
+        VStack(spacing: 3) {
+            Image(nsImage: NSApp.applicationIconImage).resizable().aspectRatio(contentMode: .fit)
+                .frame(width: 64, height: 64)
+            Text(Self.name).font(.system(size: 11, weight: .medium)).lineLimit(1)
+        }
+        .frame(width: width, height: 91)
+        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.primary.opacity(0.12)))
+        .accessibilityHidden(true)
+        .overlay { AppBundleDragView(label: Self.label) }
+    }
+}
+
+private struct AccessibilityDragArrow: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    var size: CGFloat = 17
+
+    var body: some View {
+        Image(systemName: "arrow.right")
+            .font(.system(size: size, weight: .semibold))
+            .foregroundStyle(Color.accentColor)
+            .symbolEffect(.pulse, options: .repeating, isActive: !reduceMotion)
+            .accessibilityHidden(true)
+    }
+}
+
+private struct AccessibilityDragCard: View {
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            AppBundleDragTile(width: 94)
+            AccessibilityDragArrow(size: 15)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Drag into Accessibility").font(.system(size: 13, weight: .semibold))
+                Text("Drop ClipBubble.app onto the list in System Settings.")
+                    .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Label("Waiting for access…", systemImage: "clock")
+                    .font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
+                    .padding(.horizontal, 7).padding(.vertical, 3)
+                    .background(Color.primary.opacity(0.07), in: Capsule())
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay {
+            RoundedRectangle(cornerRadius: 18).strokeBorder(Color.primary.opacity(0.14))
+                .allowsHitTesting(false)
+        }
+        .overlay(alignment: .topTrailing) {
+            Button(action: dismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+                    .frame(width: 24, height: 24)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(5)
+            .help("Dismiss drag card")
+            .accessibilityLabel("Dismiss drag card")
         }
     }
 }
@@ -229,13 +393,6 @@ struct OnboardingView: View {
             footer
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .task(id: state.step) { @MainActor in
-            guard state.step == .accessibility else { return }
-            while !Task.isCancelled {
-                state.refreshAccessibility()
-                try? await Task.sleep(for: .milliseconds(500))
-            }
-        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             state.refreshAccessibility()
             loginEnabled = LoginItem.on
@@ -378,39 +535,22 @@ struct OnboardingView: View {
                     status("Waiting for access", symbol: "clock", tint: .secondary)
                 }
                 .controlSize(.large)
-                Text("If ClipBubble is already listed, turn it on. You can also use the + button to select ClipBubble.app.")
+                Text("A floating drag card follows you to System Settings. If ClipBubble is already listed, turn it on. You can also add ClipBubble.app with the + button.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
             }
         }
     }
 
     private var dragCard: some View {
-        let bundled = AppBundleDragView.bundleFileURL.pathExtension == "app"
-        let label = bundled ? "Drag ClipBubble into Accessibility" : "Drag \(Bundle.main.bundleURL.lastPathComponent)"
-        return SettingsCard {
+        SettingsCard {
             HStack(spacing: 12) {
-                VStack(spacing: 3) {
-                    Image(nsImage: NSApp.applicationIconImage).resizable().aspectRatio(contentMode: .fit)
-                        .frame(width: 64, height: 64)
-                    Text(bundled ? "ClipBubble.app" : Bundle.main.bundleURL.lastPathComponent)
-                        .font(.system(size: 11, weight: .medium)).lineLimit(1)
-                }
-                .frame(width: 106, height: 91)
-                .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
-                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.primary.opacity(0.12)))
-                .accessibilityHidden(true)
-                .overlay { AppBundleDragView(label: label) }
-
-                Image(systemName: "arrow.right")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(Color.accentColor)
-                    .symbolEffect(.pulse, options: .repeating, isActive: !reduceMotion)
-                    .accessibilityHidden(true)
+                AppBundleDragTile()
+                AccessibilityDragArrow()
 
                 VStack(alignment: .leading, spacing: 5) {
                     SettingIcon(symbol: "gearshape", tint: .gray, size: 25).accessibilityHidden(true)
-                    Text(label).font(.system(size: 13, weight: .semibold))
-                    Text(bundled ? "Privacy & Security → Accessibility" : "Use the installed ClipBubble.app to grant access.")
+                    Text(AppBundleDragTile.label).font(.system(size: 13, weight: .semibold))
+                    Text(AppBundleDragTile.bundled ? "Privacy & Security → Accessibility" : "Use the installed ClipBubble.app to grant access.")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)

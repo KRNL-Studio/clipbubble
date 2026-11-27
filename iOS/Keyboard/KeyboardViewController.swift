@@ -125,6 +125,13 @@ final class KeyboardModel: ObservableObject {
             fetching = nil
             copy(c)
         }
+        #if DEBUG
+        if Platform.defaults.bool(forKey: "demo") || FileManager.default.fileExists(atPath: Paths.dir.appendingPathComponent(".demo").path) {
+            linked = true
+            status = "MacBook Pro"
+            return
+        }
+        #endif
         let live = SyncEngine.shared.statuses.values.compactMap { s -> String? in if case .live(let h) = s { return h.name }; return nil }
         linked = !SyncEngine.enabledHosts.isEmpty && (viaApp || !live.isEmpty)
         status = SyncEngine.enabledHosts.isEmpty ? "No computers linked yet"

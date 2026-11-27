@@ -57,4 +57,4 @@ Local Network is used only to reach the user's own computer. Full Access is used
 ## Still to make
 
 - A sync video recorded on a real iPhone and computer: linking, the Local Network prompt, a copy each way, Share and the keyboard.
-- Screenshots at 6.9 inches: Recent while linked, Library, an item's detail, Add, the keyboard in Messages and the Share card.
+- All seven 6.9-inch screenshots (`1-recent.png` through `7-share.png`) are ready in `iOS/AppStore/screenshots/`.

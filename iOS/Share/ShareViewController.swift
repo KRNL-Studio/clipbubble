@@ -18,6 +18,14 @@ final class ShareViewController: UIViewController {
         host.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         host.didMove(toParent: self)
 
+        #if DEBUG
+        if Platform.defaults.bool(forKey: "demo") || FileManager.default.fileExists(atPath: Paths.dir.appendingPathComponent(".demo").path) {
+            state.saved = true
+            state.text = "On the clipboard of MacBook Pro."
+            state.done = true
+            return
+        }
+        #endif
         let providers = (extensionContext?.inputItems as? [NSExtensionItem] ?? []).flatMap { item -> [NSItemProvider] in
             if let attachments = item.attachments, !attachments.isEmpty { return attachments }
             if let text = item.attributedContentText?.string { return [NSItemProvider(object: text as NSString)] }

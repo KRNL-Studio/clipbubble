@@ -93,7 +93,7 @@ final class Model: ObservableObject {
 
     func unlinkDirect(_ peer: DirectPeer) {
         SyncEngine.shared.setHost(DirectPeers.alias(for: peer.id), on: false)
-        DirectPeers.remove(id: peer.id)
+        DirectPeers.remove(id: peer.id, engine: SyncEngine.shared)
         refreshDirectPeers()
     }
 

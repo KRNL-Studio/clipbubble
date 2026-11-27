@@ -30,7 +30,7 @@ enum Pairing {
 
     static func unlinkDirect(id: String) {
         SyncEngine.shared.setHost(DirectPeers.alias(for: id), on: false)
-        DirectPeers.remove(id: id)
+        DirectPeers.remove(id: id, engine: SyncEngine.shared)
     }
 
     /// Retry when a trusted computer becomes discoverable, so the next dial can use its current Bonjour endpoint.

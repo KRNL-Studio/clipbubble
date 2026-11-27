@@ -19,7 +19,7 @@ from . import direct, peers, store, sync
 from .store import DB, DIR, IMAGES, sha
 from .sync import CHUNK, Entry, Hello, Stamp, Blob
 
-VERSION = "1.7.0"
+VERSION = "2.0.0"
 
 
 def log(line):

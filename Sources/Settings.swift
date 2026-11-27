@@ -876,7 +876,7 @@ struct DevicesPage: View {
     private struct DirectQR {
         let id = UUID()
         let image: NSImage
-        let phones: [DirectPeer]
+        let peers: [DirectPeer]
         let expires = ProcessInfo.processInfo.systemUptime + 600
     }
 
@@ -906,7 +906,7 @@ struct DevicesPage: View {
                 Divider().padding(.vertical, 5)
                 HStack(alignment: .center, spacing: 10) {
                     SettingIcon(symbol: "qrcode", tint: .blue)
-                    note("Scan with your iPhone's Camera or ClipBubble app. No Remote Login or SSH needed.")
+                    note("Scan with your iPhone's Camera or ClipBubble app to link directly.")
                     Spacer(minLength: 8)
                     Button(qr == nil ? "Show QR Code…" : "Done") { qr == nil ? showQR() : hideQR() }
                         .controlSize(.small)
@@ -1057,13 +1057,13 @@ struct DevicesPage: View {
             qrError = "Direct Sync is unavailable. Try again when it is listening."
             return
         }
-        let phones = DirectPeers.all.filter { $0.os == "ios" }
+        let peers = DirectPeers.all
         guard let url = runtime.startQRPairing(), let image = PairingServer.qr(url) else {
             runtime.stopQRPairing()
             qrError = "Couldn't create a QR code. Check your network connection and try again."
             return
         }
-        qr = DirectQR(image: image, phones: phones)
+        qr = DirectQR(image: image, peers: peers)
     }
 
     @MainActor private func watchQR(_ offer: DirectQR) async {
@@ -1071,7 +1071,7 @@ struct DevicesPage: View {
             do { try await Task.sleep(for: .seconds(1)) } catch { return }
             guard qr?.id == offer.id, !Task.isCancelled else { return }
             model.refreshDirectPeers()
-            if model.directPeers.contains(where: { $0.os == "ios" && !offer.phones.contains($0) }) {
+            if model.directPeers.contains(where: { !offer.peers.contains($0) }) {
                 hideQR()
                 return
             }

@@ -7,13 +7,16 @@ import json
 import os
 import re
 import secrets
+import select
 import socket
 import subprocess
+import sys
 import threading
+import time
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
-from . import peers
+from . import direct, peers, store
 
 # The launcher install.sh writes, which ssh runs with --peer.
 LAUNCHER = Path.home() / ".local/bin/clipbubble"
@@ -227,3 +230,123 @@ def addresses():
         except OSError:
             pass
     return names + ips
+
+
+def direct_addresses():
+    return addresses() or ["127.0.0.1"]
+
+
+_terminal_prompt = threading.Lock()
+
+
+def approve_direct(peer, code, deadline):
+    """Display the SAS in the running desktop app or in its foreground terminal."""
+    if "gi.repository.Gtk" in sys.modules:
+        from gi.repository import Gdk, Gio, GLib, Gtk
+        if Gdk.Display.get_default() is not None:
+            finished, answer = threading.Event(), []
+
+            def prompt():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    finished.set()
+                    return False
+                dialog = Gtk.MessageDialog(text=f"Pair with {peer.name} ({peer.os})?",
+                                           secondary_text=f"Confirm that both devices show {code}.",
+                                           modal=True)
+                app = Gio.Application.get_default()
+                if isinstance(app, Gtk.Application):
+                    dialog.set_application(app)
+                dialog.add_button("Decline", Gtk.ResponseType.CANCEL)
+                dialog.add_button("Allow", Gtk.ResponseType.OK)
+                dialog.set_default_response(Gtk.ResponseType.CANCEL)
+
+                def respond(window, response):
+                    answer.append(response == Gtk.ResponseType.OK)
+                    window.destroy()
+                    finished.set()
+
+                def expire():
+                    if not finished.is_set():
+                        dialog.response(Gtk.ResponseType.CANCEL)
+                    return False
+
+                dialog.connect("response", respond)
+                GLib.timeout_add(max(1, int(remaining * 1000)), expire)
+                dialog.present()
+                return False
+
+            GLib.idle_add(prompt)
+            finished.wait(max(0, deadline - time.monotonic()))
+            return bool(answer and answer[0])
+    if not sys.stdin.isatty() or not _terminal_prompt.acquire(blocking=False):
+        return False
+    try:
+        print(f"\nPair with {peer.name!r} ({peer.os})? Confirm both devices show {code}. [y/N] ",
+              end="", file=sys.stderr, flush=True)
+        if select.select([sys.stdin], [], [], max(0, deadline - time.monotonic()))[0]:
+            return sys.stdin.readline().strip().lower() in ("y", "yes")
+        return False
+    finally:
+        _terminal_prompt.release()
+
+
+def direct_control_path():
+    return store.socket_path() + ".direct"
+
+
+class DirectControl:
+    """Let a local terminal display an invitation on the app's existing Direct listener."""
+    def __init__(self, server):
+        self.server = server
+        self.path = direct_control_path()
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            Path(self.path).unlink(missing_ok=True)
+            self.listener.bind(self.path)
+            os.chmod(self.path, 0o600)
+            self.listener.listen(4)
+            self.listener.settimeout(0.25)
+        except BaseException:
+            self.listener.close()
+            raise
+        self.closed = threading.Event()
+        self.thread = threading.Thread(target=self._accept, daemon=True, name="clipbubble-direct-control")
+        self.thread.start()
+
+    def close(self):
+        self.closed.set()
+        self.listener.close()
+        self.thread.join()
+        Path(self.path).unlink(missing_ok=True)
+
+    def _accept(self):
+        while not self.closed.is_set():
+            try:
+                conn, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            # Serving only one terminal request at a time also keeps invitations single-use.
+            with conn:
+                self._invite(conn)
+
+    def _invite(self, conn):
+        invite = None
+        try:
+            conn.settimeout(0.5)
+            if conn.recv(1) != b"Q":
+                return
+            link, invite = self.server.invite(direct_addresses())
+            conn.sendall(link.encode() + b"\n")
+            while (not self.closed.is_set() and time.monotonic() < invite.expires
+                   and not select.select([conn], [], [], 0.25)[0]):
+                if invite.done.is_set():
+                    break
+            conn.sendall(json.dumps(invite.result).encode() + b"\n")
+        except OSError:
+            pass
+        finally:
+            if invite:
+                self.server.cancel(invite)

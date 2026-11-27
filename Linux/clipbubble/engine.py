@@ -1,4 +1,4 @@
-"""Links this machine's history with ClipBubble elsewhere over SSH (docs/sync-protocol.md).
+"""Links this machine's history with ClipBubble elsewhere over Direct Sync or SSH.
 
 Engine state is touched only on the engine thread, which runs posted callables in order, like the Mac's serial
 queue. Each session has a reader thread and a writer thread; writes put control frames ahead of file chunks."""
@@ -13,10 +13,9 @@ import socket
 import subprocess
 import threading
 import time
-import uuid
 from pathlib import Path
 
-from . import peers, store, sync
+from . import direct, peers, store, sync
 from .store import DB, DIR, IMAGES, sha
 from .sync import CHUNK, Entry, Hello, Stamp, Blob
 
@@ -111,16 +110,12 @@ def same_bytes(a, b):
 class Engine:
     def __init__(self, name=None):
         self.q = queue.Queue()
-        DIR.mkdir(parents=True, exist_ok=True)
-        id_file = DIR / "device-id"
-        try:
-            self.device = id_file.read_text().strip()
-        except OSError:
-            self.device = ""
-        if not self.device:
-            self.device = str(uuid.uuid4())
-            id_file.write_text(self.device)
+        self.device = direct.device_id(DIR)
         self.name = name or os.environ.get("CLIPBUBBLE_DEVICE_NAME") or socket.gethostname()
+        self.direct_peers = direct.DirectPeers(DIR)
+        self.direct_server = None
+        self.discovery = None
+        self.direct_control = None
         self.sessions = []
         self.links = {}
         self.sent_at = {}
@@ -163,6 +158,7 @@ class Engine:
 
     def start(self):
         self.post(self._serve_socket)
+        self.post(self._serve_direct)
         self.post(self.reconcile_links)
         self.post(self._watch_other_writers)
 
@@ -171,12 +167,13 @@ class Engine:
         connection commits, so a once-a-second check costs nothing while nothing changes. The same check notices
         hosts added from a terminal."""
         version, known = None, {}
-        hosts = (store.Prefs.get("sync.paused", False), store.Prefs.get("sync.hosts", []))
+        hosts = None
 
         def check():
             nonlocal version, known, hosts
             # clipbubble --link (another process) adds a host: start linking without a restart.
-            now_hosts = (store.Prefs.get("sync.paused", False), store.Prefs.get("sync.hosts", []))
+            now_hosts = (store.Prefs.get("sync.paused", False), store.Prefs.get("sync.hosts", []),
+                         self.direct_peers.all())
             if now_hosts != hosts:
                 hosts = now_hosts
                 self.reconcile_links()
@@ -195,16 +192,27 @@ class Engine:
         threading.Thread(target=tick, daemon=True, name="clipbubble-watch").start()
 
     def reconcile_links(self):
-        want = set() if store.Prefs.get("sync.paused", False) else set(store.Prefs.get("sync.hosts", []))
+        paused = store.Prefs.get("sync.paused", False)
+        want = set() if paused else set(store.Prefs.get("sync.hosts", []))
+        self.drop_untrusted_direct(paused)
+        want = {a for a in want if not a.startswith("direct:") or
+                (self.direct_server and self.direct_peers.by_id(a[7:]))}
         for alias in list(self.links):
             if alias not in want:
                 self.links.pop(alias).stop()
         for alias in want:
             if alias not in self.links:
-                link = HostLink(alias, self)
+                link = DirectLink(alias, self) if alias.startswith("direct:") else HostLink(alias, self)
                 self.links[alias] = link
                 link.connect()
         self.publish_status()
+
+    def drop_untrusted_direct(self, paused=False):
+        trusted = {p.id: p.fingerprint for p in self.direct_peers.all()}
+        for session in list(self.sessions):
+            peer = session.direct_peer
+            if peer and (paused or trusted.get(peer.id) != peer.fingerprint):
+                session.close()
 
     def publish_status(self):
         self.statuses = {a: l.state for a, l in self.links.items()}
@@ -301,9 +309,26 @@ class Engine:
 
         threading.Thread(target=accept, daemon=True, name="clipbubble-accept").start()
 
+    def _serve_direct(self):
+        from . import pairing
+
+        def accepted(stream, peer):
+            self.post(lambda: self.begin(Session(None, None, self, stream, peer)))
+
+        identity = direct.DirectIdentity(DIR, self.device)
+        self.direct_server = direct.DirectServer(identity, self.direct_peers, self.name, accepted,
+                                                 pairing.approve_direct, peers.enable_direct)
+        self.discovery = direct.DirectDiscovery(identity, self.name, self.direct_server.port, pairing.addresses())
+        self.direct_control = pairing.DirectControl(self.direct_server)
+
     # Sessions
 
     def begin(self, s):
+        if s.direct_peer:
+            trusted = self.direct_peers.by_id(s.direct_peer.id)
+            if not trusted or trusted.fingerprint != s.direct_peer.fingerprint:
+                s.close()
+                return
         if store.Prefs.get("sync.paused", False) and s.link is None:
             s.close()
             return
@@ -379,6 +404,9 @@ class Engine:
 
     def handle(self, frame, s):
         code, p = frame
+        if s.direct_peer and s.peer is None and code != sync.HELLO:
+            s.close()
+            return
         if code == sync.HELLO:
             if p.proto != sync.PROTO:
                 log(f"{p.name} speaks protocol {p.proto}, this machine {sync.PROTO}")
@@ -386,17 +414,22 @@ class Engine:
                     s.link.mismatch = p.version
                 s.close()
                 return
-            if p.device == self.device:
+            if p.device == self.device or (s.direct_peer and p.device != s.direct_peer.id):
                 s.close()
                 return
             old = next((o for o in self.sessions if o is not s and o.peer and o.peer.device == p.device), None)
             if old:
-                # A device dialling in again has given up on its old link (an iPhone that slept): the new one replaces it.
-                # Otherwise the two ends dialled each other, and the first link stays.
-                if old.link or s.link:
+                if old.direct_peer and s.direct_peer and bool(old.link) != bool(s.link):
+                    # Both ends select the connection dialed by the smaller device ID.
+                    if bool(s.link) != (self.device < p.device):
+                        s.close()
+                        return
+                    old.close()
+                elif old.link or s.link:
                     s.close()
                     return
-                old.close()
+                else:
+                    old.close()
             s.peer = p
             s.offset = p.clock - time.time()
             if abs(s.offset) > 30:
@@ -593,9 +626,10 @@ class HostLink:
         proc = self.proc
 
         def read_err():
-            for line in proc.stderr:
-                if len(self.stderr) < 8192:
-                    self.stderr += line.decode("utf-8", "replace")
+            with proc.stderr as err:
+                for line in err:
+                    if len(self.stderr) < 8192:
+                        self.stderr += line.decode("utf-8", "replace")
 
         def wait():
             proc.wait()
@@ -677,12 +711,72 @@ class HostLink:
         self.engine.publish_status()
 
 
+class DirectLink(HostLink):
+    """An enabled Direct alias resolves by device ID, then dials with its stored certificate pin."""
+    def __init__(self, alias, engine):
+        super().__init__(alias, engine)
+        self.dialing = False
+
+    def connect(self):
+        if self.stopped or self.dialing or self.session:
+            return
+        peer = self.engine.direct_peers.by_id(self.alias[7:])
+        if not peer:
+            return
+        incoming = next((s for s in self.engine.sessions if s.direct_peer and s.peer
+                         and s.direct_peer.id == peer.id), None)
+        if incoming:
+            self._set(("live", incoming.peer.name))
+            self.backoff = 1.0
+            self._retry()
+            return
+        self.dialing = True
+        self._set(("connecting", ""))
+
+        def dial():
+            stream, state = None, None
+            try:
+                nearby = self.engine.discovery.find(peer.id) if self.engine.discovery else None
+                stream = direct.DirectTunnel.connect(self.engine.direct_server.identity, peer, nearby)
+            except direct.HostKeyChanged:
+                state = ("host-key-changed", "")
+            except direct.NeedsKeyAuth:
+                state = ("direct-unpaired", peer.name)
+            except (OSError, ValueError):
+                state = ("offline", time.time() + self.backoff)
+            self.engine.post(lambda: self._connected(peer, stream, state))
+
+        threading.Thread(target=dial, daemon=True, name="clipbubble-direct-dial").start()
+
+    def _connected(self, peer, stream, state):
+        self.dialing = False
+        if self.stopped:
+            if stream:
+                stream.close()
+            return
+        if stream:
+            self.session = Session(None, None, self.engine, stream, peer)
+            self.session.link = self
+            self.engine.begin(self.session)
+        else:
+            self._set(state)
+            self._retry()
+
+    def session_ended(self, s):
+        if self.session is s:
+            self.session = None
+            if not self.stopped:
+                self._set(("offline", time.time() + self.backoff))
+                self._retry()
+
+
 class Session:
     """One peer. Reads frames on a thread, writes on another with control frames ahead of file chunks."""
 
-    def __init__(self, rfd, wfd, engine):
+    def __init__(self, rfd, wfd, engine, stream=None, direct_peer=None):
         self.rfd, self.wfd = rfd, wfd
         self.engine = engine
+        self.stream, self.direct_peer = stream, direct_peer
         self.link = None
         self.on_close = lambda: None
         self.peer = None
@@ -711,7 +805,7 @@ class Session:
     def _read(self):
         while True:
             try:
-                data = os.read(self.rfd, 65536)
+                data = self.stream.recv(65536) if self.stream else os.read(self.rfd, 65536)
             except OSError:
                 data = b""
             if not data:
@@ -751,30 +845,31 @@ class Session:
                 if self.uploads:
                     u = self.uploads[0]
                     frame = u.next_chunk()
+                    if frame is None or u.done:
+                        self.uploads.popleft()
+                        u.f.close()
                     if frame is None:
-                        self.uploads.popleft()
                         return sync.encode((sync.CANCEL, u.hash))
-                    if u.done:
-                        self.uploads.popleft()
                     return sync.encode(frame)
                 self.cv.wait()
 
     def _write(self):
-        while True:
-            data = self._next()
-            if data is None:
+        try:
+            while (data := self._next()) is not None:
+                if self.stream:
+                    self.stream.sendall(data)
+                else:
+                    view = memoryview(data)
+                    while view:
+                        n = os.write(self.wfd, view)
+                        view = view[n:]
+        except OSError:
+            self.engine.post(self.close)
+            with self.cv:
+                self.cv.wait_for(lambda: self.closed)
+        finally:
+            if not self.stream:
                 os.close(self.wfd)
-                return
-            try:
-                view = memoryview(data)
-                while view:
-                    n = os.write(self.wfd, view)
-                    view = view[n:]
-            except OSError:
-                self.engine.post(self.close)
-                self._next()
-                os.close(self.wfd)
-                return
 
     def upload(self, h, index, path, offset):
         try:
@@ -788,6 +883,9 @@ class Session:
 
     def cancel_upload(self, h):
         with self.cv:
+            for u in self.uploads:
+                if u.hash == h:
+                    u.f.close()
             self.uploads = collections.deque(u for u in self.uploads if u.hash != h)
 
     def is_transferring(self, h):
@@ -835,6 +933,7 @@ class Session:
             return None
         if step == "failed":
             log(f"couldn't save a file from {d.source}")
+            d.suspend()
             del self.downloads[h]
             self._start_next()
             return None
@@ -850,13 +949,18 @@ class Session:
             return
         # Wake the reader before the writer can close a shared fd: a socket gets shut down; an ssh pipe ends when
         # its link stops ssh.
-        try:
-            with socket.fromfd(self.rfd, socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
+        if self.stream:
+            self.stream.close()
+        else:
+            try:
+                with socket.fromfd(self.rfd, socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                    sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
         with self.cv:
             self.closed = True
+            for u in self.uploads:
+                u.f.close()
             self.uploads.clear()
             self.cv.notify_all()
         # Partial files stay, so the next link resumes them from where this one stopped.
@@ -871,10 +975,14 @@ class Upload:
     def __init__(self, h, index, path, offset):
         self.hash, self.index = h, index
         self.f = open(path, "rb")
-        self.total = os.fstat(self.f.fileno()).st_size
-        if not 0 <= offset <= self.total:
-            raise OSError("bad offset")
-        self.f.seek(offset)
+        try:
+            self.total = os.fstat(self.f.fileno()).st_size
+            if not 0 <= offset <= self.total:
+                raise OSError("bad offset")
+            self.f.seek(offset)
+        except BaseException:
+            self.f.close()
+            raise
         self.offset = offset
         self.sent_empty = False
 
@@ -891,8 +999,6 @@ class Upload:
         self.offset += n
         if n == 0:
             self.sent_empty = True
-        if self.done:
-            self.f.close()
         return frame
 
 
@@ -1066,6 +1172,7 @@ def state_text(state):
         return f"{arg} wasn't let in. Check the user name, or link it again" if arg \
             else "Wasn't let in. Link it again, or add this computer's key there"
     return {"connecting": "Connecting…",
+            "direct-unpaired": f"{arg} revoked this device. Pair it again",
             "unresolved": "Can't find it on this network. Check the name, or that it's on",
             "refused": "It's not accepting connections. Turn on Remote Login or SSH there",
             "unknown-host": "Not trusted yet. Check its identity to trust it",

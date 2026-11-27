@@ -40,6 +40,8 @@ polishTests()
 polishEditorTests()
 windowTests()
 folderWatcherTests()
+screencaptureTests()
+onboardingTests()
 
 try? FileManager.default.removeItem(at: testHome)
 print("\(ran) checks, \(failures) failed")

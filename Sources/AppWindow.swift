@@ -73,6 +73,7 @@ enum AppPage: String, CaseIterable, Identifiable {
 final class AppNav: ObservableObject {
     @Published var page: AppPage = .history
     let windowVisibility = CurrentValueSubject<Bool, Never>(false)
+    var runSetup: () -> Void = {}
 
     var sidebarSelection: Binding<AppPage?> {
         Binding(get: { self.page }, set: { self.page = $0 ?? self.page })
@@ -87,24 +88,84 @@ final class AppWindow: NSObject, NSWindowDelegate {
     let model: Model
     let nav = AppNav()
     let history: HistoryBrowser
+    let onboarding = OnboardingState()
     private(set) var window: NSWindow?
+    private var frameBeforeSetup: NSRect?
 
     init(model: Model) {
         self.model = model
         history = HistoryBrowser(model: model)
         super.init()
+        nav.runSetup = { [weak self] in self?.showSetup() }
     }
 
     var isVisible: Bool { window?.isVisible ?? false }
 
     func show(_ page: AppPage? = nil) {
+        if onboarding.needsSetup || onboarding.isRunning { showSetup(); return }
         if let page { nav.page = page }
         if nav.page == .history { history.reload() }
-        let w = window ?? make()
+        reveal(window ?? make())
+    }
+
+    private func reveal(_ w: NSWindow) {
         Presence.opened(w)
         w.makeKeyAndOrderFront(nil)
         if !nav.windowVisibility.value { nav.windowVisibility.send(true) }
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func showSetup() {
+        let w = window ?? make()
+        if !onboarding.isRunning {
+            onboarding.begin()
+            let setup = NSHostingController(rootView: OnboardingView(model: model, state: onboarding,
+                openAccessibilitySettings: { [weak self] in self?.openAccessibilitySettings() },
+                finish: { [weak self] in self?.finishSetup(landingOn: $0) }))
+            setup.sizingOptions = []
+            w.contentViewController = setup
+            if !w.styleMask.contains(.fullScreen), let screen = w.screen ?? NSScreen.main {
+                frameBeforeSetup = w.frame
+                w.setFrameAutosaveName("")
+                let area = screen.visibleFrame.insetBy(dx: 10, dy: 10)
+                w.minSize = NSSize(width: min(460, area.width), height: min(420, area.height))
+                let width = min(580, area.width), height = min(590, area.height)
+                w.setFrame(NSRect(x: area.midX - width / 2, y: area.midY - height / 2,
+                                  width: width, height: height), display: true)
+            }
+        }
+        reveal(w)
+    }
+
+    private func openAccessibilitySettings() {
+        if let w = window, !w.styleMask.contains(.fullScreen), let screen = w.screen ?? NSScreen.main {
+            let area = screen.visibleFrame
+            var frame = w.frame
+            frame.size.width = min(frame.width, max(w.minSize.width, area.width / 2 - 24), area.width)
+            frame.size.height = min(frame.height, area.height)
+            frame.origin.x = area.minX + min(20, area.width - frame.width)
+            frame.origin.y = min(max(frame.minY, area.minY), area.maxY - frame.height)
+            w.setFrame(frame, display: true)
+        }
+        Access.openAccessibilitySettings()
+    }
+
+    private func finishSetup(landingOn page: AppPage? = nil) {
+        guard onboarding.isRunning, let w = window else { return }
+        onboarding.finish()
+        if let page { nav.page = page }
+        installMainContent(in: w)
+        if let frameBeforeSetup {
+            w.minSize = NSSize(width: 760, height: 500)
+            w.setFrame(frameBeforeSetup, display: true)
+            w.setFrameAutosaveName(Self.frameName)
+            self.frameBeforeSetup = nil
+        }
+        if let page { show(page) }
+    }
+
+    private func installMainContent(in w: NSWindow) {
+        w.contentViewController = NSHostingController(rootView: AppRootView(model: model, nav: nav, history: history).environmentObject(nav))
     }
 
     /// History changed somewhere: the History page follows while it's on screen.
@@ -114,7 +175,7 @@ final class AppWindow: NSObject, NSWindowDelegate {
     }
 
     func handleKey(_ e: NSEvent) -> NSEvent? {
-        guard e.window != nil, e.window === window, nav.page == .history,
+        guard !onboarding.isRunning, e.window != nil, e.window === window, nav.page == .history,
               e.modifierFlags.intersection([.command, .control, .option, .shift]) == .command,
               e.charactersIgnoringModifiers?.lowercased() == "c" else { return e }
         let responder = window?.firstResponder
@@ -132,7 +193,7 @@ final class AppWindow: NSObject, NSWindowDelegate {
         w.isReleasedWhenClosed = false
         w.minSize = NSSize(width: 760, height: 500)
         w.toolbarStyle = .unified
-        w.contentViewController = NSHostingController(rootView: AppRootView(model: model, nav: nav, history: history).environmentObject(nav))
+        installMainContent(in: w)
         w.setContentSize(NSSize(width: 1020, height: 660))
         w.delegate = self
         if !w.setFrameUsingName(Self.frameName) { w.center() }
@@ -144,6 +205,7 @@ final class AppWindow: NSObject, NSWindowDelegate {
     func windowWillClose(_ n: Notification) {
         cancelRecording()
         nav.windowVisibility.send(false)
+        finishSetup()
         if let w = n.object as? NSWindow { Presence.closed(w) }
     }
 

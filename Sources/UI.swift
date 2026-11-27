@@ -18,6 +18,7 @@ final class Model: ObservableObject {
     @Published var selection: Int64?
     @Published var previewing = false
     @Published var prefsTick = 0
+    @Published var showsScreenshotThumbnail = true
     @Published var shown = 0          // bumps on every open: refocuses search and refreshes relative times
     @Published var pulse = false
     @Published var pulseTicks = 0
@@ -46,6 +47,7 @@ final class Model: ObservableObject {
     var pickClip: (Clip, _ paste: Bool) -> Bool = { _, _ in false }
     var hoverChanged: () -> Void = {}
     var prefsChanged: () -> Void = {}
+    var screenshotThumbnailChanged: (_ applyRequested: Bool) -> Void = { _ in }
     var bubbleModeChanged: () -> Void = {}
     var openApp: (AppPage) -> Void = { _ in }
     var historyChanged: () -> Void = {}
@@ -824,6 +826,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var localClickMonitor: Any?
     private var capture: Capture!
     private var screenshots: FolderWatcher?
+    private var screencapture: Screencapture?
     private var downloads: FolderWatcher?
     private var clickMonitor: Any?
     private var keyMonitor: Any?
@@ -859,25 +862,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [weak self] in
             // Launch Services can hide the app just after it finishes launching.
             guard let self, !NSApp.isHidden, !NSRunningApplication.current.isHidden, self.appWindow.window == nil else { return }
-            let first = !UserDefaults.standard.bool(forKey: "shownAppWindow")
-            if first { UserDefaults.standard.set(true, forKey: "shownAppWindow") }
-            self.appWindow.show(first ? .general : .history)
+            self.appWindow.show(.history)
         }
     }
 
     func applicationWillTerminate(_ n: Notification) {
+        screencapture?.restore()
         PolishHandoffs.clear()
+    }
+
+    func applicationDidBecomeActive(_ n: Notification) {
+        syncScreenshotThumbnail()
     }
 
     /// The bubble, panel and peek. Tests stop here, so they start no capture, sync or global shortcuts, and pass
     /// `keyable: false` so a run can't take the keyboard, or lose its panel to a click you make somewhere else.
     func setUpWindows(keyable: Bool = true) {
-        UserDefaults.standard.register(defaults: ["copyScreenshots": true, "corner": "br", "polishCard": true])
+        UserDefaults.standard.register(defaults: ["copyScreenshots": true, "corner": "br", "polishCard": true,
+                                                   Screencapture.replacementKey: true])
         model.db.prune()
         model.reload()
         model.reloadRecent()
         MainMenu.install(full: false)
         appWindow = AppWindow(model: model)
+        appWindow.onboarding.setFolderPreference = { [weak model] folder, enabled in model?.setPref(folder.rawValue, enabled) }
+        appWindow.onboarding.didCompleteFirstRun = { [weak self] in self?.refreshFolderServices() }
         MainMenu.openPage = { [weak self] in self?.appWindow.show($0) }
 
         bubble = FloatingPanel(size: NSSize(width: 64, height: 64), keyable: false)
@@ -967,20 +976,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         connectSync()
         SyncEngine.shared.start()
         Updater.shared.start()
-        syncScreenshots()
-        syncDownloads()
-        model.prefsChanged = { [weak self] in self?.syncScreenshots(); self?.syncDownloads(); self?.importFolders() }
-        // Notice when the screenshot location changes in ⌘⇧5 → Options.
+        screencapture = .system()
+        model.screenshotThumbnailChanged = { [weak self] in self?.syncScreenshotThumbnail(applyRequested: $0) }
+        model.prefsChanged = { [weak self] in self?.refreshFolderServices() }
+        refreshFolderServices()
+        // Notice thumbnail and location changes in ⌘⇧5 → Options.
         Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
-            guard let self, self.screenshots?.folder != FolderWatcher.screenshotFolder else { return }
-            self.syncScreenshots()
-            self.importFolders()
+            guard let self else { return }
+            self.syncScreenshotThumbnail()
+            guard self.screenshots?.folder != FolderWatcher.screenshotFolder,
+                  self.screenshots != nil || (Prefs.on("screenshots") && self.appWindow.onboarding.canWatch(.screenshots))
+            else { return }
+            self.refreshFolderServices()
         }
-        importFolders()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.importFolders() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.backfillWatchedFolders() }
         Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
             self?.model.db.prune()
-            self?.importFolders()
+            self?.backfillWatchedFolders()
         }
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                object: nil, queue: .main) { [weak self] _ in self?.snap(animated: false) }
@@ -1015,6 +1027,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let change = putOnClipboard(c) else { return }
         Capture.ignoreChange(change, hash: c.hash)
         reveal()
+    }
+
+    private func refreshFolderServices() {
+        syncScreenshotThumbnail()
+        if appWindow.onboarding.canWatch(.screenshots) {
+            syncScreenshots()
+        } else {
+            screenshots?.stop()
+            screenshots = nil
+        }
+        if appWindow.onboarding.canWatch(.downloads) { syncDownloads() }
+        backfillWatchedFolders()
+    }
+
+    private func backfillWatchedFolders() {
+        if !appWindow.onboarding.needsSetup || screenshots != nil || downloads != nil { importFolders() }
+    }
+
+    private func syncScreenshotThumbnail(applyRequested: Bool = false) {
+        guard let screencapture else { return }
+        let screenshotsActive = Prefs.on("screenshots") && appWindow.onboarding.canWatch(.screenshots)
+        screencapture.sync(saveScreenshots: screenshotsActive, applyRequested: applyRequested)
+        if model.showsScreenshotThumbnail != screencapture.showsThumbnail {
+            model.showsScreenshotThumbnail = screencapture.showsThumbnail
+        }
     }
 
     /// Every screenshot lands in history; copying it to the clipboard as well is optional.

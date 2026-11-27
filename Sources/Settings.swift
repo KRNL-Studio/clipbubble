@@ -575,6 +575,7 @@ final class Access: ObservableObject {
 
 struct GeneralPage: View {
     @ObservedObject var model: Model
+    @EnvironmentObject private var nav: AppNav
     @State private var openAtLogin = LoginItem.on
     @State private var loginNote: String?
 
@@ -598,6 +599,10 @@ struct GeneralPage: View {
                 UpdateRow(updater: Updater.shared)
                 RowDivider()
                 ToggleRow(icon: "power", tint: .green, title: "Open at login", detail: loginNote, isOn: $openAtLogin)
+                RowDivider()
+                SettingRow(icon: "wand.and.stars", tint: .indigo, title: "ClipBubble setup") {
+                    Button("Run setup…") { nav.runSetup() }
+                }
             }
             SettingsCard(title: "History", footer: "Clearing removes every saved item and image, here and on your linked devices. It can't be undone.") {
                 SettingRow(icon: "trash", tint: .red, title: "Clear all history") {
@@ -672,6 +677,7 @@ struct ScreenshotsPage: View {
     @StateObject private var access = Access()
     @State private var copyShots = UserDefaults.standard.bool(forKey: "copyScreenshots")
     @State private var polishCard = UserDefaults.standard.bool(forKey: "polishCard")
+    @AppStorage(Screencapture.replacementKey) private var replaceThumbnail = true
     @State private var export1x = UserDefaults.standard.bool(forKey: "polish.export1x")
     @State private var polishFolder = UserDefaults.standard.string(forKey: "polish.folder") ?? ""
     @State private var startStyle = PolishPreset.all.first { $0.style == PolishPreset.last }?.name ?? ""
@@ -702,6 +708,10 @@ struct ScreenshotsPage: View {
                 ToggleRow(icon: "sparkles", tint: .purple, title: "Offer to polish new screenshots",
                           detail: "A card with Polish and Copy slides out by the bubble for a few seconds.", isOn: $polishCard)
                 RowDivider()
+                ToggleRow(icon: "photo.on.rectangle", tint: .purple, title: "Replace macOS screenshot preview",
+                          detail: "Turns off the floating thumbnail so ClipBubble’s preview appears right away.",
+                          isOn: Binding(get: { replaceThumbnail }, set: setThumbnailReplacement))
+                RowDivider()
                 SettingRow(icon: "paintpalette", tint: .purple, title: "Starting style",
                            detail: "The editor remembers the last style you used, starting from this one.") {
                     Picker("", selection: $startStyle) {
@@ -723,19 +733,31 @@ struct ScreenshotsPage: View {
                 ToggleRow(icon: "arrow.down.right.and.arrow.up.left", tint: .gray, title: "Export at 1×",
                           detail: "Half the pixels of a Retina screenshot: smaller files that upload faster, a little softer up close.", isOn: $export1x)
             }
-            if Screencapture.showsThumbnail {
-                SettingsCard(footer: "macOS holds each screenshot for a few seconds while its own thumbnail shows in the corner, so it reaches ClipBubble late. To get it at once, press ⌘⇧5, open Options and untick Show Floating Thumbnail.") {
+            if model.showsScreenshotThumbnail {
+                SettingsCard(footer: "macOS waits for the floating thumbnail to close before saving the screenshot. Preview replacement requires Save every screenshot and Offer to polish new screenshots.") {
                     SettingRow(icon: "timer", tint: .yellow, title: "Screenshots arrive a few seconds late") {
-                        Button("Open Screenshot") { Screencapture.openApp() }.controlSize(.small)
+                        HStack {
+                            if Prefs.on("screenshots") && polishCard {
+                                Button("Replace Preview") { setThumbnailReplacement(true) }
+                            }
+                            Button("Open Screenshot") { Screencapture.openApp() }
+                        }
+                        .controlSize(.small)
                     }
                 }
             }
         }
-        .onReceive(nav.windowVisibility) { $0 ? access.start() : access.stop() }
+        .onReceive(nav.windowVisibility) { visible in
+            if visible { access.start(); model.screenshotThumbnailChanged(false) }
+            else { access.stop() }
+        }
         .onDisappear { access.stop() }
         .onChange(of: model.prefsTick) { access.refresh() }
         .onChange(of: copyShots) { _, on in UserDefaults.standard.set(on, forKey: "copyScreenshots") }
-        .onChange(of: polishCard) { _, on in UserDefaults.standard.set(on, forKey: "polishCard") }
+        .onChange(of: polishCard) { _, on in
+            UserDefaults.standard.set(on, forKey: "polishCard")
+            model.screenshotThumbnailChanged(false)
+        }
         .onChange(of: export1x) { _, on in UserDefaults.standard.set(on, forKey: "polish.export1x") }
         .onChange(of: polishFolder) { _, p in UserDefaults.standard.set(p, forKey: "polish.folder") }
         .onChange(of: startStyle) { _, name in
@@ -745,6 +767,11 @@ struct ScreenshotsPage: View {
 
     private func pref(_ key: String) -> Binding<Bool> {
         Binding(get: { _ = model.prefsTick; return Prefs.on(key) }, set: { model.setPref(key, $0) })
+    }
+
+    private func setThumbnailReplacement(_ on: Bool) {
+        replaceThumbnail = on
+        model.screenshotThumbnailChanged(on)
     }
 
     private func pickPolishFolder() {
@@ -769,10 +796,82 @@ struct ScreenshotsPage: View {
     }
 }
 
-/// macOS's own screenshot settings, which ClipBubble only reads.
-enum Screencapture {
-    static var showsThumbnail: Bool {
-        UserDefaults(suiteName: "com.apple.screencapture")?.object(forKey: "show-thumbnail") as? Bool ?? true
+protocol ScreenshotThumbnailDefaults {
+    func bool(forKey key: String) -> Bool
+    func string(forKey key: String) -> String?
+    func set(_ value: Any?, forKey key: String)
+    func removeObject(forKey key: String)
+    func synchronize() -> Bool
+}
+
+extension UserDefaults: ScreenshotThumbnailDefaults {}
+
+/// Temporarily replaces the floating thumbnail and records the exact value to restore after a quit or crash.
+final class Screencapture {
+    static let replacementKey = "replaceMacOSScreenshotThumbnail"
+    private static let priorKey = "screenshotThumbnailPriorValue"
+    private static let domain = "com.apple.screencapture" as CFString
+    private static let key = "show-thumbnail" as CFString
+    private enum Prior: String { case enabled, unset }
+    private enum ReadError: Error { case syncFailed }
+
+    private let defaults: ScreenshotThumbnailDefaults
+    private let readThumbnail: () throws -> Bool?
+    private let writeThumbnail: (Bool?) -> Bool
+    private var wasSuppressed = false
+    private(set) var showsThumbnail = true
+
+    init(defaults: ScreenshotThumbnailDefaults, readThumbnail: @escaping () throws -> Bool?, writeThumbnail: @escaping (Bool?) -> Bool) {
+        self.defaults = defaults
+        self.readThumbnail = readThumbnail
+        self.writeThumbnail = writeThumbnail
+    }
+
+    static func system() -> Screencapture {
+        Screencapture(defaults: UserDefaults.standard, readThumbnail: {
+            guard CFPreferencesAppSynchronize(domain) else { throw ReadError.syncFailed }
+            return CFPreferencesCopyValue(key, domain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost) as? Bool
+        }, writeThumbnail: { value in
+            CFPreferencesSetAppValue(key, value.map { NSNumber(value: $0) }, domain)
+            return CFPreferencesAppSynchronize(domain)
+        })
+    }
+
+    func sync(saveScreenshots: Bool, applyRequested: Bool = false) {
+        let active = saveScreenshots && defaults.bool(forKey: "polishCard") && defaults.bool(forKey: Self.replacementKey)
+        update(active: active, applyRequested: applyRequested)
+    }
+
+    func restore() { update(active: false, applyRequested: false) }
+
+    private func update(active: Bool, applyRequested: Bool) {
+        let current: Bool?
+        do { current = try readThumbnail() } catch { return }
+        showsThumbnail = current ?? true
+        var prior = defaults.string(forKey: Self.priorKey).flatMap(Prior.init(rawValue:))
+        let reenabled = showsThumbnail && (prior != nil || wasSuppressed)
+        wasSuppressed = active && !showsThumbnail
+        if reenabled {
+            defaults.removeObject(forKey: Self.priorKey)
+            prior = nil
+            // Honor a change in Screenshot Options until the user explicitly asks ClipBubble to replace it again.
+            if !applyRequested {
+                defaults.set(false, forKey: Self.replacementKey)
+                return
+            }
+        }
+
+        if active && showsThumbnail {
+            let original: Prior = current == nil ? .unset : .enabled
+            // Persist ownership before changing the other domain so a later launch can recover it.
+            defaults.set(original.rawValue, forKey: Self.priorKey)
+            guard defaults.synchronize() else { defaults.removeObject(forKey: Self.priorKey); return }
+            if writeThumbnail(false) { showsThumbnail = false; wasSuppressed = true }
+            else { defaults.removeObject(forKey: Self.priorKey) }
+        } else if !active, let prior, writeThumbnail(prior == .enabled ? true : nil) {
+            defaults.removeObject(forKey: Self.priorKey)
+            showsThumbnail = true
+        }
     }
 
     static func openApp() {

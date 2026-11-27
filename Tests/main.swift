@@ -23,11 +23,13 @@ if CommandLine.arguments.contains("--write-fixtures") {
     writeFixtures(to: URL(fileURLWithPath: CommandLine.arguments.last!))
     exit(0)
 }
+if ProcessInfo.processInfo.environment["CLIPBUBBLE_CHILD"] == "direct" { runDirectChild() }
 if child { runChild() }
 
 syncTests()
 storeTests()
 linkTests()
+directTests()
 boundaryTests()
 sweepTests()
 pairingTests()

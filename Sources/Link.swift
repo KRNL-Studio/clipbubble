@@ -176,6 +176,12 @@ final class SyncEngine {
         queue.async { [self] in sessions.filter { $0.link == nil }.forEach { $0.close() } }
     }
 
+    func dropDirect(_ deviceId: String) {
+        queue.async { [self] in
+            sessions.filter { $0.directPeerID == deviceId }.forEach { $0.close() }
+        }
+    }
+
     func setPaused(_ paused: Bool) {
         Platform.defaults.set(paused, forKey: "sync.paused")
         queue.async { [self] in
@@ -317,6 +323,7 @@ final class SyncEngine {
     func handle(_ f: Frame, from s: Session) {
         switch f {
         case .hello(let h):
+            if let id = s.directPeerID, h.device != id { s.close(); return }
             guard h.proto == Sync.proto else {
                 SyncLog.write("\(h.name) speaks protocol \(h.proto), this device \(Sync.proto)")
                 s.link?.versionMismatch(h)
@@ -572,23 +579,16 @@ enum LinkState: Equatable {
     }
 }
 
-/// A relay running on a host over SSH.
+/// A byte stream to a host. Direct links negotiate trust before opening a session.
 protocol Tunnel: AnyObject {
+    func whenReady(on queue: DispatchQueue, _ ready: @escaping () -> Void)
     func makeSession(engine: SyncEngine) -> Session
     func close()
-    #if !os(iOS)
-    var input: FileHandle { get }
-    var output: FileHandle { get }
-    #endif
 }
 
-#if !os(iOS)
 extension Tunnel {
-    func makeSession(engine: SyncEngine) -> Session {
-        Session(input: input, output: output, engine: engine)
-    }
+    func whenReady(on queue: DispatchQueue, _ ready: @escaping () -> Void) { ready() }
 }
-#endif
 
 /// One host: runs `--peer` there over SSH, retries with backoff, and turns SSH's errors into a status.
 final class HostLink {
@@ -643,10 +643,13 @@ final class HostLink {
                 exited: { [weak self] in self?.engine.queue.async { self?.exited() } })
         } catch { set(.offline(Date().addingTimeInterval(backoff))); scheduleRetry(); return }
         tunnel = t
-        let s = t.makeSession(engine: engine)
-        s.link = self
-        session = s
-        engine.begin(s)
+        t.whenReady(on: engine.queue) { [weak self, weak t] in
+            guard let self, let t, self.tunnel === t, !stopped else { return }
+            let s = t.makeSession(engine: engine)
+            s.link = self
+            session = s
+            engine.begin(s)
+        }
         // The connect timeout ends at TCP. A computer that accepts and then says nothing would read "Connecting…" forever.
         let d = DispatchWorkItem { [weak self] in
             guard let self else { return }
@@ -802,6 +805,7 @@ final class Session {
     private let transport: SessionTransport?
     private unowned let engine: SyncEngine
     weak var link: HostLink?
+    var directPeerID: String?
     var onClose: () -> Void = {}
     var peer: Hello?
     var offset: Double = 0

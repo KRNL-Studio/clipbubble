@@ -1,0 +1,430 @@
+import AppKit
+
+func oneShotTests() {
+    do { try checkOneShot() }
+    catch { check(false, "one-shot setup failed: \(error)") }
+}
+
+private func checkOneShot() throws {
+    _ = NSApplication.shared
+    NSApp.setActivationPolicy(.accessory)
+    let defaults = UserDefaults.standard
+    let keys = ["hideBubble", "polishCard", "copyScreenshots", "screenshotFolder", "polish.folder",
+                "polish.last", "polish.export1x", "save.images", "save.screenshots"]
+    let old = keys.map { defaults.object(forKey: $0) }
+    defer { for (key, value) in zip(keys, old) { defaults.set(value, forKey: key) } }
+    defaults.set(true, forKey: "hideBubble")
+    defaults.set(true, forKey: "polishCard")
+    defaults.set(false, forKey: "copyScreenshots")
+    Prefs.set("images", true)
+    Prefs.set("screenshots", true)
+
+    let folder = Paths.dir.appendingPathComponent("one-shot-" + UUID().uuidString)
+    let fm = FileManager.default
+    try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+    defaults.set(folder.path, forKey: "screenshotFolder")
+    defaults.set(folder.path, forKey: "polish.folder")
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let source = folder.appendingPathComponent("original.png")
+    let context = CGContext(data: nil, width: 2481, height: 901, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+    context.setFillColor(CGColor(red: 0.1, green: 0.23, blue: 0.38, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: 2481, height: 901))
+    context.setFillColor(CGColor(red: 0.28, green: 0.91, blue: 0.62, alpha: 1))
+    context.fill(CGRect(x: 31, y: 83, width: 457, height: 37))
+    try PolishRenderer.png(context.makeImage()!)!.write(to: source)
+    let clipHash = "f:" + sha(source.path)
+
+    let priorWindows = Set(NSApp.windows.map(ObjectIdentifier.init))
+    let app = AppDelegate()
+    let x = (NSScreen.screens.map(\.frame.maxX).max() ?? 0) + 4000
+    let area = NSRect(x: x, y: 0, width: 1400, height: 900)
+    app.displays = { [Display(id: 1001, frame: area, visible: area)] }
+    app.pointer = { CGPoint(x: area.midX, y: area.midY) }
+    app.model.db.insertIfMissing(kind: "file", text: source.path, source: "Screenshot", hash: clipHash, created: Date())
+    app.setUpWindows(keyable: false)
+    let windows = NSApp.windows.filter { !priorWindows.contains(ObjectIdentifier($0)) }
+    let board = NSPasteboard(name: .init("polish-one-shot-" + UUID().uuidString))
+    let editorBoard = NSPasteboard(name: .init("polish-one-shot-editor-" + UUID().uuidString))
+    defer {
+        app.shotCard.hide(animated: false)
+        windows.forEach { $0.orderOut(nil) }
+        board.releaseGlobally()
+        editorBoard.releaseGlobally()
+    }
+    guard let clip = app.model.db.clip(hash: clipHash), let image = PolishRenderer.load(source),
+          let panel = windows.first(where: { $0.frame.width == 420 }) else {
+        check(false, "one-shot source and panel are ready")
+        return
+    }
+    let editor = PolishModel(url: source, image: image)
+    editor.pasteboard = editorBoard
+    func editorPNG(style: PolishStyle) -> Data? {
+        editor.doc.style = style
+        editor.copy()
+        return editorBoard.data(forType: .png)
+    }
+
+    var writes = 0
+    app.putPolishedOnClipboard = { data in
+        writes += 1
+        return Board.writePNG(data, to: board, polished: true)
+    }
+    app.putOnClipboard = { _ in check(false, "one-shot must not copy the original file"); return nil }
+    var captures = 0
+    let capture = Capture(board: board) { [weak app] copied in
+        DispatchQueue.main.async {
+            if copied { captures += 1 }
+            app?.clipboardChanged(copied: copied)
+        }
+    }
+    defer { withExtendedLifetime(capture) {} }
+
+    let startingStyle = PolishStyle(background: .solid(RGBA(hex: 0xFBAA6E)), padding: 0.19, radius: 0.05, frame: .dark)
+    defaults.set(true, forKey: "polish.export1x")
+    let expected = editorPNG(style: startingStyle)
+    check(expected != nil, "editor can export the reference PNG")
+    app.toggle()
+    let before = Set(NSApp.windows.map(ObjectIdentifier.init))
+    app.model.polish(clip)
+    app.model.polish(clip)
+    check(app.model.polishStatus(for: clip) == .rendering && writes == 0, "one-shot reports rendering before writing")
+    check(waitForOneShot { app.model.polishStatus(for: clip) == .copied }, "one-shot reports success")
+    check(writes == 1, "double click makes a single clipboard write")
+    check(board.data(forType: .png) == expected, "one-shot PNG matches the editor's full-resolution source, starting style and export scale")
+    check(app.model.polishToast?.source == source && app.model.polishToast?.thumbnail != nil,
+          "the toast keeps the original URL and a preview")
+    check(panel.isVisible && Set(NSApp.windows.map(ObjectIdentifier.init)) == before, "one-shot leaves the panel open and opens no window")
+    app.toggle()
+    if let expected {
+        let hash = "i:" + sha(expected)
+        check(waitForOneShot { captures == 1 && app.model.db.clip(hash: hash)?.source == "Polished" },
+              "clipboard capture records the PNG once and labels it Polished")
+        check(app.model.db.clips(kind: "image").filter { $0.hash == hash }.count == 1 && !app.shotCard.isVisible,
+              "the captured PNG has one history entry and doesn't trigger a screenshot card")
+    }
+
+    let missing = Clip(id: -1, kind: "file", text: folder.appendingPathComponent("missing.png").path,
+                       file: nil, source: "Screenshot", created: Date())
+    let count = board.changeCount
+    app.model.polish(missing)
+    check(waitForOneShot { app.model.polishStatus(for: missing) == .failed }, "a missing source reports failure")
+    check(writes == 1 && board.changeCount == count && app.model.polishToast?.thumbnail == nil,
+          "a failed one-shot leaves the clipboard alone")
+    check(!app.shotCard.isVisible, "a failed one-shot doesn't show the card")
+
+    defaults.set(false, forKey: "polish.export1x")
+    let gradient = editorPNG(style: PolishPreset.gradient.style)
+    PolishPreset.last = PolishPreset.builtIn[0].style
+    check(PolishPreset.last.isPlain, "the starting style can be set to None")
+    app.screenshotAdded(source, at: Date())
+    check(app.shotCard.isVisible, "a new screenshot still shows its card")
+    check(draggedFile(app.shotCard.state.dragWriter(for: source)) == source, "the card drags the original file before polishing")
+    check(app.shotCard.state.copyLabel == "Copy", "the card labels its Copy button before polishing")
+    app.shotCard.state.polish()
+    app.shotCard.state.polish()
+    check(app.shotCard.state.polishStatus == .rendering, "the card shows its render state")
+    app.shotCard.state.copyFeedback = .copied
+    check(waitForOneShot { app.shotCard.state.polishStatus == .copied }, "the card confirms the copy")
+    check(writes == 2, "the card ignores repeat clicks")
+    check(matchesGradient(board.data(forType: .png), gradient), "the card uses Gradient for a plain style")
+    check(app.shotCard.isVisible && app.shotCard.state.url == source && app.shotCard.state.polishedThumbnail != nil,
+          "the card keeps the original URL and displays the polished thumbnail")
+    check(Set(NSApp.windows.map(ObjectIdentifier.init)) == before, "the card's Polish action opens no window")
+    check(app.shotCard.state.copyLabel == "Copy original", "the card distinguishes Copy original after polishing")
+    let polishedItem = app.shotCard.state.dragWriter(for: source)
+    let secondItem = app.shotCard.state.dragWriter(for: source)
+    let output = app.shotCard.state.polished
+    let polishedPNG = board.data(forType: .png)
+    checkPolishedDragLifecycle(source: source, output: output, png: polishedPNG)
+    func dragFileCount() -> Int {
+        let paths = (try? fm.subpathsOfDirectory(atPath: PolishHandoffs.root.path)) ?? []
+        return paths.filter { $0.hasSuffix("/original polished.png") }.count
+    }
+    check(dragFileCount() == 0, "starting two drags creates no handoffs")
+    check(draggedPNG(polishedItem) == polishedPNG && dragFileCount() == 0,
+          "the in-memory PNG loads without writing a handoff")
+
+    let copyPolished = app.putPolishedOnClipboard
+    app.putPolishedOnClipboard = { _ in false }
+    app.shotCard.state.polish()
+    check(waitForOneShot { app.shotCard.state.polishStatus == .failed }, "the card reports a failed retry")
+    check(draggedFile(app.shotCard.state.dragWriter(for: source)) == source, "the card drags the original file after polishing fails")
+    check(app.shotCard.state.polishedThumbnail == nil && app.shotCard.state.copyLabel == "Copy",
+          "a failed retry restores the original thumbnail and Copy label")
+    app.shotCard.hide(animated: false)
+    app.putPolishedOnClipboard = copyPolished
+
+    let polishedFile = draggedFile(polishedItem)
+    check(polishedFile.flatMap { try? Data(contentsOf: $0) } == polishedPNG && dragFileCount() == 1,
+          "requesting the PNG as a file writes a handoff lazily after the card closes")
+    check(polishedFile != source && polishedFile?.pathExtension == "png" &&
+          polishedFile.flatMap { try? Data(contentsOf: $0) } == polishedPNG,
+          "a URL-only receiver gets the full polished PNG")
+    check(polishedFile != nil && draggedFile(secondItem) == polishedFile && dragFileCount() == 1,
+          "two drags of one polish result share one handoff file")
+
+    defaults.removeObject(forKey: "polish.last")
+    app.model.polish(clip)
+    check(waitForOneShot { writes == 3 }, "a missing starting preference still copies")
+    check(matchesGradient(board.data(forType: .png), gradient), "a missing starting preference uses the built-in Gradient")
+    let files = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+    check(files == [source.lastPathComponent],
+          "one-shot leaves the screenshot and editor output folders untouched")
+    try checkLongPolishedNames(source: source, image: image, output: output)
+
+    guard let polishedFile, let polishedImage = PolishRenderer.load(polishedFile) else {
+        check(false, "the polished drag file is available to edit and save")
+        return
+    }
+    defaults.removeObject(forKey: "polish.folder")
+    let handoffEditor = PolishWindow(url: polishedFile, image: polishedImage)
+    defer { handoffEditor.window.close() }
+    guard let destination = PolishRenderer.saveURL(for: polishedFile), let path = realpath(folder.path, nil) else {
+        check(false, "a handoff original has a save location")
+        return
+    }
+    defer { free(path) }
+    let resolvedFolder = URL(fileURLWithPath: String(cString: path), isDirectory: true)
+    let saved = resolvedFolder.appendingPathComponent(destination.lastPathComponent)
+    handoffEditor.model.save()
+    check(PolishRenderer.load(saved) != nil && app.model.db.clip(hash: "f:" + sha(saved.path))?.source == "Polished",
+          "Save writes the handoff original's edited copy and records it in history as Polished")
+    check(destination.deletingLastPathComponent().path == FolderWatcher.screenshotFolder.path,
+          "Save puts the handoff original's edited copy in the watched screenshot folder")
+
+    let saveAlias = folder.appendingPathComponent("save alias")
+    try fm.createSymbolicLink(at: saveAlias, withDestinationURL: folder)
+    defaults.set(saveAlias.path, forKey: "polish.folder")
+    handoffEditor.model.save()
+    defaults.removeObject(forKey: "polish.folder")
+    let linkedSave = resolvedFolder.appendingPathComponent(PolishRenderer.polishedFilename(base: handoffEditor.model.name, copy: 2))
+    check(PolishRenderer.load(linkedSave) != nil
+          && app.model.db.clip(hash: "f:" + sha(linkedSave.path))?.text == linkedSave.path
+          && handoffEditor.model.toast?.text == "Saved as “\(linkedSave.lastPathComponent)”",
+          "Save records the resolved path in history for a symlink destination")
+
+    let otherRoot = fm.temporaryDirectory.appendingPathComponent("ClipBubble Polish-" + UUID().uuidString, isDirectory: true)
+    try fm.createDirectory(at: otherRoot, withIntermediateDirectories: false)
+    defer { try? fm.removeItem(at: otherRoot) }
+    let otherOriginal = otherRoot.appendingPathComponent(source.lastPathComponent)
+    try fm.copyItem(at: source, to: otherOriginal)
+    check(PolishHandoffs.contains(otherRoot) && PolishRenderer.saveURL(for: otherOriginal)?.deletingLastPathComponent().path == folder.path,
+          "an original in another instance's handoff root uses the watched screenshot folder")
+    defaults.set(otherRoot.appendingPathComponent("exports").path, forKey: "polish.folder")
+    check(PolishRenderer.saveURL(for: source)?.deletingLastPathComponent().path == folder.path,
+          "a custom destination in another instance's handoff root uses the watched screenshot folder")
+    defaults.removeObject(forKey: "polish.folder")
+    try checkSaveThroughSymlinks(source: source, image: image, handoffRoot: otherRoot)
+
+    let alias = folder.appendingPathComponent("drag alias.png")
+    try fm.createSymbolicLink(at: alias, withDestinationURL: polishedFile)
+    check(PolishRenderer.saveURL(for: alias)?.deletingLastPathComponent().path == folder.path,
+          "a symlink to a handoff original uses the watched screenshot folder")
+    let handoffAlias = folder.appendingPathComponent("handoff alias", isDirectory: true)
+    try fm.createSymbolicLink(at: handoffAlias, withDestinationURL: polishedFile.deletingLastPathComponent())
+    let custom = folder.appendingPathComponent("Polish exports", isDirectory: true)
+    defaults.set(custom.path, forKey: "polish.folder")
+    check(PolishRenderer.saveURL(for: polishedFile)?.deletingLastPathComponent().path == custom.path,
+          "a handoff original honors a custom destination outside the handoff root")
+    defaults.set(handoffAlias.appendingPathComponent("missing").path, forKey: "polish.folder")
+    check(PolishRenderer.saveURL(for: polishedFile)?.deletingLastPathComponent().path == folder.path,
+          "a custom destination below a symlink into a handoff uses the watched folder")
+    defaults.removeObject(forKey: "polish.folder")
+    let desktop = fm.homeDirectoryForCurrentUser.appendingPathComponent("Desktop", isDirectory: true)
+    let readOnly = folder.appendingPathComponent("read-only", isDirectory: true)
+    try fm.createDirectory(at: readOnly, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o500])
+    let storedImage = Paths.images.appendingPathComponent("clipboard.png")
+    for unavailable in [folder.appendingPathComponent("missing"), source, handoffAlias, readOnly] {
+        defaults.set(unavailable.path, forKey: "screenshotFolder")
+        check(PolishRenderer.saveURL(for: polishedFile)?.deletingLastPathComponent().path == desktop.path,
+              "a handoff original falls back to Desktop when the screenshot location is \(unavailable.lastPathComponent)")
+        check(PolishRenderer.saveURL(for: storedImage)?.deletingLastPathComponent().path == desktop.path,
+              "a stored image falls back to Desktop when the screenshot location is \(unavailable.lastPathComponent)")
+    }
+    defaults.set(folder.path, forKey: "screenshotFolder")
+    check(PolishRenderer.saveURL(for: storedImage)?.deletingLastPathComponent().path == folder.path,
+          "a stored image uses a readable, writable screenshot folder")
+
+    try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-3601)],
+                         ofItemAtPath: polishedFile.deletingLastPathComponent().path)
+    _ = try PolishHandoffs.write(Data([1]), name: "sweep.png")
+    check(!fm.fileExists(atPath: polishedFile.path), "the handoff sweep removes the expired drag file")
+    guard let refreshed = draggedFile(polishedItem) else {
+        check(false, "a drag provider can replace its expired handoff")
+        return
+    }
+    check(refreshed != polishedFile && (try? Data(contentsOf: refreshed)) == polishedPNG && draggedFile(secondItem) == refreshed,
+          "two providers share a fresh handoff after their cached file expires")
+
+    try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-50 * 60)], ofItemAtPath: refreshed.path)
+    let replacement = draggedFile(polishedItem)
+    check(fm.fileExists(atPath: refreshed.path) && replacement != nil && replacement != refreshed
+          && replacement.flatMap { try? Data(contentsOf: $0) } == polishedPNG,
+          "a drag replaces a 50-minute-old handoff that still exists")
+
+    let state = ShotCardState()
+    state.url = source
+    state.polished = output
+    let launch = refreshed.deletingLastPathComponent().deletingLastPathComponent()
+    let backup = launch.appendingPathExtension("backup")
+    let blocked: URL?
+    do {
+        try fm.moveItem(at: launch, to: backup)
+        defer {
+            do { try fm.moveItem(at: backup, to: launch) }
+            catch { check(false, "could not restore the drag handoff directory: \(error)") }
+        }
+        try Data().write(to: launch, options: .withoutOverwriting)
+        defer { try? fm.removeItem(at: launch) }
+        blocked = draggedFile(state.dragWriter(for: source))
+    }
+    check(blocked == nil, "a blocked handoff directory produces no drag file")
+    let retried = draggedFile(state.dragWriter(for: source))
+    check(retried != nil && retried.flatMap { try? Data(contentsOf: $0) } == polishedPNG,
+          "a new drag retries after a temporary handoff write failure")
+}
+
+private func checkLongPolishedNames(source: URL, image: CGImage, output: OneShot.Output?) throws {
+    let fm = FileManager.default
+    let folder = source.deletingLastPathComponent()
+    let cluster = "👩🏽‍💻"
+    let shortUnicode = "abcdefg" + String(repeating: cluster, count: 15)
+    let cases = [(String(repeating: "x", count: 250), String(repeating: "x", count: 242), String(repeating: "x", count: 240)),
+                 (shortUnicode + cluster, shortUnicode, shortUnicode)]
+    for (base, first, numbered) in cases {
+        let url = folder.appendingPathComponent(base + ".png")
+        try fm.copyItem(at: source, to: url)
+        let name = first + " polished.png"
+        let state = ShotCardState()
+        state.url = url
+        state.polished = output
+        let item = state.dragWriter(for: url)
+        let dragged = draggedFile(item)
+        check(dragged?.lastPathComponent == name
+              && dragged.flatMap { try? Data(contentsOf: $0) } == output?.png,
+              "card drag fits a \(base.utf8.count)-byte base in NAME_MAX without splitting characters")
+
+        let model = PolishModel(url: url, image: image)
+        model.doc.style = PolishPreset.builtIn[0].style
+        check(model.exportFile()?.lastPathComponent == name, "editor handoff also fits a \(base.utf8.count)-byte base")
+        var saves: [URL] = []
+        model.onSaved = { saves.append($0) }
+        model.save()
+        model.save()
+        check(saves.map(\.lastPathComponent) == [name, numbered + " polished 2.png"]
+              && saves.allSatisfy { fm.fileExists(atPath: $0.path) },
+              "Save fits both copy names for a \(base.utf8.count)-byte base")
+    }
+}
+
+private func checkSaveThroughSymlinks(source: URL, image: CGImage, handoffRoot: URL) throws {
+    let fm = FileManager.default
+    let defaults = UserDefaults.standard
+    let folder = source.deletingLastPathComponent()
+    let work = folder.appendingPathComponent("work", isDirectory: true)
+    let marker = work.appendingPathComponent("marker", isDirectory: true)
+    try fm.createDirectory(at: marker, withIntermediateDirectories: true)
+    let link = work.appendingPathComponent("link", isDirectory: true)
+    try fm.createSymbolicLink(at: link, withDestinationURL: handoffRoot)
+    let seed = URL(fileURLWithPath: work.path + "/marker/../link/seed.png")
+    try fm.copyItem(at: source, to: seed)
+    let model = PolishModel(url: seed, image: image)
+    try fm.removeItem(at: marker)
+    model.save()
+    check(fm.fileExists(atPath: folder.appendingPathComponent("seed polished.png").path)
+          && !fm.fileExists(atPath: handoffRoot.appendingPathComponent("seed polished.png").path)
+          && !fm.fileExists(atPath: marker.path),
+          "Save handles work/marker/../link/seed.png after marker is removed")
+
+    let nested = handoffRoot.appendingPathComponent("nested", isDirectory: true)
+    try fm.createDirectory(at: nested, withIntermediateDirectories: false)
+    let nestedLink = work.appendingPathComponent("nested-link", isDirectory: true)
+    try fm.createSymbolicLink(at: nestedLink, withDestinationURL: nested)
+    defaults.set(nestedLink.path + "/../exports", forKey: "polish.folder")
+    defer { defaults.removeObject(forKey: "polish.folder") }
+    var saved = false
+    model.onSaved = { _ in saved = true }
+    model.save()
+    let exports = handoffRoot.appendingPathComponent("exports", isDirectory: true)
+    check(model.toast?.text == "Couldn't find a folder for the saved copy" && !saved
+          && (try? fm.contentsOfDirectory(atPath: exports.path)) == [],
+          "Save refuses the resolved handoff destination after creating its directory")
+}
+
+private func checkPolishedDragLifecycle(source: URL, output: OneShot.Output?, png: Data?) {
+    let card = ShotCard()
+    let bubble = NSRect(x: 900, y: 20, width: 64, height: 64)
+    let screen = NSRect(x: 0, y: 0, width: 1000, height: 800)
+    var hidden = 0
+    card.onHidden = { hidden += 1 }
+    defer { card.hide(animated: false) }
+
+    card.show(source, beside: bubble, in: screen)
+    card.state.polished = output
+    guard let view = ShotDragView(state: card.state) else {
+        check(false, "a polished card has an AppKit drag source")
+        return
+    }
+    let drag = ShotDragView.Source(drag: view)
+    let item = drag.startDrag()?.item as? NSPasteboardWriting
+    check(png != nil && item.flatMap(draggedPNG) == png, "the AppKit drag source advertises the polished clipboard PNG")
+    card.state.hovered(false)
+    check(card.isVisible && hidden == 0, "the polished card stays visible during the AppKit drag")
+    drag.endDrag(operation: [])
+    check(card.isVisible && hidden == 0, "a canceled polished drag keeps the card visible")
+
+    _ = drag.startDrag()
+    let replacement = source.deletingLastPathComponent().appendingPathComponent("replacement.png")
+    card.show(replacement, beside: bubble, in: screen)
+    if let view = ShotDragView(state: card.state) { drag.drag = view }
+    drag.endDrag(operation: .copy)
+    check(card.isVisible && hidden == 0 && card.state.url == replacement,
+          "an accepted polished drag can't dismiss a replacement card")
+
+    card.hide()
+    card.show(source, beside: bubble, in: screen)
+    card.state.polished = output
+    RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+    check(card.isVisible && hidden == 0 && card.state.url == source,
+          "an older fade can't dismiss a replacement polished card")
+    if let view = ShotDragView(state: card.state) { drag.drag = view }
+    _ = drag.startDrag()
+    drag.endDrag(operation: .copy)
+    check(!card.isVisible && hidden == 1, "an accepted polished AppKit drag dismisses the card before returning")
+}
+
+private func draggedPNG(_ item: NSPasteboardWriting) -> Data? {
+    let board = NSPasteboard.withUniqueName()
+    defer { board.releaseGlobally() }
+    guard board.writeObjects([item]) else { return nil }
+    return board.data(forType: .png)
+}
+
+private func draggedFile(_ item: NSPasteboardWriting) -> URL? {
+    let board = NSPasteboard.withUniqueName()
+    defer { board.releaseGlobally() }
+    guard board.writeObjects([item]),
+          let url = board.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])?.first as? URL,
+          url.isFileURL else { return nil }
+    return url
+}
+
+private func matchesGradient(_ actual: Data?, _ expected: Data?) -> Bool {
+    guard let actual, let expected, let result = NSBitmapImageRep(data: actual),
+          let reference = NSBitmapImageRep(data: expected) else { return false }
+    let width = reference.pixelsWide, height = reference.pixelsHigh
+    guard result.pixelsWide == width, result.pixelsHigh == height else { return false }
+    // Core Graphics can vary the shadow between exports. Sample the gradient and original away from it.
+    return [(0, 0), (width - 1, height - 1), (width / 2, height / 2)].allSatisfy { x, y in
+        result.colorAt(x: x, y: y) == reference.colorAt(x: x, y: y)
+    }
+}
+
+private func waitForOneShot(_ condition: () -> Bool) -> Bool {
+    let deadline = Date().addingTimeInterval(5)
+    while !condition(), Date() < deadline {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+    }
+    return condition()
+}

@@ -88,8 +88,12 @@ final class DB {
     }
 
     private func prepare(_ sql: String, _ args: [Any?]) -> OpaquePointer? {
+        Self.prepare(h, sql, args)
+    }
+
+    static func prepare(_ db: OpaquePointer?, _ sql: String, _ args: [Any?]) -> OpaquePointer? {
         var s: OpaquePointer?
-        guard sqlite3_prepare_v2(h, sql, -1, &s, nil) == SQLITE_OK else { return nil }
+        guard sqlite3_prepare_v2(db, sql, -1, &s, nil) == SQLITE_OK else { return nil }
         for (i, a) in args.enumerated() {
             let idx = Int32(i + 1)
             let result: Int32
@@ -123,18 +127,22 @@ final class DB {
         let partial = preview ? "kind = 'text' AND length(text) > \(n)" : "0"
         let s = prepare("SELECT id,kind,\(text),file,source,created,hash,origin,remote,\(partial) FROM clips " + tail, args)
         defer { sqlite3_finalize(s) }
-        func col(_ i: Int32) -> String { sqlite3_column_text(s, i).map { String(cString: $0) } ?? "" }
         var out: [Clip] = []
         while true {
             let result = sqlite3_step(s)
             if result == SQLITE_DONE { return out }
             guard result == SQLITE_ROW else { return nil }
-            out.append(Clip(id: sqlite3_column_int64(s, 0), kind: col(1), text: col(2),
-                            file: sqlite3_column_type(s, 3) == SQLITE_NULL ? nil : col(3),
-                            source: col(4), created: Date(timeIntervalSince1970: sqlite3_column_double(s, 5)),
-                            hash: col(6), origin: col(7), remote: sqlite3_column_int(s, 8) != 0,
-                            partial: sqlite3_column_int(s, 9) != 0))
+            out.append(Self.readClip(s))
         }
+    }
+
+    static func readClip(_ s: OpaquePointer?) -> Clip {
+        func col(_ i: Int32) -> String { sqlite3_column_text(s, i).map { String(cString: $0) } ?? "" }
+        return Clip(id: sqlite3_column_int64(s, 0), kind: col(1), text: col(2),
+                    file: sqlite3_column_type(s, 3) == SQLITE_NULL ? nil : col(3),
+                    source: col(4), created: Date(timeIntervalSince1970: sqlite3_column_double(s, 5)),
+                    hash: col(6), origin: col(7), remote: sqlite3_column_int(s, 8) != 0,
+                    partial: sqlite3_column_int(s, 9) != 0)
     }
 
     /// Inserts a clip, or moves an identical existing one to the top.
@@ -163,37 +171,39 @@ final class DB {
     /// `preview` trims long text for lists, which on iPhone can't hold thousands of megabyte-long items in memory.
     func clips(limit: Int = 300, kind: String? = nil, source: String? = nil,
                query: String? = nil, sinceHours: Double? = nil, preview: Bool = false) -> [Clip] {
-        var tail = "WHERE created >= ?"
-        var args: [Any?] = [Date().timeIntervalSince1970 - (sinceHours.map { $0 * 3600 } ?? Self.retention)]
-        if kind == "image" {
-            // Image files (like screenshots) count as images too.
-            tail += " AND (kind = 'image' OR (kind = 'file' AND (" +
-                imageExts.map { "text LIKE '%.\($0)'" }.joined(separator: " OR ") + ")))"
-        } else if let kind {
-            tail += " AND kind = ?"
-            args.append(kind)
-        }
-        if let source {
-            tail += " AND (source = ? COLLATE NOCASE OR origin IN (SELECT id FROM devices WHERE name = ? COLLATE NOCASE))"
-            args += [source, source]
-        }
-        if let query, !query.isEmpty {
-            // Match % and _ literally: search is plain text, not a pattern.
-            let q = "%" + query.replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_") + "%"
-            tail += " AND (text LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\')"
-            args += [q, q]
-        }
-        tail += Prefs.hiddenSQL
-        tail += " ORDER BY created DESC LIMIT ?"
-        args.append(limit)
-        let rows = select(tail, args, preview: preview)
+        let (filter, args) = Self.clipFilter(kind: kind, source: source, query: query, sinceHours: sinceHours)
+        let rows = select(filter + " ORDER BY created DESC LIMIT ?", args + [limit], preview: preview)
         // On iPhone a file's path is only the app's own folder, so its name is what a search means.
         guard Platform.os == "ios", let query, !query.isEmpty else { return rows }
         return rows.filter { c in
             c.kind != "file" || c.source.localizedCaseInsensitiveContains(query)
                 || c.paths.contains { ($0 as NSString).lastPathComponent.localizedCaseInsensitiveContains(query) }
         }
+    }
+
+    static func clipFilter(kind: String?, source: String?, query: String?, sinceHours: Double? = nil) -> (String, [Any?]) {
+        var filter = "WHERE created >= ?"
+        var args: [Any?] = [Date().timeIntervalSince1970 - (sinceHours.map { $0 * 3600 } ?? Self.retention)]
+        if kind == "image" {
+            // Image files (like screenshots) count as images too.
+            filter += " AND (kind = 'image' OR (kind = 'file' AND (" +
+                imageExts.map { "text LIKE '%.\($0)'" }.joined(separator: " OR ") + ")))"
+        } else if let kind {
+            filter += " AND kind = ?"
+            args.append(kind)
+        }
+        if let source {
+            filter += " AND (source = ? COLLATE NOCASE OR origin IN (SELECT id FROM devices WHERE name = ? COLLATE NOCASE))"
+            args += [source, source]
+        }
+        if let query, !query.isEmpty {
+            // Match % and _ literally: search is plain text, not a pattern.
+            let q = "%" + query.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_") + "%"
+            filter += " AND (text LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\')"
+            args += [q, q]
+        }
+        return (filter + Prefs.hiddenSQL, args)
     }
 
     /// One clip by id. Items in categories switched off in Settings stay hidden here too (agents use this).

@@ -116,10 +116,12 @@ struct PolishPreset: Codable, Equatable, Identifiable {
     var name: String
     var style: PolishStyle
 
+    static let gradient = PolishPreset(name: "Gradient", style: PolishStyle(background: .gradient(0), padding: 0.09, radius: 0.022, shadow: 0.55))
+
     static let builtIn: [PolishPreset] = [
         PolishPreset(name: "None", style: PolishStyle(background: .none, padding: 0, radius: 0, shadow: 0, frame: .none, size: .auto)),
         PolishPreset(name: "Clean", style: PolishStyle(background: .solid(RGBA(hex: 0xF2F2F7)), padding: 0.07, radius: 0.018, shadow: 0.35)),
-        PolishPreset(name: "Gradient", style: PolishStyle(background: .gradient(0), padding: 0.09, radius: 0.022, shadow: 0.55)),
+        gradient,
         PolishPreset(name: "Window", style: PolishStyle(background: .gradient(2), padding: 0.08, radius: 0.02, shadow: 0.6, frame: .light)),
         PolishPreset(name: "Dark", style: PolishStyle(background: .gradient(6), padding: 0.08, radius: 0.02, shadow: 0.7, frame: .dark)),
         PolishPreset(name: "Social", style: PolishStyle(background: .gradient(1), padding: 0.07, radius: 0.022, shadow: 0.55, size: .x)),
@@ -137,7 +139,7 @@ struct PolishPreset: Codable, Equatable, Identifiable {
 
     /// The style the editor opens with: the last one used, else the default from Settings.
     static var last: PolishStyle {
-        get { UserDefaults.standard.data(forKey: lastKey).flatMap { try? JSONDecoder().decode(PolishStyle.self, from: $0) } ?? builtIn[2].style }
+        get { UserDefaults.standard.data(forKey: lastKey).flatMap { try? JSONDecoder().decode(PolishStyle.self, from: $0) } ?? gradient.style }
         set { UserDefaults.standard.set(try? JSONEncoder().encode(newValue), forKey: lastKey) }
     }
 }
@@ -244,7 +246,7 @@ enum PolishRenderer {
               let image = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
         let properties = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
         guard let value = properties?[kCGImagePropertyOrientation] as? UInt32,
-              let orientation = CGImagePropertyOrientation(rawValue: value), orientation != .up else { return image }
+              let orientation = CGImagePropertyOrientation(rawValue: value) else { return image }
         return orient(image, as: orientation)
     }
 
@@ -374,28 +376,80 @@ enum PolishRenderer {
 
     // MARK: Export
 
+    static func thumbnail(_ image: CGImage, maxSide: CGFloat) -> CGImage {
+        let scale = maxSide / CGFloat(max(image.width, image.height))
+        guard scale < 1 else { return image }
+        let width = max(1, Int(CGFloat(image.width) * scale))
+        let height = max(1, Int(CGFloat(image.height) * scale))
+        guard let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return image }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return ctx.makeImage() ?? image
+    }
+
+    static func exportScale(for style: PolishStyle, retina: Bool = !UserDefaults.standard.bool(forKey: "polish.export1x")) -> CGFloat {
+        retina || style.size.pixels != nil ? 1 : 0.5
+    }
+
     /// A finished PNG. `retina: false` halves a 2× screenshot for a smaller file.
     static func png(_ doc: PolishDoc, retina: Bool = true) -> Data? {
         guard let src = load(doc.source) else { return nil }
-        let scale: CGFloat = retina || doc.style.size.pixels != nil ? 1 : 0.5
-        guard let img = render(doc, source: src, scale: scale) else { return nil }
+        guard let img = render(doc, source: src, scale: exportScale(for: doc.style, retina: retina)) else { return nil }
+        return png(img)
+    }
+
+    static func png(_ img: CGImage) -> Data? {
         let data = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil) else { return nil }
         CGImageDestinationAddImage(dest, img, nil)
         return CGImageDestinationFinalize(dest) ? data as Data : nil
     }
 
-    /// Where a saved copy goes: next to the original unless Settings picked a folder, never over another file.
-    /// A copied image lives in ClipBubble's own data, so its copy goes to the screenshot folder instead.
-    static func saveURL(for source: URL) -> URL {
-        let custom = UserDefaults.standard.string(forKey: "polish.folder").flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
-        let inApp = source.deletingLastPathComponent().resolvingSymlinksInPath().path == Paths.images.resolvingSymlinksInPath().path
-        let dir = custom ?? (inApp ? FolderWatcher.screenshotFolder : source.deletingLastPathComponent())
-        let base = (inApp ? "Image" : source.deletingPathExtension().lastPathComponent) + " polished"
-        var url = dir.appendingPathComponent(base + ".png")
+    static var saveFolder: URL? {
+        guard let path = UserDefaults.standard.string(forKey: "polish.folder"), !path.isEmpty else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+
+    static func polishedFilename(base: String, copy: Int = 1) -> String {
+        let suffix = copy == 1 ? " polished.png" : " polished \(copy).png"
+        var remaining = Int(NAME_MAX) - suffix.utf8.count
+        var prefix = ""
+        for character in base {
+            remaining -= character.utf8.count
+            guard remaining >= 0 else { break }
+            prefix.append(character)
+        }
+        return prefix + suffix
+    }
+
+    /// Temporary originals default to the watched screenshot folder. A saved copy always outlives the handoff.
+    static func saveURL(for source: URL) -> URL? {
+        let custom = saveFolder
+        let originalFolder = source.deletingLastPathComponent()
+        let inApp = originalFolder.resolvingSymlinksInPath().path == Paths.images.resolvingSymlinksInPath().path
+        let preferred = custom ?? originalFolder
+        let fm = FileManager.default
+        let dir: URL
+        if PolishHandoffs.contains(preferred) || (custom == nil && (inApp || PolishHandoffs.contains(source))) {
+            let screenshots = FolderWatcher.screenshotFolder
+            if !PolishHandoffs.contains(screenshots), FolderWatcher.canRead(screenshots),
+               fm.isWritableFile(atPath: screenshots.path) {
+                dir = screenshots
+            } else {
+                dir = fm.homeDirectoryForCurrentUser.appendingPathComponent("Desktop", isDirectory: true)
+            }
+        } else {
+            dir = preferred
+        }
+        guard !PolishHandoffs.contains(dir) else { return nil }
+        let base = inApp ? "Image" : source.deletingPathExtension().lastPathComponent
+        var url = dir.appendingPathComponent(polishedFilename(base: base))
         var n = 2
-        while FileManager.default.fileExists(atPath: url.path) {
-            url = dir.appendingPathComponent("\(base) \(n).png")
+        var info = stat()
+        while lstat(url.path, &info) == 0 {
+            url = dir.appendingPathComponent(polishedFilename(base: base, copy: n))
             n += 1
         }
         return url

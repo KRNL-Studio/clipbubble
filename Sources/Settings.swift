@@ -624,13 +624,13 @@ struct CapturePage: View {
                 let kinds = Prefs.categories.filter { !["screenshots", "downloads"].contains($0.key) }
                 ForEach(Array(kinds.enumerated()), id: \.element.key) { i, c in
                     if i > 0 { RowDivider() }
-                    ToggleRow(icon: c.icon, tint: .blue, title: c.title, detail: c.detail, isOn: pref(c.key))
+                    ToggleRow(icon: c.icon, tint: .blue, title: c.title, detail: c.detail, isOn: model.pref(c.key))
                 }
             }
             SettingsCard(title: "Permissions",
                          footer: "macOS doesn't let apps change these themselves. Switching one on asks for access; if it was blocked, Fix opens the right page in System Settings.") {
                 PermissionRow(icon: "arrow.down.circle", tint: .teal, title: "Recent downloads", folder: FolderWatcher.downloadsFolder,
-                              note: "New files in your Downloads folder", ok: model.folderAccess[.downloads], isOn: pref("downloads"),
+                              note: "New files in your Downloads folder", ok: model.folderAccess[.downloads], isOn: model.pref("downloads"),
                               fix: Access.openFilesSettings) { EmptyView() }
                 RowDivider()
                 PermissionRow(icon: "return", tint: .orange, title: "Auto-paste", folder: nil, note: autoPasteNote,
@@ -654,9 +654,11 @@ struct CapturePage: View {
         guard autoPaste, access.accessibility == false else { return what }
         return what + " If ClipBubble is already switched on there, that's an older copy: select it, remove it with −, then switch Auto-paste off and on here."
     }
+}
 
-    private func pref(_ key: String) -> Binding<Bool> {
-        Binding(get: { _ = model.prefsTick; return Prefs.on(key) }, set: { model.setPref(key, $0) })
+private extension Model {
+    func pref(_ key: String) -> Binding<Bool> {
+        Binding(get: { _ = self.prefsTick; return Prefs.on(key) }, set: { self.setPref(key, $0) })
     }
 }
 
@@ -676,7 +678,7 @@ struct ScreenshotsPage: View {
             SettingsCard(title: "Screenshots") {
                 PermissionRow(icon: "camera.viewfinder", tint: .pink, title: "Save every screenshot", folder: FolderWatcher.screenshotFolder,
                               note: customFolder ? "Folder you picked" : "From your macOS screenshot setting",
-                              ok: model.folderAccess[.screenshots], isOn: pref("screenshots"), fix: Access.openFilesSettings) {
+                              ok: model.folderAccess[.screenshots], isOn: model.pref("screenshots"), fix: Access.openFilesSettings) {
                     HStack(spacing: 12) {
                         Button("Change folder…", action: pickFolder)
                         if customFolder {
@@ -692,7 +694,7 @@ struct ScreenshotsPage: View {
                 ToggleRow(icon: "doc.on.clipboard", tint: .pink, title: "Also copy new ones to the clipboard",
                           detail: "Ready to paste the moment you take one.", isOn: $copyShots)
             }
-            SettingsCard(title: "Polish", footer: "Polish gives a screenshot a background, a frame and a shadow, and lets you mark it up and hide private details before you share it.") {
+            SettingsCard(title: "Polish", footer: "Polish copies an image using your starting style and export scale. Choose Edit to mark it up or hide private details in the editor.") {
                 ToggleRow(icon: "sparkles", tint: .purple, title: "Offer to polish new screenshots",
                           detail: "A card with Polish and Copy slides out by the bubble for a few seconds.", isOn: $polishCard)
                 RowDivider()
@@ -748,10 +750,6 @@ struct ScreenshotsPage: View {
         .onChange(of: startStyle) { _, name in
             if let p = PolishPreset.all.first(where: { $0.name == name }) { PolishPreset.last = p.style }
         }
-    }
-
-    private func pref(_ key: String) -> Binding<Bool> {
-        Binding(get: { _ = model.prefsTick; return Prefs.on(key) }, set: { model.setPref(key, $0) })
     }
 
     private func setThumbnailReplacement(_ on: Bool) {

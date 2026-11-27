@@ -136,13 +136,23 @@ func polishTests() {
           "the PNG export is canvas-sized")
     check(PolishRenderer.png(doc, retina: false).flatMap { NSBitmapImageRep(data: $0) }.map { $0.pixelsWide == Int(PolishLayout(doc: doc, scale: 0.5).canvas.width) } == true,
           "1× export is half the pixels")
-    let saved = PolishRenderer.saveURL(for: url)
+    guard let saved = PolishRenderer.saveURL(for: url) else { check(false, "a local screenshot has a save location"); return }
     check(saved.lastPathComponent == "shot polished.png", "saved copies are named after the original: \(saved.lastPathComponent)")
+    do {
+        try FileManager.default.createSymbolicLink(at: saved, withDestinationURL: dir.appendingPathComponent("missing.png"))
+        check(PolishRenderer.saveURL(for: url)?.lastPathComponent == "shot polished 2.png",
+              "a dangling symlink takes up the first save name")
+        try FileManager.default.removeItem(at: saved)
+    } catch { check(false, "could not set up the dangling save symlink: \(error)") }
     FileManager.default.createFile(atPath: saved.path, contents: Data())
-    check(PolishRenderer.saveURL(for: url).lastPathComponent == "shot polished 2.png", "and never overwrite one")
-    check(PolishRenderer.isPolished(saved) && PolishRenderer.isPolished(PolishRenderer.saveURL(for: url)) && !PolishRenderer.isPolished(url),
+    let nextSave = PolishRenderer.saveURL(for: url)
+    check(nextSave?.lastPathComponent == "shot polished 2.png", "and never overwrite one")
+    check(PolishRenderer.isPolished(saved) && nextSave.map(PolishRenderer.isPolished) == true && !PolishRenderer.isPolished(url),
           "saved copies are told apart from screenshots")
-    let internalCopy = PolishRenderer.saveURL(for: Paths.images.appendingPathComponent("3f2a.png"))
+    guard let internalCopy = PolishRenderer.saveURL(for: Paths.images.appendingPathComponent("3f2a.png")) else {
+        check(false, "a copied image has a save location")
+        return
+    }
     check(internalCopy.deletingLastPathComponent().standardizedFileURL != Paths.images.standardizedFileURL && internalCopy.lastPathComponent.hasPrefix("Image polished"),
           "a copied image's polished copy goes somewhere you can find it: \(internalCopy.path)")
 

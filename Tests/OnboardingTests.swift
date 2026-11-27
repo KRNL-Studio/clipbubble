@@ -149,6 +149,11 @@ func onboardingTests() {
     let dragSource = AppBundleDragView.DragSource(frame: .zero)
     check(!dragSource.mouseDownCanMoveWindow, "dragging the app tile starts a file drag instead of moving the panel")
     check(dragSource.acceptsFirstMouse(for: nil), "the app tile accepts the first click while System Settings has focus")
+    check(dragSource.beginDragItem() != nil && dragSource.isDragging, "the app tile starts a drag session cleanly")
+    check(dragSource.beginDragItem() == nil, "repeated mouseDragged events cannot start overlapping drag sessions")
+    dragSource.endDrag()
+    check(!dragSource.isDragging && dragSource.beginDragItem() != nil, "ending a drag allows starting another drag")
+    dragSource.endDrag()
 
     accessibilityDragPanelTests(defaults: defaults)
     onboardingWindowCloseTest()

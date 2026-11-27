@@ -170,7 +170,7 @@ enum Thumbs {
     static func cached(_ path: String, _ px: Int) -> NSImage? { cache.object(forKey: key(path, px)) }
     static func size(of path: String) -> CGSize? { dims[path] }
 
-    static func load(_ path: String, _ px: Int, done: @escaping (NSImage?) -> Void) {
+    static func load(_ path: String, _ px: Int, attempt: Int = 0, done: @escaping (NSImage?) -> Void) {
         if let hit = cached(path, px) { done(hit); return }
         queue.async {
             let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil)
@@ -178,6 +178,11 @@ enum Thumbs {
             let opts = [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: px,
                         kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary
             let img = src.flatMap { CGImageSourceCreateThumbnailAtIndex($0, 0, opts) }.map { NSImage(cgImage: $0, size: .zero) }
+            if img == nil, attempt == 0, FileManager.default.fileExists(atPath: path) {
+                // A brand-new screenshot may still be flushing bytes to disk; retry once shortly after.
+                queue.asyncAfter(deadline: .now() + 0.15) { load(path, px, attempt: 1, done: done) }
+                return
+            }
             if let img { cache.setObject(img, forKey: key(path, px)) }
             let w = props?[kCGImagePropertyPixelWidth] as? Int, h = props?[kCGImagePropertyPixelHeight] as? Int
             DispatchQueue.main.async {
@@ -848,7 +853,7 @@ struct PeekView: View {
 
 // MARK: - App
 
-struct PolishedFile: Equatable {
+struct PolishedFile: Hashable {
     let path: String
     private let device: dev_t
     private let inode: ino_t
@@ -881,6 +886,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var polishToastReset: DispatchWorkItem?
     var putPolishedOnClipboard: (Data) -> Bool = { Board.writePNG($0, polished: true) }
     private var polishedPaths: [String: PolishedFile] = [:]
+    private var announcedScreenshots: Set<PolishedFile> = []
     var fileIdentity: (URL) -> PolishedFile? = PolishedFile.read
     var clipboardCount: () -> Int = { NSPasteboard.general.changeCount }
     private var shotWrite: (count: Int, baseline: Int)?
@@ -1166,7 +1172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard enabled else { screenshots = nil; return }
         // A picture that lands on the Desktop isn't a screenshot. Only macOS marks its own, so a folder picked in Settings isn't held to that.
         let markedOnly = folder == FolderWatcher.macOSScreenshotFolder
-        screenshots = FolderWatcher(folder: folder, maxAge: 120, include: {
+        screenshots = FolderWatcher(folder: folder, maxAge: 30, include: {
             isImagePath($0.path) ? !markedOnly || FolderWatcher.isScreenCapture($0) : ["mov", "mp4"].contains($0.pathExtension.lowercased())
         }, onAccessChanged: { [weak model] allowed in
             model?.folderAccess[.screenshots] = allowed
@@ -1201,7 +1207,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func announceScreenshot(_ url: URL, at date: Date, file: PolishedFile?, baseline: Int) {
+        let identity = file ?? fileIdentity(url)
+        if let identity, announcedScreenshots.contains(identity) { return }
         guard let hash = recordScreenshot(url, at: date, file: file) else { return }
+        if let identity { announcedScreenshots.insert(identity) }
         // A copy to the clipboard is announced when capture saves it, unless copied files aren't saved.
         if UserDefaults.standard.bool(forKey: "copyScreenshots"), let c = model.db.clip(hash: hash),
            clipboardBaseline() == baseline {
@@ -1385,7 +1394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let center = NSPoint(x: bubble.frame.midX, y: bubble.frame.midY)
         guard let display = chosen ?? bubbleDisplay else { return }
         let area = display.visible
-        if shotCard.isVisible && !display.frame.contains(shotCard.frame) { shotCard.hide(animated: false) }
+        if shotCard.isVisible && !display.frame.intersects(shotCard.frame) { shotCard.hide(animated: false) }
         var corner = UserDefaults.standard.string(forKey: "corner") ?? "br"
         if animated {
             corner = (center.y > area.midY ? "t" : "b") + (center.x > area.midX ? "r" : "l")
@@ -1415,7 +1424,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func clipboardChanged(copied: Bool) {
         guard copied else { return refreshLists() }
-        showBubble()
+        // If ShotCard is already up for a just-taken screenshot, reveal the bubble beside it instead of jumping displays and hiding the card.
+        showBubble(on: shotCard.isVisible ? bubbleDisplay : nil)
         captured()
     }
 
@@ -1478,11 +1488,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Back on screen but still see-through: whoever calls this sets how opaque. Hidden, it has no position to
     /// jump from, so it comes back on the screen with the pointer.
-    private func showBubble() {
+    private func showBubble(on display: Display? = nil) {
         hideWork?.cancel()
         hiding = false
         guard !bubble.isVisible else { return }
-        snap(animated: false, on: pointerDisplay)
+        snap(animated: false, on: display ?? pointerDisplay)
         bubble.alphaValue = 0
         bubble.orderFrontRegardless()
     }

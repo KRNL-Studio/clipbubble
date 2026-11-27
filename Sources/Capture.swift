@@ -167,6 +167,7 @@ final class FolderWatcher {
     private var cancelled = false
     private var stopped: Bool { lifecycle.withLock { cancelled } }
     private var known: Set<URL> = []
+    private var seenFiles: Set<PolishedFile> = []
     private var source: DispatchSourceFileSystemObject?
     private var pending: DispatchWorkItem?
     private var since: Date? = Date()
@@ -288,6 +289,18 @@ final class FolderWatcher {
         return v?.addedToDirectoryDate ?? v?.creationDate ?? .distantPast
     }
 
+    /// For recency-gated folders (screenshots), require both directory-addition and file creation to be recent,
+    /// so old screenshots moved or re-synced onto Desktop (e.g. by iCloud) never appear as newly captured.
+    static func recencyDate(_ u: URL) -> Date {
+        let v = try? u.resourceValues(forKeys: [.addedToDirectoryDateKey, .creationDateKey])
+        switch (v?.addedToDirectoryDate, v?.creationDate) {
+        case let (a?, c?): return min(a, c)
+        case let (a?, nil): return a
+        case let (nil, c?): return c
+        case (nil, nil): return .distantPast
+        }
+    }
+
     /// Everything already in the folder from the last `days` days, for backfilling history.
     func existing(days: Double, done: @escaping ([(URL, Date)]) -> Void) {
         queue.async { [weak self] in
@@ -317,13 +330,27 @@ final class FolderWatcher {
         let urls = try list(folder)
         guard !stopped else { return }
         let now = urls.filter(include)
-        let fresh = since == nil ? now.filter { !known.contains($0) } : now
+        let identities = Dictionary(uniqueKeysWithValues: now.compactMap { url in
+            PolishedFile.read(url).map { (url, $0) }
+        })
+        let fresh = since == nil ? now.filter { url in
+            if let id = identities[url] { return !seenFiles.contains(id) }
+            return !known.contains(url)
+        } : now.filter { url in
+            if let id = identities[url] { return !seenFiles.contains(id) }
+            return true
+        }
         known = Set(now)
+        seenFiles.formUnion(identities.values)
         let cutoff = max(since ?? .distantPast, maxAge.map { Date().addingTimeInterval(-$0) } ?? .distantPast)
         since = nil
         nextRetryDelay = retryDelay
         reportAccess(true)
-        let added = fresh.map { ($0, Self.added($0)) }.filter { $0.1 >= cutoff }.sorted { $0.1 < $1.1 }
+        let added = fresh.compactMap { url -> (URL, Date)? in
+            let date = Self.added(url)
+            let checkDate = maxAge == nil ? date : Self.recencyDate(url)
+            return checkDate >= cutoff ? (url, date) : nil
+        }.sorted { $0.1 < $1.1 }
         if !added.isEmpty {
             deliver { watcher in
                 for (url, date) in added where !watcher.stopped {

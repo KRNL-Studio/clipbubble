@@ -54,6 +54,7 @@ func folderWatcherTests() {
     folderWatcherMissingFolderTest()
     folderWatcherPermissionTests()
     folderWatcherRevokedPermissionTest()
+    folderWatcherDedupAndRecencyTest()
 }
 
 private func folderWatcherRetryTest() {
@@ -182,6 +183,56 @@ private func folderWatcherRevokedPermissionTest() {
     let deadline = Date().addingTimeInterval(3)
     while delivered.isEmpty, Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
     check(statuses == [true, false, true] && delivered == ["after-revocation.png"], "the resumed watch delivers files it missed during revocation")
+}
+
+private func folderWatcherDedupAndRecencyTest() {
+    let folder = testHome.appendingPathComponent("folder-watch-dedup", isDirectory: true)
+    try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let shot = folder.appendingPathComponent("transient.png")
+    let oldShot = folder.appendingPathComponent("old-moved.png")
+    let lock = NSLock()
+    var hideTransient = false
+    var delivered: [String] = []
+    let ready = DispatchSemaphore(value: 0)
+    var scans = 0
+
+    let watcher = FolderWatcher(folder: folder, maxAge: 30, include: { $0.pathExtension == "png" }, list: { url in
+        let files = try FolderWatcher.listFiles(url)
+        scans += 1
+        if scans == 2 { ready.signal() }
+        if lock.withLock({ hideTransient }) {
+            return files.filter { $0.lastPathComponent != shot.lastPathComponent }
+        }
+        return files
+    }) { url, _ in delivered.append(url.lastPathComponent) }
+    defer { watcher.stop() }
+
+    check(ready.wait(timeout: .now() + 3) == .success, "dedup watcher finished startup scans")
+    try? Data([1]).write(to: shot)
+    let firstDeadline = Date().addingTimeInterval(3)
+    while delivered.isEmpty, Date() < firstDeadline { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+    check(delivered == ["transient.png"], "a fresh screenshot is delivered once")
+
+    // Simulate iCloud/Finder transiently hiding the file from a scan, then showing the exact same file again.
+    lock.withLock { hideTransient = true }
+    let trigger1 = folder.appendingPathComponent("trigger1.txt")
+    try? Data([1]).write(to: trigger1)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.7))
+    lock.withLock { hideTransient = false }
+    let trigger2 = folder.appendingPathComponent("trigger2.txt")
+    try? Data([1]).write(to: trigger2)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.7))
+    check(delivered == ["transient.png"], "a transiently absent screenshot with the same identity is not re-announced")
+
+    // An old screenshot whose creation date predates maxAge must be ignored even if newly added to the folder.
+    let staleSource = testHome.appendingPathComponent("stale-source.png")
+    try? Data([2]).write(to: staleSource)
+    let hourAgo = Date().addingTimeInterval(-3600)
+    try? FileManager.default.setAttributes([.creationDate: hourAgo, .modificationDate: hourAgo], ofItemAtPath: staleSource.path)
+    try? FileManager.default.copyItem(at: staleSource, to: oldShot)
+    try? FileManager.default.setAttributes([.creationDate: hourAgo, .modificationDate: hourAgo], ofItemAtPath: oldShot.path)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.8))
+    check(delivered == ["transient.png"], "an old screenshot moved into the folder is not announced as new")
 }
 
 func guiInstanceLockTests() {

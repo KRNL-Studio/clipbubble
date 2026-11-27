@@ -167,7 +167,7 @@ final class ShotCard {
         }
         state.close = { [weak self] in self?.hide() }
         state.hovered = { [weak self] on in
-            guard let self else { return }
+            guard let self, self.hovering != on else { return }
             self.hovering = on
             if on || self.dragging { self.hideWork?.cancel() } else { self.schedule(after: 2.5) }
         }
@@ -228,7 +228,9 @@ final class ShotCard {
         let start = end.offsetBy(dx: right ? 24 : -24, dy: 0)
         let wasVisible = panel.isVisible
         if !wasVisible {
+            hovering = false
             panel.setFrame(start, display: false)
+            panel.contentView?.layoutSubtreeIfNeeded()
             panel.alphaValue = 0
             panel.orderFrontRegardless()
         }

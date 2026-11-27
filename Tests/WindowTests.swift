@@ -97,6 +97,11 @@ private func shotCardReplacementTest() {
     card.show(first, beside: bubble, in: screen)
     RunLoop.main.run(until: Date().addingTimeInterval(0.4))
     check(card.isVisible && card.state.url == first && hidden == 0, "an older fade-out cannot dismiss the replacement shot card")
+
+    // A spurious hover-exit when the pointer was never on the card must not shorten its lifetime.
+    card.state.hovered(false)
+    RunLoop.main.run(until: Date().addingTimeInterval(2.8))
+    check(card.isVisible && card.state.url == first && hidden == 0, "a spurious hover-exit does not dismiss a newly shown shot card early")
 }
 
 private func historyRecycledIDTest(_ model: Model) {

@@ -207,23 +207,58 @@ struct AppBundleDragView: NSViewRepresentable {
     }
 
     final class DragSource: NSView, NSDraggingSource {
+        private static let dragThreshold: CGFloat = 3
+        private var downPoint: NSPoint?
+        private(set) var isDragging = false
+
         override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
 
         override var mouseDownCanMoveWindow: Bool { false }
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-        override func mouseDown(with event: NSEvent) {}
+        override func mouseDown(with event: NSEvent) {
+            downPoint = convert(event.locationInWindow, from: nil)
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            downPoint = nil
+        }
+
+        private func dragIcon() -> NSImage? {
+            let icon = (NSApp.applicationIconImage?.copy() as? NSImage) ?? NSApp.applicationIconImage
+            icon?.size = NSSize(width: 64, height: 64)
+            return icon
+        }
+
+        func beginDragItem() -> NSDraggingItem? {
+            guard !isDragging else { return nil }
+            isDragging = true
+            let item = NSDraggingItem(pasteboardWriter: AppBundleDragView.bundleFileURL)
+            item.setDraggingFrame(NSRect(x: 0, y: 0, width: 64, height: 64), contents: dragIcon())
+            return item
+        }
 
         override func mouseDragged(with event: NSEvent) {
-            let item = NSDraggingItem(pasteboardWriter: AppBundleDragView.bundleFileURL)
+            guard !isDragging else { return }
             let point = convert(event.locationInWindow, from: nil)
+            if let downPoint, hypot(point.x - downPoint.x, point.y - downPoint.y) < Self.dragThreshold { return }
+            guard let item = beginDragItem() else { return }
             let frame = NSRect(x: point.x - 32, y: point.y - 32, width: 64, height: 64)
-            item.setDraggingFrame(frame, contents: NSApp.applicationIconImage)
+            item.setDraggingFrame(frame, contents: dragIcon())
             beginDraggingSession(with: [item], event: event, source: self)
         }
 
         func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
-            context == .outsideApplication ? .copy : []
+            context == .outsideApplication ? [.copy, .link, .generic] : []
+        }
+
+        func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+            endDrag()
+        }
+
+        func endDrag() {
+            isDragging = false
+            downPoint = nil
         }
     }
 }
@@ -235,6 +270,8 @@ final class AccessibilityDragPanel: NSPanel {
         isFloatingPanel = true
         level = .floating
         hidesOnDeactivate = false
+        becomesKeyOnlyIfNeeded = false
+        animationBehavior = .none
         isOpaque = false
         backgroundColor = .clear
         hasShadow = true
@@ -246,6 +283,7 @@ final class AccessibilityDragPanel: NSPanel {
         host.frame = container.bounds
         host.autoresizingMask = [.width, .height]
         container.addSubview(host)
+        container.layoutSubtreeIfNeeded()
         contentView = container
     }
 
@@ -316,14 +354,12 @@ private struct AppBundleDragTile: View {
 }
 
 private struct AccessibilityDragArrow: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var size: CGFloat = 17
 
     var body: some View {
         Image(systemName: "arrow.right")
             .font(.system(size: size, weight: .semibold))
             .foregroundStyle(Color.accentColor)
-            .symbolEffect(.pulse, options: .repeating, isActive: !reduceMotion)
             .accessibilityHidden(true)
     }
 }

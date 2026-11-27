@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import Network
 import NIOCore
 import NIOPosix
 import NIOSSH
@@ -11,48 +12,90 @@ enum Keys {
                                               kSecAttrService as String: "studio.krnl.clipbubble.ssh",
                                               kSecAttrAccessGroup as String: Platform.group]
 
-    static let privateKey: Curve25519.Signing.PrivateKey = {
-        if let k = saved() { return k }
-        let k = Curve25519.Signing.PrivateKey()
-        // After first unlock, so Shortcuts and the keyboard can sign while the phone is locked in a pocket.
-        let status = SecItemAdd(item.merging([kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-                                              kSecValueData as String: k.rawRepresentation]) { $1 } as CFDictionary, nil)
-        // The app and an extension can both make one at first launch; whichever saved first is the key.
-        if status == errSecDuplicateItem, let winner = saved() { return winner }
-        if status != errSecSuccess { SyncLog.write("couldn't save the SSH key: \(status)") }
-        return k
-    }()
+    private static let lock = NSLock()
+    private static var cachedKey: Curve25519.Signing.PrivateKey?
 
-    private static func saved() -> Curve25519.Signing.PrivateKey? {
-        var out: CFTypeRef?
-        guard SecItemCopyMatching(item.merging([kSecReturnData as String: true]) { $1 } as CFDictionary, &out) == errSecSuccess,
-              let d = out as? Data else { return nil }
-        return try? Curve25519.Signing.PrivateKey(rawRepresentation: d)
+    static func loadOrCreateKey() -> Curve25519.Signing.PrivateKey? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cachedKey { return cachedKey }
+
+        let (status, saved) = readKey()
+        if status == errSecSuccess {
+            cachedKey = saved
+            return saved
+        }
+        guard status == errSecItemNotFound else {
+            SyncLog.write("couldn't read the SSH key: \(status)")
+            return nil
+        }
+
+        let key = Curve25519.Signing.PrivateKey()
+        // Shortcuts can sign while the phone is locked after its first unlock.
+        let added = SecItemAdd(item.merging([kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+                                            kSecValueData as String: key.rawRepresentation]) { $1 } as CFDictionary, nil)
+        switch added {
+        case errSecSuccess: cachedKey = key
+        // The app and an extension can both try to make a key. Keep the one that was saved first.
+        case errSecDuplicateItem: cachedKey = readKey().key
+        default: SyncLog.write("couldn't save the SSH key: \(added)")
+        }
+        return cachedKey
     }
 
-    static var publicKey: String { String(openSSHPublicKey: NIOSSHPrivateKey(ed25519Key: privateKey).publicKey) }
+    private static func readKey() -> (status: OSStatus, key: Curve25519.Signing.PrivateKey?) {
+        var out: CFTypeRef?
+        let status = SecItemCopyMatching(item.merging([kSecReturnData as String: true]) { $1 } as CFDictionary, &out)
+        guard status == errSecSuccess, let data = out as? Data else { return (status, nil) }
+        return (status, try? Curve25519.Signing.PrivateKey(rawRepresentation: data))
+    }
+
+    static var publicKey: String? {
+        loadOrCreateKey().map { String(openSSHPublicKey: NIOSSHPrivateKey(ed25519Key: $0).publicKey) }
+    }
 
     /// The line for a host's ~/.ssh/authorized_keys.
-    static var publicLine: String { publicKey + " ClipBubble on " + Platform.deviceName }
+    static var publicLine: String? { publicKey.map { $0 + " ClipBubble on " + Platform.deviceName } }
 }
 
-/// A host as you typed it: `user@host` or `user@host:port`. It doubles as the link's alias.
+/// A host as typed: DNS, IPv4 or IPv6, with brackets around IPv6 when specifying a port.
 struct SSHTarget {
     let user: String
     let host: String
     let port: Int
 
+    var hostKeyPreference: String { "sync.hostkey.\(host):\(port)" }
+
     init?(_ alias: String) {
-        guard let at = alias.lastIndex(of: "@") else { return nil }
-        user = String(alias[..<at])
-        var rest = String(alias[alias.index(after: at)...])
-        var port = 22
-        if let colon = rest.lastIndex(of: ":"), let p = Int(rest[rest.index(after: colon)...]) {
-            port = p
-            rest = String(rest[..<colon])
+        guard let at = alias.lastIndex(of: "@"), at != alias.startIndex else { return nil }
+        let user = alias[..<at]
+        let address = alias[alias.index(after: at)...]
+
+        let host: Substring
+        var suffix: Substring = ""
+        if address.hasPrefix("[") {
+            guard let end = address.firstIndex(of: "]") else { return nil }
+            host = address[address.index(after: address.startIndex)..<end]
+            guard IPv6Address(String(host)) != nil else { return nil }
+            suffix = address[address.index(after: end)...]
+        } else if let colon = address.firstIndex(of: ":"), colon == address.lastIndex(of: ":") {
+            host = address[..<colon]
+            suffix = address[colon...]
+        } else {
+            host = address
+            if host.contains(":"), IPv6Address(String(host)) == nil { return nil }
         }
-        guard !user.isEmpty, !rest.isEmpty else { return nil }
-        host = rest
+
+        guard !host.isEmpty, !host.contains(where: { $0.isWhitespace || $0 == "[" || $0 == "]" || $0 == "\0" }) else { return nil }
+        var port = 22
+        if !suffix.isEmpty {
+            let digits = suffix.dropFirst()
+            guard suffix.hasPrefix(":"), digits.allSatisfy({ $0.isASCII && $0.isNumber }),
+                  let value = Int(digits), (1...65535).contains(value) else { return nil }
+            port = value
+        }
+        self.user = String(user)
+        self.host = String(host)
         self.port = port
     }
 }
@@ -85,7 +128,7 @@ final class SSHTunnel: Tunnel {
         self.stderr = stderr
         self.exited = exited
         let say: (String) -> Void = { stderr(Data(($0 + "\n").utf8)) }
-        let hostKeys = HostKeys(id: "\(target.host):\(target.port)", say: say)
+        let hostKeys = HostKeys(preference: target.hostKeyPreference, say: say)
         let auth = KeyAuth(user: target.user, say: say)
         let address = Addresses.next(for: alias, fallback: target.host)
         self.alias = alias
@@ -123,8 +166,12 @@ final class SSHTunnel: Tunnel {
     }
 
     private func open(_ command: String, on channel: Channel) {
-        guard let ssh = try? channel.pipeline.syncOperations.handler(type: NIOSSHHandler.self) else { return }
-        ssh.createChannel(nil, channelType: .session) { [self] child, _ in
+        guard let ssh = try? channel.pipeline.syncOperations.handler(type: NIOSSHHandler.self) else {
+            return channel.close(promise: nil)
+        }
+        let opened = channel.eventLoop.makePromise(of: Channel.self)
+        opened.futureResult.whenFailure { _ in channel.close(promise: nil) }
+        ssh.createChannel(opened, channelType: .session) { [self] child, _ in
             child.eventLoop.makeCompletedFuture {
                 try child.pipeline.syncOperations.addHandler(RelayHandler(command: command, tunnel: self))
             }
@@ -140,7 +187,10 @@ final class SSHTunnel: Tunnel {
 
     /// Starts sending what the session writes, once the relay is running.
     fileprivate func relayStarted(_ child: Channel) {
-        lock.lock(); relayed = true; lock.unlock()
+        lock.lock()
+        guard !ended, !finished, !relayed else { lock.unlock(); return }
+        relayed = true
+        lock.unlock()
         Addresses.worked(address, for: alias)
         fromSession.fileHandleForReading.readabilityHandler = { h in
             let d = h.availableData
@@ -182,7 +232,7 @@ final class SSHTunnel: Tunnel {
     }
 }
 
-enum SSHTunnelError: Error { case badAlias, refused, hostKeyChanged }
+enum SSHTunnelError: Error { case badAlias, refused, hostKeyChanged, keyUnavailable }
 
 /// Every address a computer offered when it linked, last one that worked first. Wi-Fi hands out new IP addresses, and
 /// a .local name doesn't resolve on every network, so a dial that fails moves on to the next. They all reach one
@@ -228,9 +278,7 @@ private final class RelayHandler: ChannelDuplexHandler {
         _ = context.channel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true)
         let channel = context.channel
         context.triggerUserOutboundEvent(SSHChannelRequestEvent.ExecRequest(command: command, wantReply: true))
-            .whenComplete { [tunnel] result in
-                if case .success = result { tunnel.relayStarted(channel) } else { channel.close(promise: nil) }
-            }
+            .whenFailure { _ in channel.close(promise: nil) }
         context.fireChannelActive()
     }
 
@@ -246,7 +294,9 @@ private final class RelayHandler: ChannelDuplexHandler {
     }
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
-        if let e = event as? ChannelEvent, e == .inputClosed { context.close(promise: nil) }
+        // The outbound write succeeding only means the request was sent. Wait for sshd to accept it.
+        if event is ChannelSuccessEvent { tunnel.relayStarted(context.channel) }
+        if event is ChannelFailureEvent || (event as? ChannelEvent) == .inputClosed { context.close(promise: nil) }
         context.fireUserInboundEventTriggered(event)
     }
 
@@ -277,30 +327,33 @@ private final class KeyAuth: NIOSSHClientUserAuthenticationDelegate {
             // NIOSSH waits forever on a nil offer; failing ends the connection.
             return nextChallengePromise.fail(SSHTunnelError.refused)
         }
+        guard let key = Keys.loadOrCreateKey() else {
+            say("The iPhone's SSH key is unavailable. Unlock the iPhone and try again.")
+            return nextChallengePromise.fail(SSHTunnelError.keyUnavailable)
+        }
         offered = true
         nextChallengePromise.succeed(.init(username: user, serviceName: "",
-                                           offer: .privateKey(.init(privateKey: NIOSSHPrivateKey(ed25519Key: Keys.privateKey)))))
+                                           offer: .privateKey(.init(privateKey: NIOSSHPrivateKey(ed25519Key: key)))))
     }
 }
 
 /// Trusts a host's key the first time and holds it to that key after, like OpenSSH's known_hosts.
 private final class HostKeys: NIOSSHClientServerAuthenticationDelegate {
-    private let id: String
+    private let preference: String
     private let say: (String) -> Void
 
-    init(id: String, say: @escaping (String) -> Void) {
-        self.id = id
+    init(preference: String, say: @escaping (String) -> Void) {
+        self.preference = preference
         self.say = say
     }
 
     func validateHostKey(hostKey: NIOSSHPublicKey, validationCompletePromise: EventLoopPromise<Void>) {
-        let key = "sync.hostkey." + id
         let seen = String(openSSHPublicKey: hostKey)
-        if let known = Platform.defaults.string(forKey: key), known != seen {
+        if let known = Platform.defaults.string(forKey: preference), known != seen {
             say("WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nHost key verification failed.")
             return validationCompletePromise.fail(SSHTunnelError.hostKeyChanged)
         }
-        Platform.defaults.set(seen, forKey: key)
+        Platform.defaults.set(seen, forKey: preference)
         validationCompletePromise.succeed(())
     }
 }

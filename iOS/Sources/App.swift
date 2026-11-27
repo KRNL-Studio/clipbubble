@@ -92,6 +92,7 @@ struct Line: Equatable {
 @MainActor
 final class Model: ObservableObject {
     @Published var clips: [Clip] = []
+    @Published private(set) var revision = 0
     @Published var hosts: [String] = SyncEngine.enabledHosts
     @Published var statuses: [String: LinkState] = [:]
     @Published var devices: [String: String] = [:]
@@ -122,10 +123,6 @@ final class Model: ObservableObject {
         engine.start()
         DB().prune()
         reload()
-        // Clipboard history doesn't belong in device backups, least of all whatever password was copied today.
-        var dir = Paths.dir, values = URLResourceValues()
-        values.isExcludedFromBackup = true
-        try? dir.setResourceValues(values)
         // The share sheet and the keyboard write to the same history while the app is away.
         NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in DB().prune(); self?.hosts = SyncEngine.enabledHosts; self?.reload() }
@@ -145,6 +142,7 @@ final class Model: ObservableObject {
     func reload() {
         clips = db.clips(query: query.isEmpty ? nil : query, preview: true)
         devices = db.deviceNames()
+        revision += 1
     }
 
     /// Everything kept, for the Library.
@@ -167,7 +165,7 @@ final class Model: ObservableObject {
         Addresses.forget(alias)
         // Left behind, the old host key would refuse this computer if it came back after a reinstall.
         guard let t = SSHTarget(alias), !hosts.contains(where: { SSHTarget($0)?.host == t.host && SSHTarget($0)?.port == t.port }) else { return }
-        Platform.defaults.removeObject(forKey: "sync.hostkey.\(t.host):\(t.port)")
+        Platform.defaults.removeObject(forKey: t.hostKeyPreference)
     }
 
     func redialAll() { hosts.forEach { SyncEngine.shared.redial($0) } }
@@ -207,8 +205,10 @@ final class Model: ObservableObject {
         }
     }
 
-    func addText(_ t: String) {
-        added(Inbox.text(t, source: "iPhone").map { [$0] } ?? [])
+    func addText(_ t: String) -> Bool {
+        guard let hash = Inbox.text(t, source: "iPhone") else { return false }
+        added([hash])
+        return true
     }
 
     func addFiles(_ urls: [URL]) {
@@ -252,7 +252,7 @@ final class Model: ObservableObject {
         confirmingLink = true
         let name = link.name.map { "It calls itself \($0). " } ?? ""
         Prompt.show("Link the computer at \(link.hosts[0])?",
-                    name + "It will get everything you copy here. Only link a computer you're setting up right now.",
+                    name + "Linking syncs the clipboard history ClipBubble keeps from the last 7 days and new copies between this iPhone and the computer. Only link a computer you're setting up right now.",
                     ok: "Link", cancel: "Cancel") { [weak self] yes in
             self?.confirmingLink = false
             if yes { self?.pair(link) }
@@ -319,7 +319,7 @@ struct HistoryView: View {
         .sheet(isPresented: shows(.panel), onDismiss: { adding = next; next = nil }) {
             AddPanel(paste: model.paste) { next = $0; adding = nil }
         }
-        .sheet(isPresented: shows(.text)) { TextComposer { model.addText($0) } }
+        .sheet(isPresented: shows(.text)) { TextComposer(add: model.addText) }
         .sheet(isPresented: Binding(get: { !welcomed && model.hosts.isEmpty }, set: { if !$0 { welcomed = true } })) {
             Welcome { welcomed = true; tab = .settings }
         }
@@ -332,7 +332,10 @@ struct HistoryView: View {
             photos = []
         }
         .fileImporter(isPresented: shows(.files), allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
-            if case .success(let urls) = result { model.addFiles(urls) }
+            switch result {
+            case .success(let urls): model.addFiles(urls)
+            case .failure: model.say("Couldn't open that file", .failed)
+            }
         }
     }
 
@@ -371,10 +374,22 @@ struct HistoryView: View {
             }
             Section {
                 ForEach(model.clips, id: \.hash) { c in
-                    Button { model.copy(c) } label: { ClipRow(clip: c, device: model.devices[c.origin]) }
-                        .tint(.primary)
-                        .swipeActions { Button("Delete", role: .destructive) { model.delete(c) } }
-                        .clipMenu(c) { viewing = c }
+                    HStack(spacing: 0) {
+                        Button { model.copy(c) } label: {
+                            ClipRow(clip: c, device: model.devices[c.origin])
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        Button { viewing = c } label: {
+                            Image(systemName: "info.circle").frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityLabel("Item details")
+                    }
+                    .swipeActions { Button("Delete", role: .destructive) { model.delete(c) } }
+                    .clipMenu(c) { viewing = c }
                 }
             } header: {
                 if !model.clips.isEmpty { Text("Recent") }
@@ -399,6 +414,13 @@ struct HistoryView: View {
         .searchable(text: $model.query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search history")
         .refreshable { model.redialAll() }
         .navigationTitle("ClipBubble")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                PasteButton(supportedContentTypes: [.image, .fileURL, .url, .plainText, .data]) { model.paste($0) }
+                    .labelStyle(.iconOnly).buttonBorderShape(.capsule).controlSize(.small)
+                    .accessibilityLabel("Paste into ClipBubble")
+            }
+        }
         .navigationDestination(item: $viewing) { ClipDetail(clip: $0) }
         .toast(model.line)
     }
@@ -420,7 +442,7 @@ struct Welcome: View {
                 point("desktopcomputer", "Get ClipBubble for your computer",
                       "It's free for Mac, Windows and Linux at clipbubble.krnl.studio, and keeps 7 days of what you copy.")
                 point("qrcode.viewfinder", "Link them once", "Open Link iPhone in ClipBubble on your computer and scan the code. They talk directly over your Wi-Fi.")
-                point("keyboard", "Use it anywhere", "Share anything to ClipBubble, or add the ClipBubble keyboard to type from your history in any app.")
+                point("keyboard", "Reuse your history", "Save items from the share sheet, or use the ClipBubble keyboard to type text in supported fields and copy images and files for pasting.")
             }
             .padding(28).padding(.top, 20)
         }
@@ -533,9 +555,10 @@ extension View {
 
 /// Type or paste a note to add to the history.
 struct TextComposer: View {
-    let add: (String) -> Void
+    let add: (String) -> Bool
     @Environment(\.dismiss) private var dismiss
     @State private var text = ""
+    @State private var saveFailed = false
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -548,11 +571,18 @@ struct TextComposer: View {
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                     ToolbarItem(placement: .confirmationAction) {
-                        Button("Add") { add(text); dismiss() }
+                        Button("Add") {
+                            if add(text) { dismiss() } else { saveFailed = true }
+                        }
                             .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }
                 .onAppear { focused = true }
+                .alert("Couldn't add that text", isPresented: $saveFailed) {
+                    Button("OK", role: .cancel) {}
+                } message: {
+                    Text(text.utf8.count > Sync.maxText ? "This text is too long. Shorten it and try again." : "Try saving your draft again.")
+                }
         }
         .presentationDetents([.medium, .large])
     }
@@ -773,13 +803,19 @@ struct SettingsView: View {
 struct ManualLink: View {
     @EnvironmentObject var model: Model
     @State private var alias = ""
+    @State private var publicLine: String?
 
     var body: some View {
         Form {
             Section {
-                Text(Keys.publicLine).font(.caption.monospaced()).textSelection(.enabled)
-                Button { UIPasteboard.general.string = Keys.publicLine; model.say("Key copied") } label: {
-                    Label("Copy this iPhone's key", systemImage: "doc.on.doc")
+                if let publicLine {
+                    Text(publicLine).font(.caption.monospaced()).textSelection(.enabled)
+                    Button { UIPasteboard.general.string = publicLine; model.say("Key copied") } label: {
+                        Label("Copy this iPhone's key", systemImage: "doc.on.doc")
+                    }
+                } else {
+                    Text("This iPhone's SSH key is unavailable. Unlock the iPhone and try again.")
+                    Button("Try again") { publicLine = Keys.publicLine }
                 }
             } header: { Text("1. Add this key on the computer") } footer: {
                 Text("Add it as a line in ~/.ssh/authorized_keys, with SSH turned on there and ClipBubble installed. A key added this way can do anything your account can, so link with the code when you can.")
@@ -797,6 +833,7 @@ struct ManualLink: View {
         }
         .navigationTitle("Link by hand")
         .navigationBarTitleDisplayMode(.inline)
+        .onAppear { publicLine = Keys.publicLine }
         .toast(model.line)
     }
 

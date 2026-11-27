@@ -7,8 +7,16 @@ enum Platform {
     static let group = "group.studio.krnl.clipbubble"
     static let os = "ios"
     static var deviceName: String { UIDevice.current.name }
-    static let dataDir = (FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group)
-        ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]).appendingPathComponent("ClipBubble")
+    static let dataDir: URL = {
+        let fm = FileManager.default
+        var dir = (fm.containerURL(forSecurityApplicationGroupIdentifier: group)
+            ?? fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]).appendingPathComponent("ClipBubble")
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? dir.setResourceValues(values)
+        return dir
+    }()
     static let defaults = UserDefaults(suiteName: group) ?? .standard
     /// The app is only ever linking while you're looking at it, so it never waits long.
     static let retryCap: Double = 30

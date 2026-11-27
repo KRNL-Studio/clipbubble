@@ -5,6 +5,7 @@ import UIKit
 /// files go on the clipboard to paste, since a keyboard can only type text.
 final class KeyboardViewController: UIInputViewController {
     private lazy var model = KeyboardModel(keyboard: self)
+    private var preferredHeight: NSLayoutConstraint?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -13,12 +14,15 @@ final class KeyboardViewController: UIInputViewController {
         host.view.translatesAutoresizingMaskIntoConstraints = false
         addChild(host)
         view.addSubview(host.view)
+        let height = view.heightAnchor.constraint(equalToConstant: 286)
+        height.priority = .defaultHigh
+        preferredHeight = height
         NSLayoutConstraint.activate([
             host.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             host.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             host.view.topAnchor.constraint(equalTo: view.topAnchor),
             host.view.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            host.view.heightAnchor.constraint(equalToConstant: 286),
+            height,
         ])
         host.didMove(toParent: self)
     }
@@ -26,6 +30,24 @@ final class KeyboardViewController: UIInputViewController {
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         model.appear(fullAccess: hasFullAccess, globe: needsInputModeSwitchKey)
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        let compact = view.traitCollection.verticalSizeClass == .compact
+        let height: CGFloat = compact ? 220 : 286
+        if preferredHeight?.constant != height { preferredHeight?.constant = height }
+        if model.compact != compact { model.compact = compact }
+        updateGlobe()
+    }
+
+    override func textDidChange(_ textInput: UITextInput?) {
+        super.textDidChange(textInput)
+        updateGlobe()
+    }
+
+    private func updateGlobe() {
+        if model.globe != needsInputModeSwitchKey { model.globe = needsInputModeSwitchKey }
     }
 
     /// A dismissed keyboard can stay alive in the background; it lets go of the link so the app can have it.
@@ -43,6 +65,7 @@ final class KeyboardModel: ObservableObject {
     @Published var linked = false
     @Published var fullAccess = true
     @Published var globe = false
+    @Published var compact = false
     @Published var note: String?
     /// Counts each time the keyboard comes up.
     @Published var opened = 0
@@ -61,7 +84,6 @@ final class KeyboardModel: ObservableObject {
         self.globe = globe
         guard fullAccess else { return }
         opened += 1
-        db.prune()
         checkApp()
         let engine = SyncEngine.shared
         reload()
@@ -92,6 +114,7 @@ final class KeyboardModel: ObservableObject {
     }
 
     func disappear() {
+        fetching = nil
         watching?.invalidate()
         watching = nil
     }
@@ -162,11 +185,16 @@ struct KeyboardView: View {
 
             if showsKeys {
                 // Without Full Access there's no history to show, so it's a plain keyboard until that's turned on.
-                VStack(spacing: 8) {
+                VStack(spacing: model.compact ? 4 : 8) {
                     if !model.fullAccess {
-                        Text("Turn on Allow Full Access in Settings → General → Keyboard → Keyboards → ClipBubble to see your history here.")
-                            .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center).lineLimit(2)
-                            .minimumScaleFactor(0.8).padding(.horizontal, 12).frame(maxHeight: .infinity)
+                        ViewThatFits(in: .vertical) {
+                            Text("Turn on Allow Full Access in Settings → General → Keyboard → Keyboards → ClipBubble to see your history.")
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text("Turn on Allow Full Access in ClipBubble’s keyboard settings.")
+                                .lineLimit(2).minimumScaleFactor(0.8)
+                        }
+                        .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                        .padding(.horizontal, 12).frame(maxHeight: .infinity)
                     } else {
                         Spacer(minLength: 0)
                     }
@@ -252,7 +280,7 @@ struct KeyboardView: View {
     private func key<L: View>(_ label: L, width: CGFloat?, function: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             label.font(.system(size: 18)).foregroundStyle(Color(.label))
-                .frame(maxWidth: width ?? .infinity).frame(width: width, height: 42)
+                .frame(maxWidth: width ?? .infinity).frame(width: width, height: model.compact ? 34 : 42)
                 .background(function ? KeyColor.function : KeyColor.letter, in: RoundedRectangle(cornerRadius: 8))
                 .shadow(color: .black.opacity(0.3), radius: 0, y: 1)
         }

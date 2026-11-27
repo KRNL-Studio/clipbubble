@@ -5,6 +5,7 @@ import UIKit
 @objc(ShareViewController)
 final class ShareViewController: UIViewController {
     private let state = ShareState()
+    private var delivery: Task<Void, Never>?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -17,18 +18,22 @@ final class ShareViewController: UIViewController {
         host.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         host.didMove(toParent: self)
 
-        DB().prune()
-        let providers = (extensionContext?.inputItems as? [NSExtensionItem] ?? []).flatMap { $0.attachments ?? [] }
-        Task { @MainActor in
+        let providers = (extensionContext?.inputItems as? [NSExtensionItem] ?? []).flatMap { item -> [NSItemProvider] in
+            if let attachments = item.attachments, !attachments.isEmpty { return attachments }
+            if let text = item.attributedContentText?.string { return [NSItemProvider(object: text as NSString)] }
+            return []
+        }
+        delivery = Task { @MainActor [weak self, state] in
             let message = await Courier.deliver(status: { [state] in state.text = $0 }) { [state] in
                 let hashes = await Inbox.add(providers, source: "Share", picturesAsFiles: true)
                 state.saved = !hashes.isEmpty
                 return hashes
             }
+            guard !Task.isCancelled else { return }
             state.text = message
             state.done = true
             try? await Task.sleep(nanoseconds: 1_400_000_000)
-            close()
+            if !Task.isCancelled { self?.close() }
         }
     }
 
@@ -45,6 +50,8 @@ final class ShareViewController: UIViewController {
     private func close() {
         guard !state.closed else { return }
         state.closed = true
+        delivery?.cancel()
+        delivery = nil
         extensionContext?.completeRequest(returningItems: nil)
     }
 }

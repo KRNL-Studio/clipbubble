@@ -7,8 +7,9 @@ enum Inbox {
     static func text(_ t: String, source: String) -> String? {
         guard t.utf8.count <= Sync.maxText, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         let hash = "t:" + sha(t)
-        DB().upsert(kind: "text", text: t, file: nil, source: source, hash: hash)
-        return hash
+        let db = DB()
+        db.upsert(kind: "text", text: t, file: nil, source: source, hash: hash)
+        return db.exists(hash: hash) ? hash : nil
     }
 
     /// Stored as PNG, which computers check against the hash and paste as a picture.
@@ -63,13 +64,27 @@ enum Inbox {
     }
 
     private static func saveImage(_ png: Data, source: String) -> String? {
-        let digest = sha(png)
-        let url = Paths.images.appendingPathComponent(digest + ".png")
-        try? FileManager.default.createDirectory(at: Paths.images, withIntermediateDirectories: true)
+        let hash = "i:" + sha(png)
+        let db = DB()
+        let fm = FileManager.default
+        func hasImage(_ clip: Clip?) -> Bool {
+            guard let clip, !clip.remote, let path = clip.file else { return false }
+            return fm.fileExists(atPath: path)
+        }
+        // Each writer owns its staged file, so cleanup can't unlink another process's copy.
+        let url = Paths.images.appendingPathComponent(UUID().uuidString + ".png")
         guard (try? png.write(to: url, options: .atomic)) != nil else { return nil }
-        let hash = "i:" + digest
-        DB().upsert(kind: "image", text: "", file: url.path, source: source, hash: hash)
-        return hash
+        var keepFile = false
+        defer { if !keepFile { try? fm.removeItem(at: url) } }
+        db.upsert(kind: "image", text: "", file: url.path, source: source, hash: hash)
+        guard db.exists(hash: hash) else { return nil }
+        if !hasImage(db.clip(hash: hash)) {
+            // Upserting an existing remote stub only bumps its timestamp.
+            db.received(hash: hash, file: url.path, text: nil)
+        }
+        let saved = db.clip(hash: hash)
+        keepFile = saved?.file == url.path
+        return hasImage(saved) ? hash : nil
     }
 
     /// A copy in ClipBubble's own folder, since what the share sheet hands over is gone once it closes.
@@ -82,11 +97,20 @@ enum Inbox {
         }
         let dir = Paths.dir.appendingPathComponent("sent").appendingPathComponent(UUID().uuidString)
         let dest = dir.appendingPathComponent(safeFileName(src.lastPathComponent))
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        guard (try? FileManager.default.copyItem(at: src, to: dest)) != nil else { return nil }
+        let fm = FileManager.default
+        var keepFile = false
+        defer { if !keepFile { try? fm.removeItem(at: dir) } }
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            try fm.copyItem(at: src, to: dest)
+        } catch {
+            return nil
+        }
         let hash = "f:" + sha(dest.path)
-        DB().upsert(kind: "file", text: dest.path, file: nil, source: source, hash: hash)
-        return hash
+        let db = DB()
+        db.upsert(kind: "file", text: dest.path, file: nil, source: source, hash: hash)
+        keepFile = db.exists(hash: hash)
+        return keepFile ? hash : nil
     }
 
     /// `file`, then clears the temporary folder the item was kept in until now.
@@ -100,6 +124,7 @@ enum Inbox {
     static func add(_ providers: [NSItemProvider], source: String, picturesAsFiles: Bool = false) async -> [String] {
         var hashes: [String] = []
         for p in providers {
+            guard !Task.isCancelled else { break }
             if let h = await add(p, source: source, picturesAsFiles: picturesAsFiles) { hashes.append(h) }
         }
         return hashes
@@ -165,9 +190,12 @@ enum Courier {
     /// Whatever didn't make it still syncs the next time ClipBubble opens.
     static func deliver(timeout: Double = 25, status: @escaping (String) -> Void = { _ in },
                         add: @escaping () async -> [String]) async -> String {
+        guard !Task.isCancelled else { return "Delivery stopped." }
         let engine = SyncEngine.shared
         guard !SyncEngine.enabledHosts.isEmpty else {
-            return await add().isEmpty ? "Couldn't save that." : "Saved. Link a computer in ClipBubble to send it there."
+            let hashes = await add()
+            guard !Task.isCancelled else { return "Delivery stopped." }
+            return hashes.isEmpty ? "Couldn't save that." : "Saved. Link a computer in ClipBubble to send it there."
         }
         engine.hold(true)
         defer { engine.hold(false) }
@@ -175,9 +203,11 @@ enum Courier {
         status("Connecting…")
         // Saved before the wait, so you can walk away from the share sheet with nothing lost.
         let hashes = await add()
+        guard !Task.isCancelled else { return "Delivery stopped." }
         guard !hashes.isEmpty else { return "Couldn't save that." }
         let wasLinked = engine.statuses.values.contains { $0.ok }
         let linked = await until(seconds: 10) { engine.statuses.values.contains { $0.ok } }
+        guard !Task.isCancelled else { return "Delivery stopped." }
         // A computer only takes what's just been copied onto its clipboard, so the wait mustn't count against it.
         if linked, !wasLinked {
             let now = Date().timeIntervalSince1970
@@ -192,29 +222,26 @@ enum Courier {
         }
         let names = Array(Set(engine.statuses.values.compactMap { s -> String? in if case .live(let h) = s { return h.name }; return nil }))
         status("Sending to \(names.joined(separator: ", "))…")
-        // Big files wait for Get on the computer; sending them from here means you want them there now.
-        for h in hashes where h.hasPrefix("f:") { engine.linked.forEach { engine.send(h, toDevice: $0.device) } }
         // Each item and computer that confirmed it, so two of three photos arriving isn't reported as all of them.
         var got: Set<String> = []
-        var progress: [String: Transfer] = [:]
         let (wasApplied, wasTransfers) = (engine.onApplied, engine.onTransfers)
         engine.onApplied = { hash, peer in wasApplied(hash, peer); if hashes.contains(hash) { got.insert(hash + "\n" + peer) } }
         engine.onTransfers = { t in
             wasTransfers(t)
-            progress = t
             let sending = t.values.filter(\.sending)
             if !sending.isEmpty {
                 let done = sending.map(\.done).reduce(0, +), total = max(1, sending.map(\.total).reduce(0, +))
                 status("Sending… \(Int(Double(done) / Double(total) * 100))%")
             }
         }
-        // A file still uploading gets up to ten more minutes.
-        let deadline = Date().addingTimeInterval(timeout), hardStop = deadline.addingTimeInterval(600)
-        while got.count < names.count * hashes.count, Date() < hardStop, Date() < deadline || progress.values.contains(where: \.sending) {
-            try? await Task.sleep(nanoseconds: 100_000_000)
+        defer {
+            engine.onApplied = wasApplied
+            engine.onTransfers = wasTransfers
         }
-        engine.onApplied = wasApplied
-        engine.onTransfers = wasTransfers
+        // Big files wait for Get on the computer; sending them from here means you want them there now.
+        for h in hashes where h.hasPrefix("f:") { engine.linked.forEach { engine.send(h, toDevice: $0.device) } }
+        _ = await until(seconds: timeout) { got.count >= names.count * hashes.count }
+        guard !Task.isCancelled else { return "Delivery stopped." }
         // No answer yet doesn't mean it arrived: it's saved here and syncs again next time.
         if got.isEmpty { return "Saved. Still waiting for \(names.joined(separator: ", ")) to confirm." }
         let complete = names.filter { n in hashes.allSatisfy { got.contains($0 + "\n" + n) } }
@@ -223,11 +250,12 @@ enum Courier {
     }
 
     private static func until(seconds: Double, _ cond: () -> Bool) async -> Bool {
-        let end = Date().addingTimeInterval(seconds)
-        while Date() < end {
+        let clock = ContinuousClock()
+        let end = clock.now + .seconds(seconds)
+        while !Task.isCancelled, clock.now < end {
             if cond() { return true }
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
-        return cond()
+        return !Task.isCancelled && cond()
     }
 }

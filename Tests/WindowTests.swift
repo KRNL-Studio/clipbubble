@@ -50,6 +50,28 @@ func windowTests() {
     check(browser.count == 1 && browser.clips.first?.hash == "window-shot", "History counts source-filtered matches")
 
     historyRecycledIDTest(model)
+    shotCardDragDismissTest()
+}
+
+private func shotCardDragDismissTest() {
+    let card = ShotCard()
+    var hidden = 0
+    card.onHidden = { hidden += 1 }
+    let url = testHome.appendingPathComponent("shot-drag.png")
+    card.show(url, beside: NSRect(x: 900, y: 20, width: 64, height: 64), in: NSRect(x: 0, y: 0, width: 1000, height: 800))
+    check(card.isVisible, "shot card appears for a new screenshot")
+    card.state.dragStarted()
+    card.state.hovered(false)
+    check(card.isVisible && hidden == 0, "shot card stays visible while dragging")
+    card.state.dragEnded(false)
+    check(card.isVisible && hidden == 0, "cancelling a drag leaves the shot card visible")
+    card.state.dragStarted()
+    card.state.dragEnded(true)
+    let deadline = Date().addingTimeInterval(0.6)
+    while card.isVisible, Date() < deadline {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+    }
+    check(!card.isVisible && hidden == 1, "dropping a dragged screenshot hides the shot card immediately")
 }
 
 private func historyRecycledIDTest(_ model: Model) {

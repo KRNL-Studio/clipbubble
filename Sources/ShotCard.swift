@@ -27,6 +27,8 @@ final class ShotCardState: ObservableObject {
     var copy: () -> Void = {}
     var close: () -> Void = {}
     var hovered: (Bool) -> Void = { _ in }
+    var dragStarted: () -> Void = {}
+    var dragEnded: (_ dropped: Bool) -> Void = { _ in }
 }
 
 final class ShotCard {
@@ -36,6 +38,7 @@ final class ShotCard {
     private var hideWork: DispatchWorkItem?
     private var copyFeedbackWork: DispatchWorkItem?
     private var hovering = false
+    private var dragging = false
 
     var onPolish: (URL) -> Void = { _ in }
     var onCopy: (URL) -> Bool = { _ in false }
@@ -74,13 +77,25 @@ final class ShotCard {
         state.hovered = { [weak self] on in
             guard let self else { return }
             self.hovering = on
-            if on { self.hideWork?.cancel() } else { self.schedule(after: 2.5) }
+            if on || self.dragging { self.hideWork?.cancel() } else { self.schedule(after: 2.5) }
+        }
+        state.dragStarted = { [weak self] in
+            guard let self else { return }
+            self.dragging = true
+            self.hideWork?.cancel()
+        }
+        state.dragEnded = { [weak self] dropped in
+            guard let self else { return }
+            self.dragging = false
+            if dropped { self.hide() }
+            else if !self.hovering { self.schedule(after: 2.5) }
         }
     }
 
     /// Slides out of the bubble's side of the screen, level with the bubble.
     func show(_ url: URL, beside b: NSRect, in area: NSRect) {
         state.url = url
+        dragging = false
         copyFeedbackWork?.cancel()
         state.copyFeedback = nil
         let s = ShotCard.size
@@ -127,12 +142,13 @@ final class ShotCard {
         copyFeedbackWork?.cancel()
         state.url = nil
         hovering = false
+        dragging = false
         onHidden()
     }
 
     private func schedule(after s: Double) {
         hideWork?.cancel()
-        guard !hovering else { return }
+        guard !hovering, !dragging else { return }
         let w = DispatchWorkItem { [weak self] in self?.hide() }
         hideWork = w
         DispatchQueue.main.asyncAfter(deadline: .now() + s, execute: w)
@@ -163,7 +179,7 @@ private struct ShotCardView: View {
                         .scaleEffect(hoverThumb ? 1.015 : 1)
                         .animation(.spring(response: 0.25, dampingFraction: 0.8), value: hoverThumb)
                         .onHover { hoverThumb = $0 }
-                        .onDrag { NSItemProvider(contentsOf: url) ?? NSItemProvider() }
+                        .overlay { ShotDragView(url: url, onStart: state.dragStarted, onEnd: state.dragEnded) }
                         .help("Drag it anywhere")
                 }
                 Button(action: state.close) {
@@ -203,6 +219,64 @@ private struct ShotCardView: View {
         }
         .padding(12)
         .onHover { state.hovered($0) }
+    }
+}
+
+/// AppKit file-URL drag source so the card knows the exact moment a drop lands and hides at once.
+private struct ShotDragView: NSViewRepresentable {
+    let url: URL
+    let onStart: () -> Void
+    let onEnd: (_ dropped: Bool) -> Void
+
+    func makeNSView(context: Context) -> Source { Source(url: url, onStart: onStart, onEnd: onEnd) }
+
+    func updateNSView(_ view: Source, context: Context) {
+        view.url = url
+        view.onStart = onStart
+        view.onEnd = onEnd
+    }
+
+    final class Source: NSView, NSDraggingSource {
+        var url: URL
+        var onStart: () -> Void
+        var onEnd: (_ dropped: Bool) -> Void
+
+        init(url: URL, onStart: @escaping () -> Void, onEnd: @escaping (_ dropped: Bool) -> Void) {
+            self.url = url
+            self.onStart = onStart
+            self.onEnd = onEnd
+            super.init(frame: .zero)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { fatalError() }
+
+        override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
+        override var mouseDownCanMoveWindow: Bool { false }
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+        override func mouseDown(with event: NSEvent) {}
+
+        override func mouseDragged(with event: NSEvent) {
+            let item = NSDraggingItem(pasteboardWriter: url as NSURL)
+            let preview = Thumbs.cached(url.path, 640) ?? NSImage(contentsOf: url) ?? NSWorkspace.shared.icon(forFile: url.path)
+            let side: CGFloat = 110
+            let ratio = preview.size.height > 0 ? preview.size.width / preview.size.height : 1
+            let size = ratio >= 1 ? NSSize(width: side, height: max(44, side / ratio))
+                : NSSize(width: max(44, side * ratio), height: side)
+            let p = convert(event.locationInWindow, from: nil)
+            item.setDraggingFrame(NSRect(x: p.x - size.width / 2, y: p.y - size.height / 2, width: size.width, height: size.height),
+                                  contents: preview)
+            onStart()
+            beginDraggingSession(with: [item], event: event, source: self)
+        }
+
+        func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+            context == .outsideApplication ? .copy : []
+        }
+
+        func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+            onEnd(operation != [])
+        }
     }
 }
 

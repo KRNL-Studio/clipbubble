@@ -18,6 +18,8 @@ final class Model: ObservableObject {
     @Published var selection: Int64?
     @Published var previewing = false
     @Published var prefsTick = 0
+    @Published var folderAccess: [OnboardingFolder: Bool] = [:]
+    @Published var showsScreenshotThumbnail = true
     @Published var shown = 0          // bumps on every open: refocuses search and refreshes relative times
     @Published var pulse = false
     @Published var pulseTicks = 0
@@ -45,12 +47,23 @@ final class Model: ObservableObject {
     let db = DB()
     var pickClip: (Clip, _ paste: Bool) -> Bool = { _, _ in false }
     var hoverChanged: () -> Void = {}
-    var prefsChanged: () -> Void = {}
+    var prefsChanged: (String) -> Void = { _ in }
+    var screenshotThumbnailChanged: (_ applyRequested: Bool) -> Void = { _ in }
     var bubbleModeChanged: () -> Void = {}
     var openApp: (AppPage) -> Void = { _ in }
     var historyChanged: () -> Void = {}
-    /// Opens an image in the Polish editor.
     var polish: (Clip) -> Void = { _ in }
+    var openPolishEditor: (URL) -> Void = { _ in }
+    @Published var polishActivity: (clipID: Int64, status: OneShotStatus)?
+    @Published var polishToast: (source: URL, thumbnail: NSImage?)?
+
+    func polishStatus(for clip: Clip) -> OneShotStatus? {
+        polishActivity?.clipID == clip.id ? polishActivity?.status : nil
+    }
+
+    func editInPolish(_ clip: Clip) {
+        if let path = clip.polishPath { openPolishEditor(URL(fileURLWithPath: path)) }
+    }
 
     var selected: Clip? { clips.first { $0.id == selection } ?? clips.first }
 
@@ -84,7 +97,7 @@ final class Model: ObservableObject {
         prefsTick += 1
         reload()
         reloadRecent()
-        prefsChanged()
+        prefsChanged(key)
     }
 
     func loadMascots() {
@@ -157,7 +170,7 @@ enum Thumbs {
     static func cached(_ path: String, _ px: Int) -> NSImage? { cache.object(forKey: key(path, px)) }
     static func size(of path: String) -> CGSize? { dims[path] }
 
-    static func load(_ path: String, _ px: Int, done: @escaping (NSImage?) -> Void) {
+    static func load(_ path: String, _ px: Int, attempt: Int = 0, done: @escaping (NSImage?) -> Void) {
         if let hit = cached(path, px) { done(hit); return }
         queue.async {
             let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil)
@@ -165,6 +178,11 @@ enum Thumbs {
             let opts = [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: px,
                         kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary
             let img = src.flatMap { CGImageSourceCreateThumbnailAtIndex($0, 0, opts) }.map { NSImage(cgImage: $0, size: .zero) }
+            if img == nil, attempt == 0, FileManager.default.fileExists(atPath: path) {
+                // A brand-new screenshot may still be flushing bytes to disk; retry once shortly after.
+                queue.asyncAfter(deadline: .now() + 0.15) { load(path, px, attempt: 1, done: done) }
+                return
+            }
             if let img { cache.setObject(img, forKey: key(path, px)) }
             let w = props?[kCGImagePropertyPixelWidth] as? Int, h = props?[kCGImagePropertyPixelHeight] as? Int
             DispatchQueue.main.async {
@@ -276,11 +294,12 @@ final class FloatingPanel: NSPanel {
     override var canBecomeKey: Bool { keyable }
 }
 
-/// Dark frosted glass, masked to a rounded rectangle (a circle when radius is half the size).
-func glass(frame: NSRect, radius: CGFloat) -> NSVisualEffectView {
+/// Frosted glass masked to a rounded rectangle (a circle when radius is half the size).
+func glass(frame: NSRect, radius: CGFloat, material: NSVisualEffectView.Material = .hudWindow,
+           blendingMode: NSVisualEffectView.BlendingMode = .behindWindow) -> NSVisualEffectView {
     let v = NSVisualEffectView(frame: frame)
-    v.material = .hudWindow
-    v.blendingMode = .behindWindow
+    v.material = material
+    v.blendingMode = blendingMode
     v.state = .active
     v.autoresizingMask = [.width, .height]
     let side = radius * 2 + 1
@@ -422,11 +441,13 @@ struct Row: View, Equatable {
     let selected: Bool
     let tick: Int
     let transfer: Transfer?
+    let polishStatus: OneShotStatus?
     let model: Model        // not observed, so a row redraws only when its own inputs change
     @State private var hover = false
 
     static func == (a: Row, b: Row) -> Bool {
-        a.clip == b.clip && a.index == b.index && a.selected == b.selected && a.tick == b.tick && a.transfer == b.transfer
+        a.clip == b.clip && a.index == b.index && a.selected == b.selected && a.tick == b.tick
+            && a.transfer == b.transfer && a.polishStatus == b.polishStatus
     }
 
     var body: some View {
@@ -465,12 +486,21 @@ struct Row: View, Equatable {
                 }
                 .buttonStyle(.borderless).help("Download it from \(model.devices[clip.origin] ?? "the other device")")
             }
-            if hover, transfer == nil, clip.polishPath != nil {
-                Button { model.polish(clip) } label: {
-                    Image(systemName: "sparkles").font(.system(size: 12, weight: .medium)).frame(width: 24, height: 24)
+            if hover || polishStatus != nil, transfer == nil, clip.polishPath != nil {
+                Button {
+                    if NSEvent.modifierFlags.contains(.option) { model.editInPolish(clip) }
+                    else { model.polish(clip) }
+                } label: {
+                    Group {
+                        if polishStatus == .rendering { ProgressView().controlSize(.mini) }
+                        else { Image(systemName: polishStatus?.symbol ?? "sparkles").font(.system(size: 12, weight: .medium)) }
+                    }
+                        .frame(width: 24, height: 24)
                         .background(Circle().fill(Color.white.opacity(0.1)))
                 }
-                .buttonStyle(.plain).help("Polish  ⌘E")
+                .buttonStyle(.plain)
+                .accessibilityLabel("Polish and copy")
+                .help("Polish and copy  ⌘E\nEdit in Polish  ⇧⌘E or ⌥-click")
                 .transition(.scale(scale: 0.6).combined(with: .opacity))
             }
             if index >= 0 && index < 9 {
@@ -489,7 +519,10 @@ struct Row: View, Equatable {
             if !clip.remote {
                 Button("Paste") { model.pick(clip, true) }
                 Button("Copy") { model.pick(clip, false) }
-                if clip.polishPath != nil { Button("Polish…") { model.polish(clip) } }
+                if clip.polishPath != nil {
+                    Button("Polish") { model.polish(clip) }
+                    Button("Edit in Polish…") { model.editInPolish(clip) }
+                }
                 if let p = clip.imagePath ?? clip.paths.first {
                     Button("Open") { NSWorkspace.shared.open(URL(fileURLWithPath: p)) }
                     Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p)]) }
@@ -645,6 +678,10 @@ struct PanelView: View {
             }
             .frame(maxHeight: .infinity)
 
+            if let toast = model.polishToast {
+                polishToast(source: toast.source, thumbnail: toast.thumbnail)
+                    .padding(.horizontal, 12).padding(.bottom, 8)
+            }
             Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1)
             footer
         }
@@ -663,7 +700,7 @@ struct PanelView: View {
                     LazyVStack(spacing: 1) {
                         ForEach(Array(model.clips.enumerated()), id: \.element.id) { i, c in
                             Row(clip: c, index: i, selected: c.id == model.selection, tick: model.shown,
-                                transfer: model.transfers[c.hash], model: model)
+                                transfer: model.transfers[c.hash], polishStatus: model.polishStatus(for: c), model: model)
                                 .equatable().id(c.id)
                         }
                     }
@@ -677,6 +714,30 @@ struct PanelView: View {
     }
 
     private var updateAvailable: Bool { if case .available = updater.state { return true } else { return false } }
+
+    private func polishToast(source: URL, thumbnail: NSImage?) -> some View {
+        HStack(spacing: 8) {
+            if let thumbnail {
+                Image(nsImage: thumbnail)
+                    .resizable().scaledToFit()
+                    .frame(width: 32, height: 22)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .accessibilityHidden(true)
+            } else {
+                Image(systemName: "exclamationmark.triangle").foregroundStyle(.secondary)
+            }
+            Text(thumbnail == nil ? "Couldn’t polish image" : "Polished and copied")
+                .font(.system(size: 12, weight: .medium))
+            if thumbnail != nil {
+                Button("Edit") { model.openPolishEditor(source) }
+                    .controlSize(.small)
+                    .help("Edit in Polish")
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9))
+        .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(.primary.opacity(0.12)))
+    }
 
     private var footer: some View {
         HStack(spacing: 14) {
@@ -695,7 +756,9 @@ struct PanelView: View {
             Key(keys: "↩", label: "Paste")
             Key(keys: "⌥↩", label: "Copy")
             Key(keys: "⌘Y", label: "Preview")
-            if model.selected?.polishPath != nil { Key(keys: "⌘E", label: "Polish") } else { Key(keys: "⌘⌫", label: "Delete") }
+            if model.selected?.polishPath != nil {
+                Key(keys: "⌘E", label: "Polish")
+            } else { Key(keys: "⌘⌫", label: "Delete") }
         }
         .padding(.horizontal, 14).frame(height: 36)
     }
@@ -776,7 +839,10 @@ struct PeekView: View {
             if model.recent.isEmpty {
                 Text("Nothing copied yet").font(.system(size: 12)).foregroundStyle(.secondary).padding(8)
             }
-            ForEach(model.recent) { Row(clip: $0, index: -1, selected: false, tick: model.shown, transfer: model.transfers[$0.hash], model: model) }
+            ForEach(model.recent) { c in
+                Row(clip: c, index: -1, selected: false, tick: model.shown, transfer: model.transfers[c.hash],
+                    polishStatus: model.polishStatus(for: c), model: model)
+            }
         }
         .padding(6)
         .frame(width: 300)
@@ -787,7 +853,7 @@ struct PeekView: View {
 
 // MARK: - App
 
-struct PolishedFile: Equatable {
+struct PolishedFile: Hashable {
     let path: String
     private let device: dev_t
     private let inode: ino_t
@@ -815,15 +881,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var peekHost: NSView!
     private(set) var appWindow: AppWindow!
     private(set) var shotCard = ShotCard()
+    private let oneShot = OneShot()
+    private var polishRowReset: DispatchWorkItem?
+    private var polishToastReset: DispatchWorkItem?
+    var putPolishedOnClipboard: (Data) -> Bool = { Board.writePNG($0, polished: true) }
     private var polishedPaths: [String: PolishedFile] = [:]
-    var polishedFileAt: (URL) -> PolishedFile? = PolishedFile.read
-    var screenshotClipboardChangeCount: () -> Int = { NSPasteboard.general.changeCount }
-    private var screenshotClipboardWrite: (count: Int, baseline: Int)?
-    // Resolve screenshot identities in arrival order so their effects are delivered in that order.
-    private static let screenshotIdentityQueue = DispatchQueue(label: "clipbubble.screenshotIdentity", qos: .userInitiated)
+    private var announcedScreenshots: Set<PolishedFile> = []
+    var fileIdentity: (URL) -> PolishedFile? = PolishedFile.read
+    var clipboardCount: () -> Int = { NSPasteboard.general.changeCount }
+    private var shotWrite: (count: Int, baseline: Int)?
+    // Keep screenshot notifications in arrival order.
+    private static let shotQueue = DispatchQueue(label: "clipbubble.screenshotIdentity", qos: .userInitiated)
     private var localClickMonitor: Any?
     private var capture: Capture!
     private var screenshots: FolderWatcher?
+    private var screencapture: Screencapture?
     private var downloads: FolderWatcher?
     private var clickMonitor: Any?
     private var keyMonitor: Any?
@@ -859,26 +931,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [weak self] in
             // Launch Services can hide the app just after it finishes launching.
             guard let self, !NSApp.isHidden, !NSRunningApplication.current.isHidden, self.appWindow.window == nil else { return }
-            let first = !UserDefaults.standard.bool(forKey: "shownAppWindow")
-            if first { UserDefaults.standard.set(true, forKey: "shownAppWindow") }
-            self.appWindow.show(first ? .general : .history)
+            self.appWindow.show(.history)
         }
     }
 
     func applicationWillTerminate(_ n: Notification) {
+        screencapture?.restore()
         PolishHandoffs.clear()
+    }
+
+    func applicationDidBecomeActive(_ n: Notification) {
+        syncScreenshotThumbnail()
+        guard let window = appWindow?.window, window.isVisible, !window.isMiniaturized else { return }
+        screenshots?.retryIfPaused()
+        downloads?.retryIfPaused()
+        backfillWatchedFolders()
     }
 
     /// The bubble, panel and peek. Tests stop here, so they start no capture, sync or global shortcuts, and pass
     /// `keyable: false` so a run can't take the keyboard, or lose its panel to a click you make somewhere else.
     func setUpWindows(keyable: Bool = true) {
-        UserDefaults.standard.register(defaults: ["copyScreenshots": true, "corner": "br", "polishCard": true])
+        UserDefaults.standard.register(defaults: ["copyScreenshots": true, "corner": "br", "polishCard": true,
+                                                   Screencapture.replacementKey: true])
         model.db.prune()
         model.reload()
         model.reloadRecent()
         MainMenu.install(full: false)
         appWindow = AppWindow(model: model)
+        appWindow.onboarding.setFolderPreference = { [weak model] folder, enabled in model?.setPref(folder.rawValue, enabled) }
+        appWindow.onboarding.didCompleteFirstRun = { [weak self] in self?.refreshFolderServices() }
         MainMenu.openPage = { [weak self] in self?.appWindow.show($0) }
+        MainMenu.runSetup = { [weak self] in self?.openSetupWindow() }
 
         bubble = FloatingPanel(size: NSSize(width: 64, height: 64), keyable: false)
         let view = BubbleView(frame: NSRect(x: 0, y: 0, width: 64, height: 64))
@@ -921,8 +1004,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.historyChanged = { [weak self] in self?.appWindow.historyChanged() }
         view.onMenu = { [weak self] in self?.bubbleMenu() ?? NSMenu() }
         model.polish = { [weak self] in self?.polish($0) }
+        model.openPolishEditor = { [weak self] in self?.editInPolish($0) }
         PolishWindow.onSaved = { [weak self] in self?.polishedSaved($0) }
-        shotCard.onPolish = { [weak self] in self?.polish(file: $0) }
+        shotCard.onPolish = { [weak self] url, done in
+            guard let self else { return false }
+            return self.oneShot.start(url, putOnClipboard: self.putPolishedOnClipboard, done: done)
+        }
+        shotCard.onEdit = { [weak self] in self?.editInPolish($0) }
         shotCard.onCopy = { [weak self] url in
             guard let self, let c = self.model.db.clip(hash: "f:" + sha(url.path)) else { return false }
             return self.model.pick(c, false)
@@ -933,11 +1021,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Polish
 
     func polish(_ c: Clip) {
-        guard let p = c.polishPath else { NSSound.beep(); return }
-        polish(file: URL(fileURLWithPath: p))
+        guard let path = c.polishPath else { return }
+        let source = URL(fileURLWithPath: path)
+        guard oneShot.start(source, putOnClipboard: putPolishedOnClipboard, done: { [weak self] output in
+            guard let self else { return }
+            let thumbnail = output?.thumbnail
+            self.model.polishActivity = (c.id, thumbnail == nil ? .failed : .copied)
+            self.model.polishToast = (source, thumbnail)
+            self.polishRowReset = .onMain(after: 1.5) { [weak self] in self?.model.polishActivity = nil }
+            self.polishToastReset = .onMain(after: thumbnail == nil ? 1.5 : 4) { [weak self] in self?.model.polishToast = nil }
+        }) else { return }
+        polishRowReset?.cancel()
+        polishToastReset?.cancel()
+        model.polishToast = nil
+        model.polishActivity = (c.id, .rendering)
     }
 
-    private func polish(file url: URL) {
+    private func editInPolish(_ url: URL) {
         hidePanel()
         hidePeek()
         shotCard.hide()
@@ -946,7 +1046,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// A saved copy joins history as Polished, not as a new screenshot.
     func polishedSaved(_ url: URL) {
-        if let file = polishedFileAt(url) { polishedPaths[file.path] = file }
+        if let file = fileIdentity(url) { polishedPaths[file.path] = file }
         model.db.insertIfMissing(kind: "file", text: url.path, source: "Polished", hash: "f:" + sha(url.path), created: Date())
         refreshLists()
     }
@@ -967,27 +1067,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         connectSync()
         SyncEngine.shared.start()
         Updater.shared.start()
-        syncScreenshots()
-        syncDownloads()
-        model.prefsChanged = { [weak self] in self?.syncScreenshots(); self?.syncDownloads(); self?.importFolders() }
-        // Notice when the screenshot location changes in ⌘⇧5 → Options.
-        Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
-            guard let self, self.screenshots?.folder != FolderWatcher.screenshotFolder else { return }
-            self.syncScreenshots()
-            self.importFolders()
+        screencapture = .system()
+        model.screenshotThumbnailChanged = { [weak self] in self?.syncScreenshotThumbnail(applyRequested: $0) }
+        model.prefsChanged = { [weak self] key in
+            self?.refreshFolderServices(retrying: OnboardingFolder(rawValue: key))
         }
-        importFolders()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.importFolders() }
-        Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
+        refreshFolderServices()
+        // Notice thumbnail and location changes in ⌘⇧5 → Options.
+        let refreshScreenshots: @MainActor @Sendable () -> Void = { [weak self] in
+            guard let self else { return }
+            self.syncScreenshotThumbnail()
+            guard self.screenshots?.folder != FolderWatcher.screenshotFolder,
+                  self.screenshots != nil || (Prefs.on("screenshots") && self.appWindow.onboarding.canWatch(.screenshots))
+            else { return }
+            self.refreshFolderServices()
+        }
+        Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { _ in
+            MainActor.assumeIsolated(refreshScreenshots)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.backfillWatchedFolders() }
+        let maintainHistory: @MainActor @Sendable () -> Void = { [weak self] in
             self?.model.db.prune()
-            self?.importFolders()
+            self?.backfillWatchedFolders()
         }
+        Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { _ in
+            MainActor.assumeIsolated(maintainHistory)
+        }
+        let snapToDisplay: @MainActor @Sendable () -> Void = { [weak self] in self?.snap(animated: false) }
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
-                                               object: nil, queue: .main) { [weak self] _ in self?.snap(animated: false) }
+                                               object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated(snapToDisplay)
+        }
         // Mascot changes from the MCP server (another process) land here.
-        DistributedNotificationCenter.default().addObserver(forName: Mascots.changed, object: nil, queue: .main) { [weak self] _ in
+        let reloadMascots: @MainActor @Sendable () -> Void = { [weak self] in
             self?.model.loadMascots()
             self?.model.pulseTicks += 1
+        }
+        DistributedNotificationCenter.default().addObserver(forName: Mascots.changed, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated(reloadMascots)
         }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard let self else { return e }
@@ -1017,16 +1134,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         reveal()
     }
 
+    private func refreshFolderServices(retrying folder: OnboardingFolder? = nil) {
+        syncScreenshotThumbnail()
+        if appWindow.onboarding.canWatch(.screenshots) {
+            syncScreenshots()
+        } else {
+            screenshots?.stop()
+            screenshots = nil
+            model.folderAccess[.screenshots] = nil
+        }
+        syncDownloads()
+        if folder == .screenshots { screenshots?.retryIfPaused() }
+        if folder == .downloads { downloads?.retryIfPaused() }
+        backfillWatchedFolders()
+    }
+
+    private func backfillWatchedFolders() {
+        if !appWindow.onboarding.needsSetup || screenshots != nil || downloads != nil { importFolders() }
+    }
+
+    private func syncScreenshotThumbnail(applyRequested: Bool = false) {
+        guard let screencapture else { return }
+        let screenshotsActive = Prefs.on("screenshots") && appWindow.onboarding.canWatch(.screenshots)
+        screencapture.sync(saveScreenshots: screenshotsActive, applyRequested: applyRequested)
+        if model.showsScreenshotThumbnail != screencapture.showsThumbnail {
+            model.showsScreenshotThumbnail = screencapture.showsThumbnail
+        }
+    }
+
     /// Every screenshot lands in history; copying it to the clipboard as well is optional.
     func syncScreenshots() {
         let folder = FolderWatcher.screenshotFolder
-        guard Prefs.on("screenshots") else { screenshots?.stop(); screenshots = nil; return }
-        guard screenshots?.folder != folder else { return }
+        let enabled = Prefs.on("screenshots")
+        if enabled, screenshots?.folder == folder { return }
         screenshots?.stop()
+        model.folderAccess[.screenshots] = nil
+        guard enabled else { screenshots = nil; return }
         // A picture that lands on the Desktop isn't a screenshot. Only macOS marks its own, so a folder picked in Settings isn't held to that.
         let markedOnly = folder == FolderWatcher.macOSScreenshotFolder
-        screenshots = FolderWatcher(folder: folder, maxAge: 120, include: {
+        screenshots = FolderWatcher(folder: folder, maxAge: 30, include: {
             isImagePath($0.path) ? !markedOnly || FolderWatcher.isScreenCapture($0) : ["mov", "mp4"].contains($0.pathExtension.lowercased())
+        }, onAccessChanged: { [weak model] allowed in
+            model?.folderAccess[.screenshots] = allowed
         }) { [weak self] url, date in
             self?.screenshotAdded(url, at: date)
         }
@@ -1035,34 +1184,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func screenshotAdded(_ url: URL, at date: Date) {
         guard Prefs.on("screenshots") else { return }
         let watcher = screenshots
-        let clipboardBaseline = screenshotClipboardBaseline()
+        let baseline = clipboardBaseline()
         guard !polishedPaths.isEmpty else {
-            announceScreenshot(url, at: date, file: nil, clipboardBaseline: clipboardBaseline)
+            announceScreenshot(url, at: date, file: nil, baseline: baseline)
             return
         }
-        let read = polishedFileAt
-        Self.screenshotIdentityQueue.async { [weak self] in
+        let read = fileIdentity
+        Self.shotQueue.async { [weak self] in
             let file = read(url)
             DispatchQueue.main.async {
                 guard let self, self.screenshots === watcher, Prefs.on("screenshots") else { return }
-                self.announceScreenshot(url, at: date, file: file, clipboardBaseline: clipboardBaseline)
+                self.announceScreenshot(url, at: date, file: file, baseline: baseline)
             }
         }
     }
 
-    private func screenshotClipboardBaseline() -> Int {
-        let count = screenshotClipboardChangeCount()
+    private func clipboardBaseline() -> Int {
+        let count = clipboardCount()
         // A run of our own screenshot writes shares the clipboard count it started from.
-        if let write = screenshotClipboardWrite, write.count == count { return write.baseline }
+        if let write = shotWrite, write.count == count { return write.baseline }
         return count
     }
 
-    private func announceScreenshot(_ url: URL, at date: Date, file: PolishedFile?, clipboardBaseline: Int) {
+    private func announceScreenshot(_ url: URL, at date: Date, file: PolishedFile?, baseline: Int) {
+        let identity = file ?? fileIdentity(url)
+        if let identity, announcedScreenshots.contains(identity) { return }
         guard let hash = recordScreenshot(url, at: date, file: file) else { return }
+        if let identity { announcedScreenshots.insert(identity) }
         // A copy to the clipboard is announced when capture saves it, unless copied files aren't saved.
         if UserDefaults.standard.bool(forKey: "copyScreenshots"), let c = model.db.clip(hash: hash),
-           screenshotClipboardBaseline() == clipboardBaseline {
-            if let count = putOnClipboard(c) { screenshotClipboardWrite = (count, clipboardBaseline) }
+           clipboardBaseline() == baseline {
+            if let count = putOnClipboard(c) { shotWrite = (count, baseline) }
             if !Prefs.on("files") { captured() }
         } else { captured() }
         offerPolish(url)
@@ -1083,16 +1235,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Watches ~/Downloads only while that's switched on (so the privacy prompt only shows up if you want it).
     private func syncDownloads() {
-        if Prefs.on("downloads") {
+        if Prefs.on("downloads"), appWindow.onboarding.canWatch(.downloads) {
             guard downloads == nil, let dir = FolderWatcher.downloadsFolder else { return }
             downloads = FolderWatcher(folder: dir, maxAge: nil,
-                                      include: { !FolderWatcher.tempExts.contains($0.pathExtension.lowercased()) && $0.lastPathComponent != "ClipBubble" }) { [weak self] url, date in
+                                      include: { !FolderWatcher.tempExts.contains($0.pathExtension.lowercased()) && $0.lastPathComponent != "ClipBubble" },
+                                      onAccessChanged: { [weak model] allowed in model?.folderAccess[.downloads] = allowed }) { [weak self] url, date in
                 self?.model.db.insertIfMissing(kind: "file", text: url.path, source: "Downloads", hash: "f:" + sha(url.path), created: date)
                 self?.captured()
             }
         } else {
             downloads?.stop()
             downloads = nil
+            model.folderAccess[.downloads] = nil
         }
     }
 
@@ -1124,7 +1278,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         // Resolving aliases and reading file metadata can block on a mounted volume.
-        let read = polishedFileAt
+        let read = fileIdentity
         DispatchQueue.global(qos: .utility).async {
             let files = found.map { ($0.0, $0.1, read($0.0)) }
             DispatchQueue.main.async { apply(files) }
@@ -1202,7 +1356,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             else { hidePanel() }
         case kVK_Delete where cmd: if let c = model.selected { model.delete(c) }
         case kVK_ANSI_Y where cmd: model.previewing.toggle()
-        case kVK_ANSI_E where cmd: if let c = model.selected { polish(c) }
+        case kVK_ANSI_E where cmd && !opt && !e.modifierFlags.contains(.control):
+            if let c = model.selected {
+                if e.modifierFlags.contains(.shift) { model.editInPolish(c) }
+                else { model.polish(c) }
+            }
         default:
             if cmd, let d = Int(e.charactersIgnoringModifiers ?? ""), (1...9).contains(d), d <= model.clips.count {
                 pick(model.clips[d - 1], paste: !opt)
@@ -1236,7 +1394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let center = NSPoint(x: bubble.frame.midX, y: bubble.frame.midY)
         guard let display = chosen ?? bubbleDisplay else { return }
         let area = display.visible
-        if shotCard.isVisible && !display.frame.contains(shotCard.frame) { shotCard.hide(animated: false) }
+        if shotCard.isVisible && !display.frame.intersects(shotCard.frame) { shotCard.hide(animated: false) }
         var corner = UserDefaults.standard.string(forKey: "corner") ?? "br"
         if animated {
             corner = (center.y > area.midY ? "t" : "b") + (center.x > area.midX ? "r" : "l")
@@ -1266,7 +1424,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func clipboardChanged(copied: Bool) {
         guard copied else { return refreshLists() }
-        showBubble()
+        // If ShotCard is already up for a just-taken screenshot, reveal the bubble beside it instead of jumping displays and hiding the card.
+        showBubble(on: shotCard.isVisible ? bubbleDisplay : nil)
         captured()
     }
 
@@ -1329,11 +1488,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Back on screen but still see-through: whoever calls this sets how opaque. Hidden, it has no position to
     /// jump from, so it comes back on the screen with the pointer.
-    private func showBubble() {
+    private func showBubble(on display: Display? = nil) {
         hideWork?.cancel()
         hiding = false
         guard !bubble.isVisible else { return }
-        snap(animated: false, on: pointerDisplay)
+        snap(animated: false, on: display ?? pointerDisplay)
         bubble.alphaValue = 0
         bubble.orderFrontRegardless()
     }
@@ -1380,6 +1539,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appWindow.show(page)
     }
 
+    private func openSetupWindow() {
+        resumePanel = true
+        hidePanel()
+        appWindow.showSetup()
+    }
+
     /// Right-clicking the bubble.
     private func bubbleMenu() -> NSMenu {
         let m = NSMenu()
@@ -1388,6 +1553,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let i = MenuAction.item(title) { [weak self] in self?.openAppWindow(page) }
             m.addItem(i)
         }
+        m.addItem(MenuAction.item("Run Setup…") { [weak self] in self?.openSetupWindow() })
         m.addItem(.separator())
         m.addItem(MenuAction.item("Quit ClipBubble") { NSApp.terminate(nil) })
         return m

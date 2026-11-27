@@ -133,6 +133,26 @@ func boundaryTests() {
     check(honest.fetch(mineHash) == nil, "a delete takes it back at once")
     honest.close()
 
+    // The advertised indices don't shift when a file disappears after the put.
+    let missing = testHome.appendingPathComponent("removed-after-put.txt")
+    let surviving = testHome.appendingPathComponent("second-blob.txt")
+    let fifo = testHome.appendingPathComponent("named-pipe")
+    try? Data("first".utf8).write(to: missing)
+    try? Data("second".utf8).write(to: surviving)
+    check(mkfifo(fifo.path, 0o600) == 0, "create a non-regular file for the manifest test")
+    let manifestHash = "f:stable-manifest"
+    db.upsert(kind: "file", text: [missing.path, fifo.path, surviving.path].joined(separator: "\n"),
+              file: nil, source: "Finder", hash: manifestHash)
+    let manifestPeer = RawPeer(device: "manifest")
+    check(manifestPeer.put(manifestHash)?.blobs.map(\.name) == [missing.lastPathComponent, surviving.lastPathComponent],
+          "only the two regular files are advertised")
+    try? FileManager.default.removeItem(at: missing)
+    check(mkfifo(missing.path, 0o600) == 0, "replace the first path after it is advertised")
+    check(manifestPeer.fetch(manifestHash) == nil, "fetch rejects a path replaced by a FIFO")
+    check(manifestPeer.fetch(manifestHash, index: 1) == Data("second".utf8), "fetch still uses its advertised index")
+    manifestPeer.close()
+    db.delete(hash: manifestHash)
+
     let shot = testHome.appendingPathComponent("shot.txt")
     try? Data("hidden".utf8).write(to: shot)
     let shotHash = "f:" + sha(shot.path)

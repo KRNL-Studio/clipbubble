@@ -143,14 +143,53 @@ private func sessionCloseTests() {
     check(closed.wait(timeout: .now() + 3) == .success, "a broken output pipe ends the session")
 }
 
+private func simultaneousDialTests() {
+    let engine = SyncEngine.shared
+    engine.queue.sync {
+        let outgoingLink = HostLink(alias: "test-simultaneous", engine: engine)
+        for remoteID in ["!" + engine.device, "~" + engine.device] {
+            for outgoingFirst in [true, false] {
+                let incomingInput = Pipe(), incomingOutput = Pipe()
+                let outgoingInput = Pipe(), outgoingOutput = Pipe()
+                let incoming = Session(input: incomingInput.fileHandleForReading,
+                                       output: incomingOutput.fileHandleForWriting, engine: engine)
+                let outgoing = Session(input: outgoingInput.fileHandleForReading,
+                                       output: outgoingOutput.fileHandleForWriting, engine: engine)
+                outgoing.link = outgoingLink
+                engine.begin(incoming)
+                engine.begin(outgoing)
+                let hello = Frame.hello(Hello(proto: Sync.proto, device: remoteID, name: "Simultaneous", os: "macos",
+                                              version: "test", clock: Date().timeIntervalSince1970))
+                engine.handle(hello, from: outgoingFirst ? outgoing : incoming)
+                engine.handle(hello, from: outgoingFirst ? incoming : outgoing)
+                let keepsOutgoing = engine.device < remoteID
+                check(incoming.closed == keepsOutgoing && outgoing.closed != keepsOutgoing,
+                      "both devices keep the smaller ID's outgoing link regardless of hello order")
+                incoming.close()
+                outgoing.close()
+            }
+        }
+        outgoingLink.stop()
+    }
+}
+
 func linkTests() {
     check(safeFileName("../../.ssh/authorized_keys") == "_.._.ssh_authorized_keys", "names can't climb out of their folder")
     check(safeFileName("...hidden") == "hidden", "names can't hide")
     check(safeFileName("") == "file", "empty names get a name")
+    check(safeFileName("  ..") == "file" && safeFileName(" . . ") == "file", "whitespace cannot conceal a dot-only path")
+    let mismatched = Download(hash: "f:mismatched", kind: "file", names: ["mismatch.bin"], shas: [""],
+                              sizes: [5], from: "Test", apply: false)
+    check(mismatched.write(Data([1]), total: 6) == .failed && mismatched.received == 0,
+          "a chunk cannot exceed its manifest size even when the chunk fits")
+    check(mismatched.write(Data([1]), total: 4) == .failed && mismatched.received == 0,
+          "a chunk cannot claim a shorter manifest size")
+    check(mismatched.write(Data(repeating: 1, count: 5), total: 5) == .done, "a matching chunk can complete")
     let long = String(repeating: "shot (2) ", count: 30) + "end.png"
     check(safeFileName(long).count == 200 && safeFileName(long).hasSuffix(".png"), "a long name is cut before its extension")
     receivedFileTests()
     sessionCloseTests()
+    simultaneousDialTests()
 
     let peerHome = testHome.appendingPathComponent("peer")
     try? FileManager.default.createDirectory(at: peerHome, withIntermediateDirectories: true)

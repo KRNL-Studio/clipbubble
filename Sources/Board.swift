@@ -2,6 +2,8 @@ import AppKit
 
 /// Writes clips back to the macOS clipboard.
 enum Board {
+    static let polishedType = NSPasteboard.PasteboardType("studio.krnl.clipbubble.polished")
+
     static func pngData(_ path: String) -> Data? {
         if (path as NSString).pathExtension.lowercased() == "png" { return FileManager.default.contents(atPath: path) }
         return NSImage(contentsOfFile: path)?.tiffRepresentation
@@ -18,15 +20,22 @@ enum Board {
             return true
         case "image":
             guard let f = c.file, let d = pngData(f) else { return false }
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setData(d, forType: .png)
-            return true
+            return writePNG(d)
         default:
             let urls = c.paths.filter { $0.hasPrefix("/") && FileManager.default.fileExists(atPath: $0) }.map { URL(fileURLWithPath: $0) }
             guard !urls.isEmpty else { return false }
             writeFiles(urls)
             return true
         }
+    }
+
+    @discardableResult
+    static func writePNG(_ data: Data, to board: NSPasteboard = .general, polished: Bool = false) -> Bool {
+        let item = NSPasteboardItem()
+        guard item.setData(data, forType: .png) else { return false }
+        if polished, !item.setString("", forType: polishedType) { return false }
+        board.clearContents()
+        return board.writeObjects([item])
     }
 
     /// `transient` marks it so clipboard managers (ClipBubble included) don't save it.

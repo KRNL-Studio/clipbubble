@@ -45,8 +45,23 @@ if CommandLine.arguments.contains("--mcp") {
     exit(0)
 }
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)
-app.run()
+do {
+    guard let lock = try GUIInstanceLock() else {
+        let bundleID = Bundle.main.bundleIdentifier ?? "studio.krnl.clipbubble"
+        let pid = ProcessInfo.processInfo.processIdentifier
+        // macOS 14 and later ignore the old activateIgnoringOtherApps flag.
+        NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .first { $0.processIdentifier != pid }?.activate(options: [])
+        exit(0)
+    }
+    withExtendedLifetime(lock) {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)
+        withExtendedLifetime(delegate) { app.run() }
+    }
+} catch {
+    fputs("ClipBubble: couldn't lock the app data directory: \(error.localizedDescription)\n", stderr)
+    exit(1)
+}

@@ -95,6 +95,38 @@ func storeTests() {
     db.received(hash: "i:abc", file: "/tmp/abc.png", text: nil)
     check(db.clip(hash: "i:abc")?.remote == false && db.clip(hash: "i:abc")?.file == "/tmp/abc.png", "image lands")
 
+    let remote = Entry(hash: "i:local-copy", time: now - 5, kind: "image", text: "", source: "Figma", origin: "rog-id",
+                       blobs: [Blob(name: "copy.png", size: 10, sha: "")])
+    db.insert(remote, origin: "rog-id")
+    let file = Paths.images.appendingPathComponent("shared.png")
+    try? Data("copy".utf8).write(to: file)
+    check(db.upsert(kind: "image", text: "", file: file.path, source: "Preview", hash: remote.hash),
+          "the local copy commits")
+    let local = db.clip(hash: remote.hash)
+    check(local?.remote == false && local?.origin == "" && local?.file == file.path
+          && (local?.created.timeIntervalSince1970 ?? 0) > remote.time, "the local copy takes over the remote image stub")
+
+    db.upsert(kind: "image", text: "", file: file.path, source: "Preview", hash: "i:shared")
+    db.delete(hash: remote.hash)
+    check(db.clip(hash: remote.hash) == nil && FileManager.default.fileExists(atPath: file.path),
+          "deleting one of two rows sharing an image keeps its bytes")
+
+    // Abort the delete after its tombstone has been written. Both statements must roll back.
+    var blocker: OpaquePointer?
+    sqlite3_open(Paths.db.path, &blocker)
+    defer { sqlite3_close(blocker) }
+    check(sqlite3_exec(blocker, """
+        CREATE TRIGGER reject_test_delete BEFORE DELETE ON clips WHEN OLD.hash = 'i:shared'
+        BEGIN SELECT RAISE(ABORT, 'test'); END;
+        """, nil, nil, nil) == SQLITE_OK, "install a test trigger")
+    seen = []
+    db.delete(id: db.clip(hash: "i:shared")!.id)
+    check(db.stamp(hash: "i:shared")?.deleted == false && db.clip(hash: "i:shared") != nil
+          && FileManager.default.fileExists(atPath: file.path) && seen.isEmpty, "a failed delete keeps the row and file and emits no event")
+    check(sqlite3_exec(blocker, "DROP TRIGGER reject_test_delete", nil, nil, nil) == SQLITE_OK, "remove the test trigger")
+    db.delete(hash: "i:shared")
+    check(!FileManager.default.fileExists(atPath: file.path), "deleting the final reference unlinks the image")
+
     // Kinds switched off in Settings are neither offered nor accepted.
     check(db.allowed(kind: "image", source: "Figma"), "images allowed by default")
     Prefs.set("images", false)

@@ -24,7 +24,7 @@ enum RemoteSetup {
         }
     }
 
-    static let releases = URL(string: "https://github.com/rohit3a/clipbubble/releases/latest")!
+    static let releases = URL(string: "https://github.com/KRNL-Studio/clipbubble/releases/latest")!
 
     static var bundle: URL? { Bundle.main.resourceURL?.appendingPathComponent("linux") }
 
@@ -54,6 +54,36 @@ enum RemoteSetup {
         return p
     }
 
+    /// The installer can fill either pipe independently. Drain both and retain the tail,
+    /// where it emits the result marker or the final error.
+    private static func drain(_ out: Pipe, _ err: Pipe) -> (String, String) {
+        let stdout = PipeTail(out), stderr = PipeTail(err)
+        return (stdout.text(), stderr.text())
+    }
+
+    private final class PipeTail {
+        private let finished = DispatchGroup()
+        private var bytes = Data()
+
+        init(_ pipe: Pipe) {
+            finished.enter()
+            DispatchQueue.global(qos: .utility).async { [self] in
+                defer { finished.leave() }
+                let input = pipe.fileHandleForReading
+                let limit = 64 * 1024
+                while let chunk = try? input.read(upToCount: 8192), !chunk.isEmpty {
+                    bytes.append(chunk)
+                    if bytes.count > limit { bytes.removeFirst(bytes.count - limit) }
+                }
+            }
+        }
+
+        func text() -> String {
+            finished.wait()
+            return String(decoding: bytes, as: UTF8.self)
+        }
+    }
+
     private static func install(_ alias: String, progress: (String) -> Void) -> Result {
         guard !alias.hasPrefix("-"), let bundle, FileManager.default.fileExists(atPath: bundle.path) else {
             return .failed("this copy of ClipBubble has no Linux app inside")
@@ -64,9 +94,9 @@ enum RemoteSetup {
         probe.standardOutput = out
         probe.standardError = err
         do { try probe.run() } catch { return .failed(error.localizedDescription) }
-        let os = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        let probeErr = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        let (output, probeErr) = drain(out, err)
         probe.waitUntilExit()
+        let os = output.trimmingCharacters(in: .whitespacesAndNewlines)
         if probeErr.contains("is not recognized") || probeErr.contains("CommandNotFoundException") { return .otherOS("Windows") }
         if os == "Darwin" { return .otherOS("Mac") }
         guard os == "Linux" else {
@@ -87,9 +117,12 @@ enum RemoteSetup {
         remote.standardInput = stream
         remote.standardOutput = rout
         remote.standardError = rerr
-        do { try tar.run(); try remote.run() } catch { return .failed(error.localizedDescription) }
-        let said = String(decoding: rout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        let errs = String(decoding: rerr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        do { try tar.run(); try remote.run() } catch {
+            try? stream.fileHandleForReading.close()
+            if tar.isRunning { tar.terminate() }
+            return .failed(error.localizedDescription)
+        }
+        let (said, errs) = drain(rout, rerr)
         tar.waitUntilExit()
         remote.waitUntilExit()
         if said.contains("CLIPBUBBLE_NEEDS_PYTHON") { return .needsPython }

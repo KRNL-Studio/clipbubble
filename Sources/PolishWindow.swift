@@ -1,8 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
-import ImageIO
 import SwiftUI
-import UniformTypeIdentifiers
 
 // The Polish editor window: a toolbar of tools across the top, the canvas, an inspector on the right,
 // and presets plus the ways out (drag, share, save, copy) along the bottom.
@@ -79,7 +77,6 @@ final class PolishModel: ObservableObject {
     var history = DocHistory()
     var onClose: () -> Void = {}
     var onSaved: (URL) -> Void = { _ in }
-    var focusInspector: () -> Void = {}
     var pasteboard = NSPasteboard.general
     var detectRedactions: (CGImage, Set<Redactor.Kind>, Bool) throws -> [(Redactor.Kind?, CGRect)] = Redactor.find
 
@@ -98,8 +95,7 @@ final class PolishModel: ObservableObject {
     init(url: URL, image: CGImage) {
         source = image
         name = url.deletingPathExtension().lastPathComponent
-        let k = min(1, 2400 / CGFloat(max(image.width, image.height)))
-        preview = k < 1 ? PolishModel.scaled(image, k) ?? image : image
+        preview = PolishRenderer.thumbnail(image, maxSide: 2400)
         let d = PolishDoc(source: url, size: CGSize(width: image.width, height: image.height))
         doc = d
         cropDraft = d.crop
@@ -107,16 +103,6 @@ final class PolishModel: ObservableObject {
     }
 
     deinit { thumbnailWork?.cancel() }
-
-    static func scaled(_ img: CGImage, _ k: CGFloat) -> CGImage? {
-        let w = max(1, Int(CGFloat(img.width) * k)), h = max(1, Int(CGFloat(img.height) * k))
-        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
-                                  space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-        else { return nil }
-        ctx.interpolationQuality = .high
-        ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
-        return ctx.makeImage()
-    }
 
     // MARK: Marks
 
@@ -286,7 +272,7 @@ final class PolishModel: ObservableObject {
                 d.style = p.style
                 // About 130 px across: sharp at 2× in a 66-point chip.
                 let one = PolishLayout(doc: d, scale: 1).canvas
-                if let img = PolishRenderer.render(d, source: src, scale: 130 / max(one.width, one.height), marks: true) {
+                if let img = PolishRenderer.render(d, source: src, scale: 130 / max(one.width, one.height)) {
                     out[p.name] = NSImage(cgImage: img, size: NSSize(width: img.width, height: img.height))
                 }
             }
@@ -302,19 +288,13 @@ final class PolishModel: ObservableObject {
 
     // MARK: Out
 
-    var exportScale: CGFloat {
-        doc.style.size.pixels != nil || !UserDefaults.standard.bool(forKey: "polish.export1x") ? 1 : 0.5
-    }
+    var exportScale: CGFloat { PolishRenderer.exportScale(for: doc.style) }
 
     private func png() -> Data? {
         guard !findingRedactions else { return nil }
         if tool == .crop { tool = .select }
         PolishPreset.last = doc.style
-        guard let image = PolishRenderer.render(doc, source: source, scale: exportScale, marks: true) else { return nil }
-        let data = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil) else { return nil }
-        CGImageDestinationAddImage(destination, image, nil)
-        return CGImageDestinationFinalize(destination) ? data as Data : nil
+        return PolishRenderer.render(doc, source: source, scale: exportScale).flatMap(PolishRenderer.png)
     }
 
     private func exportWhenReady(_ action: @escaping (PolishModel, Data) -> Void) {
@@ -354,12 +334,27 @@ final class PolishModel: ObservableObject {
 
     func save() {
         exportWhenReady { model, data in
-            let url = PolishRenderer.saveURL(for: model.doc.source)
+            guard let url = PolishRenderer.saveURL(for: model.doc.source) else {
+                model.say("Couldn't find a folder for the saved copy", "exclamationmark.triangle")
+                return
+            }
             do {
-                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try data.write(to: url, options: .withoutOverwriting)
-                model.onSaved(url)
-                model.say("Saved as “\(url.lastPathComponent)”", "square.and.arrow.down")
+                let parent = url.deletingLastPathComponent()
+                try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+                guard let path = realpath(parent.path, nil) else {
+                    model.say("Couldn't find a folder for the saved copy", "exclamationmark.triangle")
+                    return
+                }
+                defer { free(path) }
+                let resolvedParent = URL(fileURLWithPath: String(cString: path), isDirectory: true)
+                guard !PolishHandoffs.contains(resolvedParent) else {
+                    model.say("Couldn't find a folder for the saved copy", "exclamationmark.triangle")
+                    return
+                }
+                let resolvedURL = resolvedParent.appendingPathComponent(url.lastPathComponent)
+                try data.write(to: resolvedURL, options: .withoutOverwriting)
+                model.onSaved(resolvedURL)
+                model.say("Saved as “\(resolvedURL.lastPathComponent)”", "square.and.arrow.down")
             } catch {
                 model.say("Couldn't save: \(error.localizedDescription)", "exclamationmark.triangle")
             }
@@ -384,7 +379,7 @@ final class PolishModel: ObservableObject {
 
     private func handoff(_ data: Data) -> URL? {
         do {
-            return try PolishHandoffs.write(data, name: "\(name) polished.png")
+            return try PolishHandoffs.write(data, name: PolishRenderer.polishedFilename(base: name))
         } catch {
             say("Couldn't prepare the image", "exclamationmark.triangle")
             return nil
@@ -423,12 +418,11 @@ final class PolishModel: ObservableObject {
                     return
                 }
                 let crop = (self.tool == .crop ? self.validCropDraft : nil) ?? self.doc.crop
-                let found = detected.filter { crop.intersects($0.1) }
-                if !found.isEmpty || self.doc.marks.contains(where: \.auto) {
+                if !detected.isEmpty || self.doc.marks.contains(where: \.auto) {
                     self.history.record(self.doc)
                     self.doc.marks.removeAll(where: \.auto)
                 }
-                for (_, r) in found {
+                for (_, r) in detected {
                     var m = Mark(.redact, [r.origin, CGPoint(x: r.maxX, y: r.maxY)])
                     m.redaction = self.ink.redaction
                     m.color = RGBA(hex: 0x1C1C1E)
@@ -436,9 +430,14 @@ final class PolishModel: ObservableObject {
                     self.doc.marks.insert(m, at: 0)
                 }
                 self.selection = nil
-                let n = found.count
-                self.say(n == 0 ? "Nothing sensitive found" : "Hid \(n) \(n == 1 ? "thing" : "things") · select one to remove it",
-                         n == 0 ? "checkmark.shield" : "eye.slash")
+                if detected.isEmpty {
+                    self.say("Nothing sensitive found", "checkmark.shield")
+                } else {
+                    let visible = detected.filter { !crop.intersection($0.1).isEmpty }.count
+                    let total = detected.count
+                    let detail = visible == total ? "select one to remove it" : "\(visible) in this crop"
+                    self.say("Hid \(total) \(total == 1 ? "thing" : "things") · \(detail)", "eye.slash")
+                }
                 self.activity = nil
                 let exports = self.queuedExports
                 self.queuedExports.removeAll()
@@ -459,7 +458,7 @@ final class PolishModel: ObservableObject {
         activity = .reading
         let src = source, doc = self.doc
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let image = PolishRenderer.render(doc, source: src, scale: 1, marks: true)
+            let image = PolishRenderer.render(doc, source: src)
             let text = image.map { Redactor.text(in: $0) } ?? ""
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -476,87 +475,128 @@ final class PolishModel: ObservableObject {
 
 enum PolishHandoffs {
     private static let lifetime: TimeInterval = 3600
+    private static let permissions: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
+    private static let lock = NSLock()
+    private static var closed = false
+    private static let temp = FileManager.default.temporaryDirectory
+    private static let rootPrefix = "ClipBubble Polish"
     static let root: URL = {
         // A second instance with its own data folder also has its own handoffs.
         let suffix = ProcessInfo.processInfo.environment["CLIPBUBBLE_HOME"].map { "-" + sha($0) } ?? ""
-        return FileManager.default.temporaryDirectory.appendingPathComponent("ClipBubble Polish" + suffix, isDirectory: true)
+        return temp.appendingPathComponent(rootPrefix + suffix, isDirectory: true)
     }()
-    private static let directory = root.appendingPathComponent("\(getpid())-\(UUID())", isDirectory: true)
-    private static let startup: Void = removeExpiredProcesses()
+    private static let launch = root.appendingPathComponent("\(getpid())-\(UUID())", isDirectory: true)
+    private static let startup: Void? = try? sweep(root, matching: canRemoveLaunch)
 
     static func prepare() { _ = startup }
 
-    static func clear() { removeHandoff(directory) }
-
-    private static func removeHandoff(_ folder: URL) {
-        if let path = UserDefaults.standard.string(forKey: "polish.folder"), !path.isEmpty {
-            let destination = URL(fileURLWithPath: path, isDirectory: true)
-            func containsSaveFolder(_ parent: URL, _ child: URL) -> Bool {
-                child.standardizedFileURL.pathComponents.starts(with: parent.standardizedFileURL.pathComponents) {
-                    $0.caseInsensitiveCompare($1) == .orderedSame
-                }
-            }
-            if containsSaveFolder(folder, destination) ||
-                containsSaveFolder(folder.resolvingSymlinksInPath(), destination.resolvingSymlinksInPath()) { return }
+    static func clear() {
+        lock.withLock {
+            closed = true
+            remove(launch)
         }
+    }
+
+    static func contains(_ child: URL) -> Bool {
+        func isHandoffPath(_ url: URL, under parent: URL) -> Bool {
+            relativePath(of: url, in: parent)?.first?.range(of: rootPrefix, options: [.anchored, .caseInsensitive]) != nil
+        }
+        let resolvedTemp = temp.resolvingSymlinksInPath()
+        return isHandoffPath(child, under: temp) || isHandoffPath(child, under: resolvedTemp)
+            || isHandoffPath(resolvingSymlinks(child), under: resolvedTemp)
+    }
+
+    private static func relativePath(of child: URL, in parent: URL) -> ArraySlice<String>? {
+        let path = child.standardizedFileURL.pathComponents
+        let prefix = parent.standardizedFileURL.pathComponents
+        guard path.starts(with: prefix, by: { $0.caseInsensitiveCompare($1) == .orderedSame }) else { return nil }
+        return path.dropFirst(prefix.count)
+    }
+
+    // A save can create a directory below a symlink, so resolve the existing ancestor.
+    private static func resolvingSymlinks(_ url: URL) -> URL {
+        var ancestor = url.standardizedFileURL
+        var missing: [String] = []
+        while !FileManager.default.fileExists(atPath: ancestor.path) {
+            let parent = ancestor.deletingLastPathComponent()
+            guard parent.path != ancestor.path else { return url }
+            missing.append(ancestor.lastPathComponent)
+            ancestor = parent
+        }
+        return missing.reversed().reduce(ancestor.resolvingSymlinksInPath()) { $0.appendingPathComponent($1) }
+    }
+
+    private static func remove(_ folder: URL) {
+        // Never follow a redirect out of the handoff root or launch folder.
+        guard ![root, folder.deletingLastPathComponent(), folder].contains(where: {
+            (try? $0.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true
+        }) else { return }
+        if let destination = PolishRenderer.saveFolder,
+           relativePath(of: destination, in: folder) != nil ||
+           relativePath(of: resolvingSymlinks(destination), in: folder.resolvingSymlinksInPath()) != nil { return }
         try? FileManager.default.removeItem(at: folder)
     }
 
-    private static func removeExpiredProcesses() {
-        let fm = FileManager.default
+    private static func canRemoveLaunch(_ name: String) -> Bool {
+        if UUID(uuidString: name) != nil { return true } // Older versions used only a UUID.
+        let parts = name.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2, let pid = pid_t(parts[0]), pid > 0, String(pid) == parts[0],
+              UUID(uuidString: String(parts[1])) != nil else { return false }
+        return kill(pid, 0) == -1 && errno == ESRCH
+    }
+
+    private static func sweep(_ folder: URL, matching: (String) -> Bool) throws {
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey]
-        guard let entries = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: Array(keys)) else { return }
+        let entries = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: Array(keys))
         let stale = Date().addingTimeInterval(-lifetime)
         for entry in entries {
             guard let values = try? entry.resourceValues(forKeys: keys), values.isDirectory == true,
-                  values.isSymbolicLink == false, let date = values.contentModificationDate, date < stale else { continue }
-            let name = entry.lastPathComponent.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
-            if name.count == 2, let pid = pid_t(name[0]), pid > 0, String(pid) == name[0],
-               UUID(uuidString: String(name[1])) != nil {
-                guard kill(pid, 0) == -1, errno == ESRCH else { continue }
-            } else if UUID(uuidString: entry.lastPathComponent) == nil {
-                continue
-            }
-            removeHandoff(entry)
+                  values.isSymbolicLink == false, let date = values.contentModificationDate, date < stale,
+                  matching(entry.lastPathComponent) else { continue }
+            remove(entry)
         }
     }
 
     static func write(_ data: Data, name: String) throws -> URL {
-        prepare()
-        let fm = FileManager.default
-        let privateDirectory: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
-        try fm.createDirectory(at: directory, withIntermediateDirectories: true, attributes: privateDirectory)
-        let stale = Date().addingTimeInterval(-lifetime)
-        let entries = try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey])
-        for entry in entries {
-            if let date = try? entry.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate, date < stale {
-                removeHandoff(entry)
+        guard !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.contains("\0") else {
+            throw POSIXError(.EINVAL)
+        }
+        return try lock.withLock {
+            guard !closed else { throw POSIXError(.ECANCELED) }
+            prepare()
+            let fm = FileManager.default
+            try fm.createDirectory(at: root, withIntermediateDirectories: true, attributes: permissions)
+            guard try root.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink == false else {
+                throw POSIXError(.ENOTDIR)
             }
-        }
+            try fm.createDirectory(at: launch, withIntermediateDirectories: true, attributes: permissions)
+            try sweep(launch) { UUID(uuidString: $0) != nil }
 
-        let folder = directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try fm.createDirectory(at: folder, withIntermediateDirectories: false, attributes: privateDirectory)
-        let url = folder.appendingPathComponent(name)
-        do {
-            let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
-            guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-            let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-            try file.write(contentsOf: data)
-            try file.close()
-        } catch {
-            removeHandoff(folder)
-            throw error
+            let folder = launch.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try fm.createDirectory(at: folder, withIntermediateDirectories: false, attributes: permissions)
+            let url = folder.appendingPathComponent(name)
+            do {
+                let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+                guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+                try file.write(contentsOf: data)
+                try file.close()
+            } catch {
+                remove(folder)
+                throw error
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + lifetime) {
+                lock.withLock { remove(folder) }
+            }
+            return url
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + lifetime) { removeHandoff(folder) }
-        return url
     }
 }
 
 extension Clip {
     /// The image Polish can open: a copied image or an image file, here on this Mac.
     var polishPath: String? {
-        guard !remote, let p = imagePath, FileManager.default.fileExists(atPath: p) else { return nil }
-        return p
+        remote ? nil : imagePath
     }
 }
 
@@ -589,7 +629,7 @@ final class PolishWindow: NSObject, NSWindowDelegate {
 
     init(url: URL, image: CGImage) {
         model = PolishModel(url: url, image: image)
-        window = EditorWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 720),
+        window = EditorWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                               backing: .buffered, defer: false)
         super.init()
@@ -599,28 +639,23 @@ final class PolishWindow: NSObject, NSWindowDelegate {
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 860, height: 560)
         window.delegate = self
         window.contentView = NSHostingView(rootView: Optional(PolishView(model: model, canvas: canvas)))
-        window.setContentSize(idealSize(for: image))
         model.onClose = { [weak self] in self?.window.performClose(nil) }
         model.onSaved = { PolishWindow.onSaved($0) }
     }
 
-    /// Big enough to see the screenshot well, never bigger than the screen.
-    private func idealSize(for img: CGImage) -> NSSize {
-        let screen = (NSScreen.main ?? NSScreen.screens[0]).visibleFrame
-        let chrome = NSSize(width: 290, height: 140)
-        let one = PolishLayout(doc: model.doc, scale: 1).canvas
-        let backing = max(1, NSScreen.main?.backingScaleFactor ?? 2)
-        let maxW = screen.width * 0.86 - chrome.width, maxH = screen.height * 0.86 - chrome.height
-        let k = min(maxW / one.width, maxH / one.height, 1 / backing * 1.4)
-        return NSSize(width: max(860, one.width * k + chrome.width + 72), height: max(560, one.height * k + chrome.height + 60))
-    }
-
     private func show() {
+        let pointer = NSEvent.mouseLocation
+        if let screen = NSScreen.screens.first(where: { NSMouseInRect(pointer, $0.frame, false) }) ?? NSScreen.main {
+            let area = screen.visibleFrame
+            window.minSize = NSSize(width: min(900, area.width), height: min(600, area.height))
+            let width = min(area.width, 1280, max(900, (area.width * 0.7).rounded()))
+            let height = min(area.height, 820, max(600, (area.height * 0.7).rounded()))
+            window.setFrame(NSRect(x: area.midX - width / 2, y: area.midY - height / 2,
+                                   width: width, height: height), display: false)
+        }
         Presence.opened(window)
-        window.center()
         window.alphaValue = 0
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)

@@ -38,15 +38,32 @@ final class SyncEngine {
     private var holds = 0
 
     private init() {
-        let idFile = Paths.dir.appendingPathComponent("device-id")
-        if let id = try? String(contentsOf: idFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty {
-            device = id
-        } else {
-            device = UUID().uuidString.lowercased()
-            try? FileManager.default.createDirectory(at: Paths.dir, withIntermediateDirectories: true)
-            try? device.write(to: idFile, atomically: true, encoding: .utf8)
-        }
+        device = Self.loadDeviceID()
         name = ProcessInfo.processInfo.environment["CLIPBUBBLE_DEVICE_NAME"] ?? Platform.deviceName
+    }
+
+    private static func loadDeviceID() -> String {
+        let newID = UUID().uuidString.lowercased()
+        try? FileManager.default.createDirectory(at: Paths.dir, withIntermediateDirectories: true)
+        let path = Paths.dir.appendingPathComponent("device-id").path
+        var fd = open(path, O_CREAT | O_EXCL | O_WRONLY | O_EXLOCK, 0o600)
+        if fd < 0, errno == EEXIST { fd = open(path, O_RDWR | O_EXLOCK | O_NOFOLLOW) }
+        guard fd >= 0 else {
+            // A read-only store can still use an established identity.
+            return readDeviceID(path) ?? newID
+        }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        // An opener may acquire the lock first after another process creates the file.
+        if let existing = readDeviceID(path) { return existing }
+        try? handle.truncate(atOffset: 0)
+        try? handle.write(contentsOf: Data(newID.utf8))
+        return newID
+    }
+
+    private static func readDeviceID(_ path: String) -> String? {
+        guard let id = try? String(contentsOfFile: path, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+              !id.isEmpty else { return nil }
+        return id
     }
 
     // MARK: Hosts
@@ -154,9 +171,9 @@ final class SyncEngine {
         }
     }
 
-    /// A phone just lost its key. Which session was its isn't known, so all of them drop and the others link again.
+    /// A paired device lost its key. Close incoming sessions so still-authorized peers reconnect.
     func dropPhones() {
-        queue.async { [self] in sessions.filter { $0.peer?.os == "ios" }.forEach { $0.close() } }
+        queue.async { [self] in sessions.filter { $0.link == nil }.forEach { $0.close() } }
     }
 
     func setPaused(_ paused: Bool) {
@@ -246,19 +263,21 @@ final class SyncEngine {
 
     private func send(_ st: Stamp, to s: Session) {
         if st.deleted {
+            s.fetchable[st.hash] = nil
             s.known[st.hash] = st
             s.send(.tombstone(st))
             return
         }
-        guard let c = db.clip(hash: st.hash), db.allowed(kind: c.kind, source: c.source), let e = entry(c) else { return }
+        guard let c = db.clip(hash: st.hash), db.allowed(kind: c.kind, source: c.source), let (e, paths) = entry(c) else { return }
         s.known[st.hash] = st
-        if !e.blobs.isEmpty { s.fetchable.insert(st.hash) }
+        s.fetchable[st.hash] = paths.isEmpty ? nil : paths
         // Only fresh copies get acked, so only they are timed.
         if c.origin.isEmpty, Date().timeIntervalSince(c.created) < 10 { sentAt[st.hash] = Date().timeIntervalSince1970 }
         s.send(.put(e))
     }
 
-    private func entry(_ c: Clip) -> Entry? {
+    private func entry(_ c: Clip) -> (Entry, [String])? {
+        var paths: [String] = []
         var e = Entry(hash: c.hash, time: c.created.timeIntervalSince1970, kind: c.kind, text: "", source: c.source,
                       origin: c.origin.isEmpty ? device : c.origin, blobs: [])
         switch c.kind {
@@ -268,28 +287,29 @@ final class SyncEngine {
             e.text = c.text
         case "image":
             // Offered before its bytes are here, an item is a dead end for every device after this one.
-            guard !c.remote, let f = c.file, let size = fileSize(f) else { return nil }
+            guard !c.remote, let f = c.file, let size = regularFileSize(f) else { return nil }
+            paths = [f]
             e.blobs = [Blob(name: String(c.hash.dropFirst(2)) + ".png", size: size, sha: String(c.hash.dropFirst(2)))]
         default:
             guard !c.remote else { return nil }
             let files = blobFiles(c)
             e.text = c.paths.map { ($0 as NSString).lastPathComponent }.joined(separator: "\n")
-            e.blobs = files.compactMap { p in fileSize(p).map { Blob(name: (p as NSString).lastPathComponent, size: $0, sha: "") } }
+            paths = files.map(\.path)
+            e.blobs = files.map { Blob(name: ($0.path as NSString).lastPathComponent, size: $0.size, sha: "") }
         }
-        return e
+        return (e, paths)
     }
 
     /// The files an item can send: regular files only, in order. Folders show by name but don't transfer.
-    private func blobFiles(_ c: Clip) -> [String] {
-        if c.kind == "image" { return c.file.map { [$0] } ?? [] }
-        return c.paths.filter { p in
-            var dir: ObjCBool = false
-            return p.hasPrefix("/") && FileManager.default.fileExists(atPath: p, isDirectory: &dir) && !dir.boolValue
-        }
+    private func blobFiles(_ c: Clip) -> [(path: String, size: Int64)] {
+        c.paths.compactMap { path in regularFileSize(path).map { (path, $0) } }
     }
 
-    private func fileSize(_ p: String) -> Int64? {
-        (try? FileManager.default.attributesOfItem(atPath: p)[.size] as? NSNumber)?.int64Value
+    private func regularFileSize(_ path: String) -> Int64? {
+        guard path.hasPrefix("/"),
+              let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              attributes[.type] as? FileAttributeType == .typeRegular else { return nil }
+        return (attributes[.size] as? NSNumber)?.int64Value
     }
 
     // MARK: Frames
@@ -307,13 +327,19 @@ final class SyncEngine {
             let old = sessions.first { $0 !== s && $0.peer?.device == h.device }
             // A device dialling in again has given up on its old link (an iPhone that slept), and two names for one
             // computer look the same from there: either way the far end keeps the new link, so this end has to as well.
-            // If only one side has a link here, the two ends dialled each other, and the first link stays.
-            if let old, (old.link == nil) != (s.link == nil) { s.close(); return }
+            if let old, (old.link == nil) != (s.link == nil) {
+                // Both peers keep the connection dialled by the device with the smaller ID.
+                guard (s.link != nil) == (device < h.device) else {
+                    s.link?.standBy(for: h)
+                    s.close()
+                    return
+                }
+            }
             s.peer = h
             old?.link?.standBy(for: h)
             old?.close()
             s.offset = h.clock - Date().timeIntervalSince1970
-            if abs(s.offset) > 30 { SyncLog.write("\(h.name)'s clock is \(Int(s.offset)) s off") }
+            if abs(s.offset) > 30 { SyncLog.write("\(h.name)'s clock is \(s.offset.rounded()) s off") }
             if db.saveDevice(id: h.device, name: h.name, os: h.os) { share(id: h.device, name: h.name, os: h.os, from: s) }
             if h.readsDevices {
                 for d in db.devices() where d.id != h.device { s.send(.device(id: d.id, name: d.name, os: d.os)) }
@@ -334,14 +360,20 @@ final class SyncEngine {
             guard st.deleted else { s.close(); return }
             if st.beats(s.known[st.hash]) { s.known[st.hash] = st }
             if merge(local: db.stamp(hash: st.hash), hasRow: db.clip(hash: st.hash) != nil, incoming: st) == .delete {
-                s.cancelDownload(st.hash)
-                db.tombstone(st)
+                guard db.tombstone(st) else { return }
+                wanted.remove(st.hash)
+                for peer in sessions {
+                    peer.offered[st.hash] = nil
+                    if peer.cancelDownload(st.hash) { peer.send(.cancel(hash: st.hash)) }
+                }
+                publishTransfers()
                 notifyUI()
             }
         case .fetch(let hash, let index, let offset):
             // A `put` on this link is the only way in, so naming a hash or a path reaches nothing else.
-            guard s.fetchable.contains(hash), let c = db.clip(hash: hash), !c.remote, db.allowed(kind: c.kind, source: c.source),
-                  index < blobFiles(c).count, s.upload(hash: hash, index: index, path: blobFiles(c)[index], offset: offset) else {
+            guard let path = s.fetchable[hash]?[safe: index],
+                  let c = db.clip(hash: hash), !c.remote, db.allowed(kind: c.kind, source: c.source),
+                  s.upload(hash: hash, index: index, path: path, offset: offset) else {
                 s.send(.cancel(hash: hash))
                 return
             }
@@ -387,7 +419,10 @@ final class SyncEngine {
         guard e.time >= Date().timeIntervalSince1970 - DB.retention else { return }
         let row = db.clip(hash: e.hash)
         // Copied seconds ago on its device, and newer than anything here: it's what you just copied, so it goes on the clipboard.
-        let fresh = Date().timeIntervalSince1970 - (e.time - s.offset) < 10 && e.time > (db.clips(limit: 1).first?.created.timeIntervalSince1970 ?? 0)
+        let now = Date().timeIntervalSince1970
+        let localTime = e.time - s.offset
+        let fresh = localTime > now - 10 && localTime <= now + 300
+            && e.time > (db.clips(limit: 1).first?.created.timeIntervalSince1970 ?? 0)
         var new = false
         switch merge(local: db.stamp(hash: e.hash), hasRow: row != nil, incoming: st) {
         case .delete:
@@ -395,14 +430,15 @@ final class SyncEngine {
         case .ignore:
             guard row?.remote == true else { return }
         case .bump:
-            db.bump(hash: e.hash, to: e.time)
+            guard let row, db.allowed(kind: e.kind, source: e.source), db.allowed(kind: row.kind, source: row.source) else { return }
+            guard db.bump(hash: e.hash, to: e.time) else { return }
             new = true
             if fresh, let c = db.clip(hash: e.hash), !c.remote { applyNow(c, to: s) }
         case .insert:
             guard db.allowed(kind: e.kind, source: e.source) else { return }
             var named = e
             if e.kind == "file" { named.text = e.text.split(separator: "\n").map { safeFileName(String($0)) }.joined(separator: "\n") }
-            db.insert(named, origin: e.origin == device ? "" : e.origin)
+            guard db.insert(named, origin: e.origin == device ? "" : e.origin) else { return }
             new = true
             if e.kind == "text", fresh, let c = db.clip(hash: e.hash) { applyNow(c, to: s) }
         }
@@ -423,10 +459,11 @@ final class SyncEngine {
     }
 
     private func finished(_ d: Download, from s: Session) {
+        let image = d.kind == "image"
+        guard db.received(hash: d.hash, file: image ? d.paths.first : nil,
+                          text: image ? nil : d.paths.joined(separator: "\n")) else { return }
         wanted.remove(d.hash)
         s.offered[d.hash] = nil
-        if d.kind == "image" { db.received(hash: d.hash, file: d.paths.first, text: nil) }
-        else { db.received(hash: d.hash, file: nil, text: d.paths.joined(separator: "\n")) }
         // Still the newest item once the bytes are here: put it on the clipboard.
         if d.apply, !d.bounced, let c = db.clip(hash: d.hash), db.clips(limit: 1).first?.hash == d.hash { applyNow(c, to: s) }
         notifyUI()
@@ -535,12 +572,23 @@ enum LinkState: Equatable {
     }
 }
 
-/// A relay running on a host over SSH: frames in on `input`, frames out on `output`.
+/// A relay running on a host over SSH.
 protocol Tunnel: AnyObject {
+    func makeSession(engine: SyncEngine) -> Session
+    func close()
+    #if !os(iOS)
     var input: FileHandle { get }
     var output: FileHandle { get }
-    func close()
+    #endif
 }
+
+#if !os(iOS)
+extension Tunnel {
+    func makeSession(engine: SyncEngine) -> Session {
+        Session(input: input, output: output, engine: engine)
+    }
+}
+#endif
 
 /// One host: runs `--peer` there over SSH, retries with backoff, and turns SSH's errors into a status.
 final class HostLink {
@@ -549,6 +597,7 @@ final class HostLink {
     private var tunnel: Tunnel?
     private var session: Session?
     private var stderr = ""
+    private var lastError = ""
     private var backoff: Double = 1
     private var retry: DispatchWorkItem?
     private var deadline: DispatchWorkItem?
@@ -594,14 +643,14 @@ final class HostLink {
                 exited: { [weak self] in self?.engine.queue.async { self?.exited() } })
         } catch { set(.offline(Date().addingTimeInterval(backoff))); scheduleRetry(); return }
         tunnel = t
-        let s = Session(input: t.input, output: t.output, engine: engine)
+        let s = t.makeSession(engine: engine)
         s.link = self
         session = s
         engine.begin(s)
         // The connect timeout ends at TCP. A computer that accepts and then says nothing would read "Connecting…" forever.
         let d = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            SyncLog.write("\(alias): no answer in \(Int(Self.helloLimit)) s")
+            logError("no answer in \(Int(Self.helloLimit)) s")
             hangUp()
         }
         deadline = d
@@ -611,6 +660,7 @@ final class HostLink {
     func helloReceived(_ h: Hello) {
         deadline?.cancel()
         backoff = 1
+        lastError = ""
         mismatch = nil
         Platform.defaults.set(Date().timeIntervalSince1970, forKey: "sync.lastLive." + alias)
         set(.live(h))
@@ -676,12 +726,18 @@ final class HostLink {
         }
         let next = mismatch.map(LinkState.versionMismatch) ?? LinkState.failure(stderr: err, windows: windows)
             ?? .offline(Date().addingTimeInterval(wasLive ? 1 : backoff))
-        if !err.isEmpty { SyncLog.write("\(alias): \(err.trimmingCharacters(in: .whitespacesAndNewlines).suffix(300))") }
+        logError(String(err.trimmingCharacters(in: .whitespacesAndNewlines).suffix(300)))
         // Problems only you can fix retry slowly; a dropped link comes back fast.
         if !next.transient { backoff = max(backoff, 60) }
         if wasLive { backoff = 1 }
         set(next)
         scheduleRetry()
+    }
+
+    private func logError(_ message: String) {
+        guard !message.isEmpty, lastError != message else { return }
+        lastError = message
+        SyncLog.write("\(alias): \(message)")
     }
 
     private func scheduleRetry() {
@@ -693,7 +749,10 @@ final class HostLink {
 
     /// A link that looks fine may have died with the old network, so it has one ping to prove otherwise.
     func networkChanged() {
-        if case .offline = state { return redial() }
+        switch state {
+        case .offline, .unresolved, .refused: return redial()
+        default: break
+        }
         guard state.ok, let s = session else { return }
         let asked = DispatchTime.now()
         s.send(.ping(Date().timeIntervalSince1970))
@@ -729,10 +788,18 @@ final class HostLink {
 
 // MARK: - Session
 
+/// Delivers bytes (nil at EOF) on the supplied queue and resumes reads once the receiver returns.
+/// A session writes one frame at a time, waiting for completion before reading the next file chunk.
+protocol SessionTransport: AnyObject {
+    func start(on queue: DispatchQueue, receive: @escaping (Data?) -> Void)
+    func write(_ bytes: Data, completion: @escaping (Bool) -> Void)
+    func close()
+}
+
 /// One peer: reads frames, and writes them with control frames always ahead of file chunks.
 final class Session {
-    private let input: FileHandle
-    private let output: FileHandle
+    private let handles: (input: FileHandle, output: FileHandle)?
+    private let transport: SessionTransport?
     private unowned let engine: SyncEngine
     weak var link: HostLink?
     var onClose: () -> Void = {}
@@ -744,7 +811,7 @@ final class Session {
     /// Items the peer has bytes for that haven't come over yet, with their blob sizes, for Get and Send to.
     var offered: [String: Entry] = [:]
     /// Items sent to the peer with bytes on this link: the only ones it may fetch. `known` won't do, since the peer's summary fills it.
-    var fetchable: Set<String> = []
+    var fetchable: [String: [String]] = [:]
     private var reader = FrameReader()
     private var downloads: [String: Download] = [:]
     private var pendingDownloads: [Download] = []
@@ -758,24 +825,36 @@ final class Session {
     private let writeQueue = DispatchQueue(label: "clipbubble.sync.write", qos: .utility)
 
     init(input: FileHandle, output: FileHandle, engine: SyncEngine) {
-        self.input = input
-        self.output = output
+        handles = (input, output)
+        transport = nil
+        self.engine = engine
+    }
+
+    init(transport: SessionTransport, engine: SyncEngine) {
+        handles = nil
+        self.transport = transport
         self.engine = engine
     }
 
     func start(hello: Hello, summary: [Stamp]) {
-        input.readabilityHandler = { [weak self] h in
-            guard let self, let d = self.readReady(h) else { return }
-            self.engine.queue.async {
-                guard !self.closed else { return }
-                if d.isEmpty { self.close(); return }
-                self.heardAt = .now()
-                do { for f in try self.reader.feed(d) where !self.closed { self.engine.handle(f, from: self) } }
-                catch { SyncLog.write("dropped \(self.peer?.name ?? "peer"): malformed frame"); self.close() }
+        if let transport {
+            transport.start(on: engine.queue) { [weak self] in self?.receive($0) }
+        } else {
+            handles?.input.readabilityHandler = { [weak self] h in
+                guard let self, let d = self.readReady(h) else { return }
+                self.engine.queue.async { self.receive(d.isEmpty ? nil : d) }
             }
         }
         send(.hello(hello))
         send(.summary(summary))
+    }
+
+    private func receive(_ bytes: Data?) {
+        guard !closed else { return }
+        guard let bytes else { return close() }
+        heardAt = .now()
+        do { for f in try reader.feed(bytes) where !closed { engine.handle(f, from: self) } }
+        catch { SyncLog.write("dropped \(peer?.name ?? "peer"): malformed frame"); close() }
     }
 
     private func readReady(_ handle: FileHandle) -> Data? {
@@ -796,6 +875,7 @@ final class Session {
 
     func send(_ f: Frame) {
         lock.lock()
+        guard !closed else { lock.unlock(); return }
         control.append(f.encoded())
         lock.unlock()
         pump()
@@ -806,10 +886,26 @@ final class Session {
         guard !writing, !closed else { lock.unlock(); return }
         writing = true
         lock.unlock()
+        if let transport {
+            writeNext(to: transport)
+            return
+        }
+        guard let output = handles?.output else { return }
         writeQueue.async { [self] in
             while let data = next() {
                 do { try output.write(contentsOf: data) }
                 catch { engine.queue.async { self.close() }; break }
+            }
+        }
+    }
+
+    private func writeNext(to transport: SessionTransport) {
+        writeQueue.async { [self] in
+            guard let bytes = next() else { return }
+            transport.write(bytes) { [weak self] written in
+                guard let self else { return }
+                if written { self.writeNext(to: transport) }
+                else { self.engine.queue.async { self.close() } }
             }
         }
     }
@@ -873,15 +969,18 @@ final class Session {
     }
 
     private func begin(_ d: Download) {
+        d.resume()
         downloads[d.hash] = d
         send(.fetch(hash: d.hash, index: d.index, offset: d.received))
     }
 
-    func cancelDownload(_ hash: String) {
+    @discardableResult
+    func cancelDownload(_ hash: String) -> Bool {
         pendingDownloads.removeAll { $0.hash == hash }
-        guard let d = downloads.removeValue(forKey: hash) else { return }
+        guard let d = downloads.removeValue(forKey: hash) else { return false }
         d.discard()
         startNext()
+        return true
     }
 
     private func startNext() {
@@ -897,6 +996,8 @@ final class Session {
             return nil
         case .failed:
             SyncLog.write("couldn't save \(d.names[safe: index] ?? hash) from \(d.from)")
+            d.discard()
+            send(.cancel(hash: hash))
             downloads[hash] = nil
             startNext()
             return nil
@@ -915,11 +1016,13 @@ final class Session {
         let was = closed
         closed = true
         uploads.removeAll()
+        control.removeAll()
         lock.unlock()
         guard !was else { return }
-        input.readabilityHandler = nil
-        try? output.close()
-        try? input.close()
+        transport?.close()
+        handles?.input.readabilityHandler = nil
+        try? handles?.output.close()
+        try? handles?.input.close()
         // Partial files stay, so the next link resumes them from where this one stopped.
         downloads.values.forEach { $0.suspend() }
         downloads.removeAll()
@@ -940,15 +1043,17 @@ final class Upload {
     var done: Bool { offset >= total && (total > 0 || sentEmpty) }
 
     init?(hash: String, index: Int, path: String, offset: Int64) {
-        guard let h = FileHandle(forReadingAtPath: path),
-              let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value,
-              offset >= 0, offset <= size else { return nil }
-        try? h.seek(toOffset: UInt64(offset))
+        let fd = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW)
+        guard fd >= 0 else { return nil }
+        let h = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        var info = stat()
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
+              offset >= 0, offset <= info.st_size, (try? h.seek(toOffset: UInt64(offset))) != nil else { return nil }
         self.hash = hash
         self.index = index
         self.handle = h
         self.offset = offset
-        self.total = size
+        self.total = info.st_size
     }
 
     deinit { try? handle.close() }
@@ -975,15 +1080,20 @@ final class Download {
     let sizes: [Int64]
     let from: String
     let apply: Bool
-    var total: Int64 { sizes.reduce(0, +) }
-    var doneBytes: Int64 { sizes.prefix(index).reduce(0, +) + received }
+    var total: Int64 { Sync.blobSize(sizes) ?? .max }
+    var doneBytes: Int64 {
+        guard let completed = Sync.blobSize(sizes.prefix(index)), received <= Int64.max - completed else { return .max }
+        return completed + received
+    }
     private(set) var index = 0
     private(set) var received: Int64 = 0
     private(set) var paths: [String] = []
     /// A file was already here from a moment ago, so this is the same file coming back: it doesn't go on the clipboard.
     private(set) var bounced = false
     private var handle: FileHandle?
-    private var temp: URL { Paths.dir.appendingPathComponent("incoming/\(sha(hash))-\(index)") }
+    private let stagingHash: String
+    private var stagingSuffix = ""
+    private var temp: URL { Paths.dir.appendingPathComponent("incoming/\(stagingHash)\(stagingSuffix)-\(index)") }
 
     init(hash: String, kind: String, names: [String], shas: [String], sizes: [Int64], from: String, apply: Bool) {
         self.hash = hash
@@ -993,46 +1103,72 @@ final class Download {
         self.sizes = sizes
         self.from = from
         self.apply = apply
-        // A partial first file from a link that dropped: carry on from its end.
-        if let size = (try? FileManager.default.attributesOfItem(atPath: temp.path)[.size] as? NSNumber)?.int64Value,
-           size <= sizes.first ?? 0 {
-            received = size
+        stagingHash = sha(hash)
+    }
+
+    /// Keep the resume file locked until it is placed or discarded. A concurrent
+    /// transfer starts from zero in its own file.
+    func resume() {
+        guard index == 0, handle == nil else { return }
+        handle = openStaging()
+        if handle == nil {
+            stagingSuffix = "-" + UUID().uuidString
+            handle = openStaging()
         }
+        guard let handle else { return }
+        do {
+            let size = try handle.seekToEnd()
+            if let expected = sizes.first, expected >= 0, size <= UInt64(expected) {
+                received = Int64(size)
+            } else {
+                try reset(handle)
+            }
+        } catch { discard() }
+    }
+
+    private func openStaging() -> FileHandle? {
+        try? FileManager.default.createDirectory(at: temp.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let fd = open(temp.path, O_RDWR | O_CREAT | O_NONBLOCK | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else { return nil }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        var info = stat()
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0, fstat(fd, &info) == 0,
+              (info.st_mode & S_IFMT) == S_IFREG, info.st_nlink == 1 else { return nil }
+        return handle
     }
 
     func write(_ bytes: Data, total: Int64) -> Step {
-        guard index < names.count, received + Int64(bytes.count) <= total else { return .failed }
+        guard index < names.count, let expected = sizes[safe: index], total == expected,
+              received <= total, Int64(bytes.count) <= total - received else { return .failed }
         if handle == nil {
-            try? FileManager.default.createDirectory(at: temp.deletingLastPathComponent(), withIntermediateDirectories: true)
-            if !FileManager.default.fileExists(atPath: temp.path) {
-                FileManager.default.createFile(atPath: temp.path, contents: nil, attributes: [.posixPermissions: 0o600])
-            }
-            handle = FileHandle(forWritingAtPath: temp.path)
-            try? handle?.truncate(atOffset: UInt64(received))
+            handle = openStaging()
+            guard let handle, (try? reset(handle)) != nil else { return .failed }
         }
         guard let h = handle, (try? h.write(contentsOf: bytes)) != nil else { return .failed }
         received += Int64(bytes.count)
         guard received == total else { return .more }
-        try? h.close()
-        handle = nil
         guard let dest = place() else { return .failed }
+        suspend()
         paths.append(dest)
         index += 1
         received = 0
         return index < names.count ? .nextFile : .done
     }
 
+    private func reset(_ handle: FileHandle) throws {
+        try handle.truncate(atOffset: 0)
+        try handle.seek(toOffset: 0)
+    }
+
     /// Images go next to ClipBubble's own; files go to Downloads/ClipBubble/<device>/ under a safe, unique name.
     private func place() -> String? {
         if kind == "image" {
             let expected = shas[safe: index] ?? ""
-            guard let data = FileManager.default.contents(atPath: temp.path), expected.isEmpty || sha(data) == expected else {
-                try? FileManager.default.removeItem(at: temp)
-                return nil
-            }
-            let dest = Paths.images.appendingPathComponent(sha(data) + ".png")
-            try? FileManager.default.removeItem(at: dest)
-            guard (try? FileManager.default.moveItem(at: temp, to: dest)) != nil else { return nil }
+            guard let data = FileManager.default.contents(atPath: temp.path) else { return nil }
+            let digest = sha(data)
+            guard expected.isEmpty || digest == expected else { return nil }
+            let dest = Paths.images.appendingPathComponent(digest + ".png")
+            guard rename(temp.path, dest.path) == 0 else { return nil }
             return dest.path
         }
         let dir = receivedFolder(from)
@@ -1058,8 +1194,8 @@ final class Download {
     }
 
     func discard() {
+        if handle != nil { unlink(temp.path) }
         suspend()
-        try? FileManager.default.removeItem(at: temp)
     }
 }
 
@@ -1081,17 +1217,18 @@ func receivedFolder(_ device: String) -> URL {
 
 /// A name from another machine can't climb out of its folder or hide itself.
 func safeFileName(_ raw: String) -> String {
-    var s = raw.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "\\", with: "_")
+    var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "\\", with: "_")
         .replacingOccurrences(of: ":", with: "_").filter { !$0.isNewline && $0 != "\0" }
-    while s.hasPrefix(".") { s.removeFirst() }
-    s = s.trimmingCharacters(in: .whitespaces)
+    while let first = s.first, first == "." || first.isWhitespace { s.removeFirst() }
+    s = s.trimmingCharacters(in: .whitespacesAndNewlines)
     // A long name is cut before its extension, so the file still opens with the right app.
     if s.count > 200 {
         let ext = numbered(s).ext
         let tail = ext.isEmpty ? "" : "." + ext
         s = String(s.prefix(200 - tail.count)).trimmingCharacters(in: .whitespaces) + tail
     }
-    return s.isEmpty ? "file" : s
+    return s.isEmpty || s == "." || s == ".." ? "file" : s
 }
 
 /// A name split for numbering: "shot (3).png" is "shot", 3, "png". Extensions are short and have no spaces.

@@ -29,9 +29,9 @@ final class Updater: ObservableObject {
     }
 
     nonisolated static let current = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
-    nonisolated static let releases = URL(string: "https://github.com/rohit3a/clipbubble/releases/latest")!
+    nonisolated static let releases = URL(string: "https://github.com/KRNL-Studio/clipbubble/releases/latest")!
     nonisolated static let relaunchArgument = "-clipbubble-update-relaunch"
-    private nonisolated static let latest = URL(string: "https://api.github.com/repos/rohit3a/clipbubble/releases/latest")!
+    nonisolated static let latest = URL(string: "https://api.github.com/repos/KRNL-Studio/clipbubble/releases/latest")!
 
     /// An ad hoc build can't prove the update came from the same developer, and macOS treats it as a new app.
     static let signedByTeam: Bool = {
@@ -48,7 +48,7 @@ final class Updater: ObservableObject {
     }
 
     /// A background check stays quiet when it can't reach GitHub, and leaves a found update or an install alone.
-    func check(quietly: Bool = false) {
+    func check(quietly: Bool = false, fetchLatest: @escaping @MainActor () async throws -> Release = { try await Updater.fetchLatest() }) {
         switch state {
         case .checking, .installing: return
         case .available where quietly: return
@@ -58,9 +58,11 @@ final class Updater: ObservableObject {
         if !quietly { state = .checking }
         Task {
             do {
-                let r = try await Self.fetchLatest()
+                let r = try await fetchLatest()
+                if case .installing = state { return }
                 state = Self.isNewer(r.version, than: Self.current) ? .available(r) : .current
             } catch {
+                if case .installing = state { return }
                 if !quietly { state = .failed("Couldn't check for updates: \(error.localizedDescription)") }
             }
         }
@@ -72,9 +74,11 @@ final class Updater: ObservableObject {
         let app = Bundle.main.bundleURL
         Task {
             do {
-                try await Self.install(r, over: app) { s in Task { @MainActor in Updater.shared.state = .installing(s) } }
+                try await Self.install(r, over: app) { s in
+                    await MainActor.run { self.state = .installing(s) }
+                }
                 state = .installing("Reopening…")
-                Self.reopen(app)
+                try Self.reopen(app)
             } catch {
                 state = .failed(error.localizedDescription)
             }
@@ -120,7 +124,7 @@ final class Updater: ObservableObject {
         return try parse(data)
     }
 
-    private nonisolated static func install(_ r: Release, over app: URL, progress: @escaping @Sendable (String) -> Void) async throws {
+    private nonisolated static func install(_ r: Release, over app: URL, progress: @Sendable (String) async -> Void) async throws {
         guard !app.path.contains("/AppTranslocation/") else {
             throw UpdateError("Move ClipBubble into your Applications folder, open it from there, then update.")
         }
@@ -133,7 +137,7 @@ final class Updater: ObservableObject {
         let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200 else { throw UpdateError("the download failed (\(status))") }
 
-        progress("Checking the download…")
+        await progress("Checking the download…")
         // On the app's own volume, so the swap below is a rename.
         let work = try FileManager.default.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: app, create: true)
         defer { try? FileManager.default.removeItem(at: work) }
@@ -146,7 +150,7 @@ final class Updater: ObservableObject {
         guard ditto.terminationStatus == 0, FileManager.default.fileExists(atPath: new.path) else { throw UpdateError("the download couldn't be unpacked") }
         try verify(new, version: r.version, against: app)
 
-        progress("Installing \(r.version)…")
+        await progress("Installing \(r.version)…")
         _ = try FileManager.default.replaceItemAt(app, withItemAt: new, backupItemName: nil, options: .usingNewMetadataOnly)
     }
 
@@ -180,13 +184,14 @@ final class Updater: ObservableObject {
     }
 
     /// Waits for this copy to quit, then opens the new one.
-    private static func reopen(_ app: URL) {
+    static func reopen(_ app: URL, helper: URL = URL(fileURLWithPath: "/bin/sh"),
+                       terminate: @MainActor () -> Void = { NSApp.terminate(nil) }) throws {
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.executableURL = helper
         p.arguments = ["-c", #"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open -g "$2" --args "$3""#,
                        "sh", String(getpid()), app.path, relaunchArgument]
-        try? p.run()
-        NSApp.terminate(nil)
+        try p.run()
+        terminate()
     }
 }
 

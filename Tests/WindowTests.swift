@@ -50,6 +50,58 @@ func windowTests() {
     check(browser.count == 1 && browser.clips.first?.hash == "window-shot", "History counts source-filtered matches")
 
     historyRecycledIDTest(model)
+    shotCardDragDismissTest()
+    shotCardReplacementTest()
+}
+
+private func shotCardDragDismissTest() {
+    let card = ShotCard()
+    var hidden = 0
+    card.onHidden = { hidden += 1 }
+    let url = testHome.appendingPathComponent("shot-drag.png")
+    card.show(url, beside: NSRect(x: 900, y: 20, width: 64, height: 64), in: NSRect(x: 0, y: 0, width: 1000, height: 800))
+    check(card.isVisible, "shot card appears for a new screenshot")
+    card.state.dragStarted()
+    card.state.hovered(false)
+    check(card.isVisible && hidden == 0, "shot card stays visible while dragging")
+    card.state.dragEnded(false)
+    check(card.isVisible && hidden == 0, "cancelling a drag leaves the shot card visible")
+    card.state.dragStarted()
+    card.state.dragEnded(true)
+    let deadline = Date().addingTimeInterval(0.6)
+    while card.isVisible, Date() < deadline {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+    }
+    check(!card.isVisible && hidden == 1, "dropping a dragged screenshot hides the shot card immediately")
+}
+
+private func shotCardReplacementTest() {
+    let card = ShotCard()
+    let bubble = NSRect(x: 900, y: 20, width: 64, height: 64)
+    let screen = NSRect(x: 0, y: 0, width: 1000, height: 800)
+    let first = testHome.appendingPathComponent("shot-first.png")
+    let second = testHome.appendingPathComponent("shot-second.png")
+    var hidden = 0
+    card.onHidden = { hidden += 1 }
+    defer { card.hide(animated: false) }
+
+    card.show(first, beside: bubble, in: screen)
+    card.state.dragStarted()
+    let finishFirstDrag = card.state.dragEnded
+    card.show(second, beside: bubble, in: screen)
+    finishFirstDrag(true)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+    check(card.isVisible && card.state.url == second && hidden == 0, "an older drag cannot dismiss the replacement shot card")
+
+    card.hide()
+    card.show(first, beside: bubble, in: screen)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+    check(card.isVisible && card.state.url == first && hidden == 0, "an older fade-out cannot dismiss the replacement shot card")
+
+    // A spurious hover-exit when the pointer was never on the card must not shorten its lifetime.
+    card.state.hovered(false)
+    RunLoop.main.run(until: Date().addingTimeInterval(2.8))
+    check(card.isVisible && card.state.url == first && hidden == 0, "a spurious hover-exit does not dismiss a newly shown shot card early")
 }
 
 private func historyRecycledIDTest(_ model: Model) {

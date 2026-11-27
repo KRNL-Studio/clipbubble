@@ -73,6 +73,7 @@ enum AppPage: String, CaseIterable, Identifiable {
 final class AppNav: ObservableObject {
     @Published var page: AppPage = .history
     let windowVisibility = CurrentValueSubject<Bool, Never>(false)
+    var runSetup: () -> Void = {}
 
     var sidebarSelection: Binding<AppPage?> {
         Binding(get: { self.page }, set: { self.page = $0 ?? self.page })
@@ -87,24 +88,90 @@ final class AppWindow: NSObject, NSWindowDelegate {
     let model: Model
     let nav = AppNav()
     let history: HistoryBrowser
+    let onboarding: OnboardingState
     private(set) var window: NSWindow?
+    private var frameBeforeSetup: NSRect?
+    private lazy var accessibilityDrag = AccessibilityDragPanelController(state: onboarding) { [weak self] in
+        guard let self, let window = self.window else { return }
+        self.reveal(window)
+    }
 
-    init(model: Model) {
+    init(model: Model, onboarding: OnboardingState = OnboardingState()) {
         self.model = model
+        self.onboarding = onboarding
         history = HistoryBrowser(model: model)
         super.init()
+        nav.runSetup = { [weak self] in self?.showSetup() }
     }
 
     var isVisible: Bool { window?.isVisible ?? false }
 
     func show(_ page: AppPage? = nil) {
+        if onboarding.needsSetup || onboarding.isRunning { showSetup(); return }
         if let page { nav.page = page }
         if nav.page == .history { history.reload() }
-        let w = window ?? make()
+        reveal(window ?? make())
+    }
+
+    private func reveal(_ w: NSWindow) {
         Presence.opened(w)
         w.makeKeyAndOrderFront(nil)
         if !nav.windowVisibility.value { nav.windowVisibility.send(true) }
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func showSetup() {
+        let w = window ?? make()
+        if !onboarding.isRunning {
+            onboarding.begin()
+            let setup = NSHostingController(rootView: OnboardingView(model: model, state: onboarding,
+                openAccessibilitySettings: { [weak self] in self?.openAccessibilitySettings() },
+                finish: { [weak self] in self?.finishSetup(landingOn: $0) }))
+            setup.sizingOptions = []
+            w.contentViewController = setup
+            if !w.styleMask.contains(.fullScreen), let screen = w.screen ?? NSScreen.main {
+                frameBeforeSetup = w.frame
+                w.setFrameAutosaveName("")
+                let area = screen.visibleFrame.insetBy(dx: 10, dy: 10)
+                w.minSize = NSSize(width: min(460, area.width), height: min(420, area.height))
+                let width = min(580, area.width), height = min(590, area.height)
+                w.setFrame(NSRect(x: area.midX - width / 2, y: area.midY - height / 2,
+                                  width: width, height: height), display: true)
+            }
+        }
+        reveal(w)
+    }
+
+    private func openAccessibilitySettings() {
+        if accessibilityDrag.show(on: window?.screen ?? NSScreen.main) { Access.openAccessibilitySettings() }
+    }
+
+    private func finishSetup(landingOn page: AppPage) {
+        guard onboarding.isRunning, let w = window else { return }
+        onboarding.finish()
+        nav.page = page
+        restoreMainWindow(w)
+        show(page)
+    }
+
+    private func cancelSetup() {
+        guard onboarding.isRunning, let w = window else { return }
+        onboarding.cancel()
+        restoreMainWindow(w)
+    }
+
+    private func restoreMainWindow(_ w: NSWindow) {
+        installMainContent(in: w)
+        if let frameBeforeSetup {
+            w.minSize = NSSize(width: 760, height: 500)
+            w.setFrame(frameBeforeSetup, display: true)
+            w.setFrameAutosaveName(Self.frameName)
+            self.frameBeforeSetup = nil
+        }
+    }
+
+    private func installMainContent(in w: NSWindow) {
+        w.contentViewController = NSHostingController(rootView: AppRootView(model: model, nav: nav, history: history).environmentObject(nav))
     }
 
     /// History changed somewhere: the History page follows while it's on screen.
@@ -114,8 +181,14 @@ final class AppWindow: NSObject, NSWindowDelegate {
     }
 
     func handleKey(_ e: NSEvent) -> NSEvent? {
-        guard e.window != nil, e.window === window, nav.page == .history,
-              e.modifierFlags.intersection([.command, .control, .option, .shift]) == .command,
+        guard !onboarding.isRunning, e.window != nil, e.window === window, nav.page == .history else { return e }
+        let modifiers = e.modifierFlags.intersection([.command, .control, .option, .shift])
+        if modifiers == [.command, .shift], e.charactersIgnoringModifiers?.lowercased() == "e",
+           let clip = history.selected, clip.polishPath != nil {
+            model.editInPolish(clip)
+            return nil
+        }
+        guard modifiers == .command,
               e.charactersIgnoringModifiers?.lowercased() == "c" else { return e }
         let responder = window?.firstResponder
         if responder is NSText || responder is NSTextField { return e }
@@ -132,7 +205,7 @@ final class AppWindow: NSObject, NSWindowDelegate {
         w.isReleasedWhenClosed = false
         w.minSize = NSSize(width: 760, height: 500)
         w.toolbarStyle = .unified
-        w.contentViewController = NSHostingController(rootView: AppRootView(model: model, nav: nav, history: history).environmentObject(nav))
+        installMainContent(in: w)
         w.setContentSize(NSSize(width: 1020, height: 660))
         w.delegate = self
         if !w.setFrameUsingName(Self.frameName) { w.center() }
@@ -144,6 +217,7 @@ final class AppWindow: NSObject, NSWindowDelegate {
     func windowWillClose(_ n: Notification) {
         cancelRecording()
         nav.windowVisibility.send(false)
+        cancelSetup()
         if let w = n.object as? NSWindow { Presence.closed(w) }
     }
 
@@ -184,6 +258,7 @@ enum Presence {
 /// while a window is open: ⌘Q or ⌘W pressed in the panel must not quit ClipBubble or close anything.
 enum MainMenu {
     static var openPage: (AppPage) -> Void = { _ in }
+    static var runSetup: () -> Void = {}
 
     static func install(full: Bool) {
         let main = NSMenu()
@@ -192,6 +267,7 @@ enum MainMenu {
             app.addItem(item("About ClipBubble", #selector(Actions.about), ""))
             app.addItem(.separator())
             app.addItem(item("Settings…", #selector(Actions.settings), ","))
+            app.addItem(item("Run Setup…", #selector(Actions.setup), ""))
             app.addItem(.separator())
             app.addItem(item("Quit ClipBubble", #selector(NSApplication.terminate(_:)), "q", target: NSApp))
             main.addItem(holder(app))
@@ -232,6 +308,7 @@ enum MainMenu {
         static let shared = Actions()
         @objc func about() { MainMenu.openPage(.about) }
         @objc func settings() { MainMenu.openPage(.general) }
+        @objc func setup() { MainMenu.runSetup() }
     }
 }
 
@@ -371,7 +448,7 @@ final class HistoryBrowser: ObservableObject {
 
     private func matchingClips(limit: Int, after cursor: Clip? = nil, id: Int64? = nil) -> [Clip]? {
         var tail = ""
-        var bindings: [Any] = []
+        var bindings: [Any?] = []
         if let cursor {
             // The ID breaks ties when several clips share a timestamp.
             tail += " AND (created, id) < (?, ?)"
@@ -383,15 +460,11 @@ final class HistoryBrowser: ObservableObject {
         }
         tail += " ORDER BY created DESC, id DESC LIMIT ?"
         bindings.append(limit)
-        return readMatches("id, kind, text, file, source, created, hash, origin, remote", tail: tail, bindings: bindings) { s in
-            func col(_ i: Int32) -> String { sqlite3_column_text(s, i).map { String(cString: $0) } ?? "" }
+        return readMatches("id, kind, text, file, source, created, hash, origin, remote, 0", tail: tail, bindings: bindings) { s in
             var clips: [Clip] = []
             var result = sqlite3_step(s)
             while result == SQLITE_ROW {
-                clips.append(Clip(id: sqlite3_column_int64(s, 0), kind: col(1), text: col(2),
-                                  file: sqlite3_column_type(s, 3) == SQLITE_NULL ? nil : col(3), source: col(4),
-                                  created: Date(timeIntervalSince1970: sqlite3_column_double(s, 5)),
-                                  hash: col(6), origin: col(7), remote: sqlite3_column_int(s, 8) != 0))
+                clips.append(DB.readClip(s))
                 result = sqlite3_step(s)
             }
             return result == SQLITE_DONE ? clips : nil
@@ -399,51 +472,19 @@ final class HistoryBrowser: ObservableObject {
     }
 
     /// Apply the same filters to the count, every page and a selection outside the loaded pages.
-    private func readMatches<T>(_ columns: String, tail: String = "", bindings: [Any] = [],
+    private func readMatches<T>(_ columns: String, tail: String = "", bindings: [Any?] = [],
                                 read: (OpaquePointer?) -> T?) -> T? {
         var db: OpaquePointer?
         defer { sqlite3_close(db) }
         guard sqlite3_open_v2(Paths.db.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return nil }
         sqlite3_busy_timeout(db, 3000)
 
-        // Match the filters in DB.clips so History and the panel agree.
-        var sql = "SELECT \(columns) FROM clips WHERE created >= ?"
-        var args: [Any] = [Date().timeIntervalSince1970 - DB.retention]
         let kind = ["text", "image", "file"].contains(filter) ? filter : nil
-        if kind == "image" {
-            sql += " AND (kind = 'image' OR (kind = 'file' AND (" +
-                imageExts.map { "text LIKE '%.\($0)'" }.joined(separator: " OR ") + ")))"
-        } else if let kind {
-            sql += " AND kind = ?"
-            args.append(kind)
-        }
-        if let source = ["iphone": "iPhone", "shots": "Screenshot", "downloads": "Downloads"][filter] {
-            sql += " AND (source = ? COLLATE NOCASE OR origin IN (SELECT id FROM devices WHERE name = ? COLLATE NOCASE))"
-            args += [source, source]
-        }
-        if !query.isEmpty {
-            let text = "%" + query.replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_") + "%"
-            sql += " AND (text LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\')"
-            args += [text, text]
-        }
-        sql += Prefs.hiddenSQL + tail
-        args += bindings
-
-        var statement: OpaquePointer?
+        let source = ["iphone": "iPhone", "shots": "Screenshot", "downloads": "Downloads"][filter]
+        let (whereClause, args) = DB.clipFilter(kind: kind, source: source, query: query)
+        let sql = "SELECT \(columns) FROM clips " + whereClause + tail
+        guard let statement = DB.prepare(db, sql, args + bindings) else { return nil }
         defer { sqlite3_finalize(statement) }
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
-        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        for (index, value) in args.enumerated() {
-            let index = Int32(index + 1)
-            switch value {
-            case let text as String: sqlite3_bind_text(statement, index, text, -1, transient)
-            case let time as Double: sqlite3_bind_double(statement, index, time)
-            case let id as Int64: sqlite3_bind_int64(statement, index, id)
-            case let limit as Int: sqlite3_bind_int64(statement, index, Int64(limit))
-            default: return nil
-            }
-        }
         return read(statement)
     }
 
@@ -454,9 +495,7 @@ final class HistoryBrowser: ObservableObject {
         let feedback = model.pick(clip, false)
         clearCopyFeedback()
         copyFeedback = feedback
-        let reset = DispatchWorkItem { [weak self] in self?.clearCopyFeedback() }
-        copyFeedbackReset = reset
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: reset)
+        copyFeedbackReset = .onMain(after: 1.2) { [weak self] in self?.clearCopyFeedback() }
         return true
     }
 
@@ -488,7 +527,9 @@ struct HistoryPage: View {
             }
             if let c = browser.selected {
                 Divider()
-                HistoryInspector(clip: c, model: model, browser: browser)
+                HistoryInspector(clip: c, device: model.devices[c.origin], linked: model.linked,
+                                 copyFeedback: browser.copyFeedback, polishStatus: model.polishStatus(for: c),
+                                 model: model, browser: browser)
                     .frame(width: 280)
                     .transition(.move(edge: .trailing).combined(with: .opacity))
             }
@@ -550,7 +591,10 @@ struct HistoryPage: View {
                             .onTapGesture(count: 2) { model.pick(c, false) }
                             .simultaneousGesture(TapGesture().onEnded { browser.selection = c.id })
                             .onDrag { dragItem(c) }
-                            .contextMenu { HistoryActions(clip: c, model: model, browser: browser) }
+                            .contextMenu {
+                                HistoryActions(clip: c, device: model.devices[c.origin], linked: model.linked,
+                                               model: model, browser: browser)
+                            }
                             .onAppear { browser.loadMore(after: c.id) }
                     }
                 }
@@ -637,22 +681,27 @@ struct HistoryCard: View {
 /// Copy, open, send and delete, the same for a card's menu and the inspector.
 struct HistoryActions: View {
     let clip: Clip
+    let device: String?
+    let linked: [Hello]
     let model: Model
     let browser: HistoryBrowser
 
     var body: some View {
         if clip.remote {
-            Button("Get from \(model.devices[clip.origin] ?? "other device")") { SyncEngine.shared.get(clip.hash) }
+            Button("Get from \(device ?? "other device")") { SyncEngine.shared.get(clip.hash) }
         } else {
             Button("Copy") { model.pick(clip, false) }
-            if clip.polishPath != nil { Button("Polish…") { model.polish(clip) } }
+            if clip.polishPath != nil {
+                Button("Polish") { model.polish(clip) }
+                Button("Edit in Polish…") { model.editInPolish(clip) }
+            }
             if let p = clip.imagePath ?? clip.paths.first {
                 Button("Open") { NSWorkspace.shared.open(URL(fileURLWithPath: p)) }
                 Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p)]) }
             }
-            if clip.kind != "text", !model.linked.isEmpty {
+            if clip.kind != "text", !linked.isEmpty {
                 Menu("Send to") {
-                    ForEach(model.linked, id: \.device) { h in Button(h.name) { SyncEngine.shared.send(clip.hash, toDevice: h.device) } }
+                    ForEach(linked, id: \.device) { h in Button(h.name) { SyncEngine.shared.send(clip.hash, toDevice: h.device) } }
                 }
             }
         }
@@ -663,6 +712,10 @@ struct HistoryActions: View {
 
 struct HistoryInspector: View {
     let clip: Clip
+    let device: String?
+    let linked: [Hello]
+    let copyFeedback: Bool?
+    let polishStatus: OneShotStatus?
     let model: Model
     let browser: HistoryBrowser
 
@@ -679,7 +732,7 @@ struct HistoryInspector: View {
                 .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.05)))
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             VStack(alignment: .leading, spacing: 6) {
-                fact("From", [model.devices[clip.origin], clip.source].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
+                fact("From", [device, clip.source].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
                 fact("Copied", clip.created.formatted(date: .abbreviated, time: .shortened))
                 if let s = size { fact("Size", s) }
                 if let p = clip.imagePath ?? clip.paths.first { fact("Where", (p as NSString).abbreviatingWithTildeInPath) }
@@ -691,18 +744,25 @@ struct HistoryInspector: View {
                         .controlSize(.large).buttonStyle(.borderedProminent)
                 } else {
                     Button { browser.copySelected() } label: {
-                        let feedback = browser.copyFeedback
-                        Label(feedback.map { $0 ? "Copied" : "Couldn't copy" } ?? "Copy",
-                              systemImage: feedback.map { $0 ? "checkmark" : "exclamationmark.circle" } ?? "doc.on.doc").frame(maxWidth: .infinity)
+                        Label(copyFeedback.map { $0 ? "Copied" : "Couldn't copy" } ?? "Copy",
+                              systemImage: copyFeedback.map { $0 ? "checkmark" : "exclamationmark.circle" } ?? "doc.on.doc").frame(maxWidth: .infinity)
                     }
                     .controlSize(.large).buttonStyle(.borderedProminent)
                     if clip.polishPath != nil {
-                        Button { model.polish(clip) } label: { Label("Polish", systemImage: "sparkles") }
-                            .controlSize(.large).keyboardShortcut("e", modifiers: .command).help("Open in the editor  ⌘E")
+                        Button { model.polish(clip) } label: {
+                            if polishStatus == .rendering { ProgressView().controlSize(.small).frame(width: 52) }
+                            else {
+                                Label(polishStatus == .copied ? "Copied" : polishStatus == .failed ? "Failed" : "Polish",
+                                      systemImage: polishStatus?.symbol ?? "sparkles")
+                            }
+                        }
+                        .controlSize(.large).keyboardShortcut("e", modifiers: .command)
+                        .accessibilityLabel("Polish and copy")
+                        .help("Polish and copy  ⌘E")
                     }
                 }
                 Menu {
-                    HistoryActions(clip: clip, model: model, browser: browser)
+                    HistoryActions(clip: clip, device: device, linked: linked, model: model, browser: browser)
                 } label: { Image(systemName: "ellipsis") }
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                     .controlSize(.large)

@@ -73,6 +73,14 @@ func syncTests() {
     let hugeCount = Data([2, 0xff, 0xff, 0xff, 0xff])
     check((try? Frame.decode(hugeCount)) == nil, "rejects a summary count larger than the frame")
 
+    var oversized = Entry(hash: "f:overflow", time: 1, kind: "file", text: "", source: "", origin: "",
+                          blobs: [Blob(name: "first", size: Int64.max - 1, sha: ""), Blob(name: "second", size: 1, sha: "")])
+    check(oversized.size == Int64.max && (try? Frame.decode(Frame.put(oversized).encoded().dropFirst(4))) == .put(oversized),
+          "a blob total of Int64.max is valid")
+    oversized.blobs[1].size = 2
+    check(oversized.size == Int64.max && (try? Frame.decode(Frame.put(oversized).encoded().dropFirst(4))) == nil,
+          "blob size saturates and an overflowing manifest is rejected")
+
     // Random bytes never crash the decoder.
     var rng = SystemRandomNumberGenerator()
     for _ in 0..<3000 {

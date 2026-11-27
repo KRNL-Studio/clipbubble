@@ -8,7 +8,7 @@ packages:
     from: 2.81.0
   swift-nio-ssh:
     url: https://github.com/apple/swift-nio-ssh
-    from: 0.14.1
+    from: 0.15.0
 settings:
   base:
     SWIFT_VERSION: "5.0"
@@ -92,6 +92,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: studio.krnl.clipbubble.share
+        # Only the main app declares App Intents.
+        LM_SKIP_METADATA_EXTRACTION: YES
   ClipBubbleKeyboard:
     type: app-extension
     platform: iOS
@@ -114,3 +116,4 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: studio.krnl.clipbubble.keyboard
+        LM_SKIP_METADATA_EXTRACTION: YES

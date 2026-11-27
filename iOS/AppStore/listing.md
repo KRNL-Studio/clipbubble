@@ -26,15 +26,15 @@ Paste these into App Store Connect.
 
 ## Description
 
-ClipBubble for iPhone works with the free ClipBubble app for Mac, Windows and Linux. You need a computer running ClipBubble to sync. Without one, you can still save text, photos and files on this iPhone and reuse them.
+Save, search and reuse text, photos and files on your iPhone. To sync your clipboard, link a Mac, Windows PC or Linux computer running the free ClipBubble app.
 
 Copy on your computer, paste on your iPhone, and back. Your devices link directly over your own Wi-Fi with an encrypted SSH connection. There is no account, no cloud and no subscription.
 
-Recent and Library show 7 days of what you copied: text, links, images and files. Search any of it and tap to copy.
+Recent and Library keep 7 days of text, links, images and files you add or sync. Search your history and tap an item to copy it or get it from a linked computer.
 
-The ClipBubble keyboard types from your history in any app. Turn on Allow Full Access to read your history there. It types normally without it.
+The ClipBubble keyboard types saved text in supported fields and copies images and files so you can paste them where supported. Turn on Allow Full Access to see your history in the keyboard. Basic typing works with Full Access off.
 
-Share anything to ClipBubble from any app. Use Shortcuts or Siri to send your clipboard or fetch the latest item.
+Use the share sheet in supported apps to save text, links, photos and files to ClipBubble. Use Shortcuts or Siri to send your clipboard to linked computers or copy a recent item to this iPhone.
 
 ClipBubble collects no data. Your history stays on your devices.
 
@@ -46,15 +46,15 @@ Without a computer:
 
 1. Tap Not now on Welcome.
 2. Tap Add, then Text, and add a note. It appears in Recent and Library.
-3. Tap it to copy. Touch and hold it for Open, Copy, Share and Delete.
+3. Tap it to copy, or tap the info button in Recent to inspect it. Touch and hold for more actions.
 4. In Safari, share a page to ClipBubble.
-5. In Settings, go to General, Keyboard, Keyboards, Add New Keyboard, ClipBubble. In Notes, switch to it. Turn on Allow Full Access and it lists your history. Tap an item to type it.
+5. In Settings, go to General, Keyboard, Keyboards, Add New Keyboard, ClipBubble. Turn on Allow Full Access for ClipBubble to see your history. In Notes, switch to ClipBubble and tap the saved note to type it.
 
-With a computer: install ClipBubble from https://clipbubble.krnl.studio on a Mac, and turn on Remote Login in System Settings, General, Sharing. Open ClipBubble, Settings, Sync over SSH, Link iPhone. On the same Wi-Fi, scan the code with the iPhone Camera, tap Link, and allow Local Network.
+Install ClipBubble from https://clipbubble.krnl.studio on a Mac and turn on Remote Login in System Settings → General → Sharing. On the Mac, open ClipBubble → Devices → Sync over SSH → Link iPhone… On the same Wi-Fi, scan the code with the iPhone Camera, tap Link, and allow Local Network.
 
 Local Network is used only to reach the user's own computer. Full Access is used only to read the local history and link to the user's computers.
 
 ## Still to make
 
 - A sync video recorded on a real iPhone and computer: linking, the Local Network prompt, a copy each way, Share and the keyboard.
-- Screenshots at 6.9 inches: Recent while linked, Library, an item's detail, Add, the keyboard in Messages and the Share card.
+- All seven 6.9-inch screenshots (`1-recent.png` through `7-share.png`) are ready in `iOS/AppStore/screenshots/`.

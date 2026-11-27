@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 import Network
 
@@ -6,11 +7,12 @@ import Network
 /// one-time code. The phone sends its key; the computer answers with its user and host key.
 enum Pairing {
     enum Failure: LocalizedError {
-        case badLink, unreachable, refused(String)
+        case badLink, unreachable, keyUnavailable, refused(String)
         var errorDescription: String? {
             switch self {
             case .badLink: return "That isn't a ClipBubble pairing code."
             case .unreachable: return "Couldn't reach the computer. Check that this iPhone is on the same Wi-Fi, and that Local Network is on for ClipBubble in Settings."
+            case .keyUnavailable: return "This iPhone's SSH key is unavailable. Unlock the iPhone and try again."
             case .refused(let why): return why
             }
         }
@@ -23,9 +25,13 @@ enum Pairing {
         init?(_ url: URL) {
             guard url.scheme == "clipbubble", url.host == "pair",
                   let q = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
-                  let hosts = q.first(where: { $0.name == "h" })?.value?.split(separator: ",").map(String.init), !hosts.isEmpty,
+                  let addresses = q.first(where: { $0.name == "h" })?.value?.split(separator: ","), !addresses.isEmpty,
                   let port = q.first(where: { $0.name == "p" })?.value.flatMap(UInt16.init),
+                  port != 0,
                   let code = q.first(where: { $0.name == "c" })?.value else { return nil }
+            let hosts = addresses.map { address in
+                address.hasPrefix("[") && address.hasSuffix("]") ? String(address.dropFirst().dropLast()) : String(address)
+            }
             (self.hosts, self.port, self.code) = (hosts, port, code)
             name = q.first(where: { $0.name == "n" })?.value
         }
@@ -34,7 +40,8 @@ enum Pairing {
     /// Returns the new link's alias (`user@host`) and the computer's name.
     static func pair(_ link: Link) async throws -> (alias: String, name: String) {
         let (hosts, port) = (link.hosts, link.port)
-        var req = try JSONSerialization.data(withJSONObject: ["code": link.code, "key": Keys.publicKey, "name": Platform.deviceName])
+        guard let key = Keys.publicKey else { throw Failure.keyUnavailable }
+        var req = try JSONSerialization.data(withJSONObject: ["code": link.code, "key": key, "name": Platform.deviceName])
         req.append(10)
         // Every address at once, so one a firewall drops costs nothing. The first (the .local name, which survives a
         // new IP address) gets a head start, since all of them reach the same computer.
@@ -58,16 +65,28 @@ enum Pairing {
             guard let no = replies.first?.1 else { throw Failure.unreachable }
             throw Failure.refused(no["error"] as? String ?? "The computer said no. Show a new code there and scan it again.")
         }
-        // Trusts exactly the key the computer reported, so even the first SSH connection is checked.
-        if let key = r["hostKey"] as? String, !key.isEmpty { Platform.defaults.set(key, forKey: "sync.hostkey.\(host):22") }
-        let alias = "\(user)@\(host)"
+        let sshPort: Int
+        if let value = r["sshPort"] {
+            guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  let port = number as? Int, (1...65535).contains(port) else {
+                throw Failure.refused("The computer sent an invalid SSH port.")
+            }
+            sshPort = port
+        } else {
+            sshPort = 22
+        }
+        let address = sshPort == 22 ? host : "\(host.contains(":") ? "[\(host)]" : host):\(sshPort)"
+        let alias = "\(user)@\(address)"
+        guard let target = SSHTarget(alias) else { throw Failure.refused("The computer sent an invalid SSH address.") }
+        // Trust exactly the key the computer reported, including on the first SSH connection.
+        if let key = r["hostKey"] as? String, !key.isEmpty { Platform.defaults.set(key, forKey: target.hostKeyPreference) }
         Addresses.save([host] + hosts.filter { $0 != host }, for: alias)
         return (alias, r["name"] as? String ?? host)
     }
 
     /// Links to the same computer under an older address. A computer keeps one link per device, so they'd only compete.
     static func olderLinks(than alias: String) -> [String] {
-        func key(_ a: String) -> String? { SSHTarget(a).flatMap { Platform.defaults.string(forKey: "sync.hostkey.\($0.host):\($0.port)") } }
+        func key(_ a: String) -> String? { SSHTarget(a).flatMap { Platform.defaults.string(forKey: $0.hostKeyPreference) } }
         guard let k = key(alias) else { return [] }
         return SyncEngine.enabledHosts.filter { $0 != alias && key($0) == k }
     }

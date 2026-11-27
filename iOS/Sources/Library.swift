@@ -108,7 +108,11 @@ struct LibraryView: View {
         .navigationTitle("Library")
         .navigationBarTitleDisplayMode(.inline)
         .task(id: query) { all = model.library(query: query) }
-        .onChange(of: model.clips) { withAnimation(.snappy) { all = model.library(query: query) } }
+        .refreshable {
+            model.redialAll()
+            all = model.library(query: query)
+        }
+        .onChange(of: model.revision) { withAnimation(.snappy) { all = model.library(query: query) } }
         .navigationDestination(item: $viewing) { ClipDetail(clip: $0) }
         .toast(model.line)
     }

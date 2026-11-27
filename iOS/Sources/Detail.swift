@@ -1,3 +1,4 @@
+import ImageIO
 import SwiftUI
 
 extension View {
@@ -43,7 +44,10 @@ struct ClipPreview: View {
 
     var body: some View {
         if let p = clip.imagePath, !clip.remote {
-            Color.clear.frame(width: 340, height: 260).overlay { Thumb(p, pixels: 900).scaledToFit() }
+            let size = imageSize(p)
+            Color.clear.frame(width: size.width, height: size.height)
+                .overlay { Thumb(p, pixels: 900).scaledToFill() }
+                .clipped()
         } else if clip.kind == "text" {
             Text(clip.text.trimmingCharacters(in: .whitespacesAndNewlines))
                 .font(.body).lineLimit(18)
@@ -56,6 +60,20 @@ struct ClipPreview: View {
             .padding(24).frame(width: 300)
         }
     }
+
+    private func imageSize(_ path: String) -> CGSize {
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let image = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, options),
+              let properties = CGImageSourceCopyPropertiesAtIndex(image, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? CGFloat, width > 0,
+              let height = properties[kCGImagePropertyPixelHeight] as? CGFloat, height > 0 else {
+            return CGSize(width: 340, height: 260)
+        }
+        let orientation = properties[kCGImagePropertyOrientation] as? Int ?? 1
+        let (w, h) = (5...8).contains(orientation) ? (height, width) : (width, height)
+        let scale = min(340 / w, 420 / h)
+        return CGSize(width: w * scale, height: h * scale)
+    }
 }
 
 /// Everything about one item: all of its text, the full picture, or its files, and where and when it came from.
@@ -66,29 +84,44 @@ struct ClipDetail: View {
     private static let shownLength = 20_000
     private let item: Clip
     @State private var confirmDelete = false
+    @State private var live: Clip?
 
     init(clip: Clip) { item = clip }
 
-    @State private var live: Clip?
-    private var clip: Clip { live ?? item }
-
     var body: some View {
-        ScrollView {
+        Group {
+            if let live {
+                detail(live)
+            } else {
+                ContentUnavailableView("Item deleted", systemImage: "trash",
+                                       description: Text("This item is no longer in your ClipBubble history."))
+            }
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle(item.look.name)
+        .navigationBarTitleDisplayMode(.inline)
+        .toast(model.line)
+        .onChange(of: model.revision, initial: true) {
+            live = model.clip(item.hash)
+            if live == nil { confirmDelete = false }
+        }
+    }
+
+    private func detail(_ clip: Clip) -> some View {
+        let device = clip.origin.isEmpty ? "This iPhone" : model.devices[clip.origin] ?? "computer"
+        return ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 if let t = model.transfers[clip.hash] { TransferRow(hash: clip.hash, transfer: t).card() }
-                content
-                details
+                content(clip, device: device)
+                details(clip, device: device)
             }
             .padding()
         }
-        .background(Color(.systemGroupedBackground))
-        .navigationTitle(clip.look.name)
-        .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             if !clip.remote {
                 ToolbarItem(placement: .topBarTrailing) {
                     if clip.kind == "text" {
-                        ShareLink(item: clip.text)
+                        ShareLink(item: model.whole(clip).text)
                     } else if let p = clip.file ?? clip.paths.first {
                         ShareLink(item: URL(fileURLWithPath: p))
                     }
@@ -109,15 +142,9 @@ struct ClipDetail: View {
             .buttonStyle(.borderedProminent).buttonBorderShape(.capsule).controlSize(.large)
             .padding(.horizontal).padding(.bottom, 8)
         }
-        .toast(model.line)
-        // Reads the item back whenever history changes, so the screen updates when Get brings it over. The first read
-        // also swaps the list's trimmed copy for the full item.
-        .onReceive(model.$clips) { _ in live = model.clip(item.hash) ?? live }
     }
 
-    private var device: String { clip.origin.isEmpty ? "This iPhone" : model.devices[clip.origin] ?? "computer" }
-
-    @ViewBuilder private var content: some View {
+    @ViewBuilder private func content(_ clip: Clip, device: String) -> some View {
         if let p = clip.imagePath, !clip.remote {
             ZoomableImage(path: p)
         } else if clip.kind == "text" {
@@ -154,7 +181,7 @@ struct ClipDetail: View {
         }
     }
 
-    private var details: some View {
+    private func details(_ clip: Clip, device: String) -> some View {
         VStack(spacing: 0) {
             row("From", device)
             Divider()
@@ -185,19 +212,87 @@ struct ClipDetail: View {
     }
 }
 
-/// The full picture. Pinch to look closer; it settles back when you let go.
+/// Pinch and pan to inspect an image, then double-tap to fit it back on screen.
 struct ZoomableImage: View {
     let path: String
-    @State private var scale: CGFloat = 1
+    @State private var image: UIImage?
 
     var body: some View {
-        Thumb(path, pixels: 2400).scaledToFit()
-            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .scaleEffect(scale)
-            .gesture(MagnifyGesture()
-                .onChanged { scale = min(4, max(1, $0.magnification)) }
-                .onEnded { _ in withAnimation(.snappy) { scale = 1 } })
-            .zIndex(1)
+        Group {
+            if let image {
+                ImageScrollView(image: image)
+                    .aspectRatio(image.size, contentMode: .fit)
+                    .accessibilityLabel("Image")
+                    .accessibilityHint("Pinch to zoom. Double-tap to reset.")
+            } else {
+                Color(.tertiarySystemFill).aspectRatio(4 / 3, contentMode: .fit)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .task(id: path) {
+            image = Thumbnails.cached(path, pixels: 2400)
+            if image == nil {
+                let loaded = await Thumbnails.load(path, pixels: 2400)
+                if !Task.isCancelled { image = loaded }
+            }
+        }
+    }
+}
+
+private struct ImageScrollView: UIViewRepresentable {
+    let image: UIImage
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> UIScrollView {
+        let scroll = UIScrollView()
+        let imageView = context.coordinator.imageView
+        scroll.delegate = context.coordinator
+        scroll.maximumZoomScale = 4
+        scroll.showsHorizontalScrollIndicator = false
+        scroll.showsVerticalScrollIndicator = false
+        scroll.panGestureRecognizer.isEnabled = false
+        scroll.contentInsetAdjustmentBehavior = .never
+        imageView.contentMode = .scaleAspectFit
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        scroll.addSubview(imageView)
+        NSLayoutConstraint.activate([
+            imageView.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
+            imageView.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
+            imageView.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
+            imageView.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
+            imageView.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor),
+            imageView.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor),
+        ])
+        let reset = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.resetZoom(_:)))
+        reset.numberOfTapsRequired = 2
+        scroll.addGestureRecognizer(reset)
+        return scroll
+    }
+
+    func updateUIView(_ scroll: UIScrollView, context: Context) {
+        let imageView = context.coordinator.imageView
+        if imageView.image !== image {
+            scroll.setZoomScale(1, animated: false)
+            imageView.image = image
+        }
+    }
+
+    final class Coordinator: NSObject, UIScrollViewDelegate {
+        let imageView = UIImageView()
+
+        func viewForZooming(in scrollView: UIScrollView) -> UIView? { imageView }
+
+        func scrollViewDidZoom(_ scrollView: UIScrollView) {
+            // At fit size, leave vertical scrolling to the detail screen.
+            let zoomed = scrollView.zoomScale > scrollView.minimumZoomScale
+            if scrollView.panGestureRecognizer.isEnabled != zoomed { scrollView.panGestureRecognizer.isEnabled = zoomed }
+        }
+
+        @objc func resetZoom(_ tap: UITapGestureRecognizer) {
+            guard let scroll = tap.view as? UIScrollView else { return }
+            scroll.setZoomScale(scroll.minimumZoomScale, animated: true)
+        }
     }
 }
 

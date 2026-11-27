@@ -2,10 +2,53 @@ import CoreFoundation
 import Foundation
 import Network
 
-/// The phone's half of pairing (the computer's is Sources/Pairing.swift, Linux/clipbubble/pairing.py or
-/// Windows/Sources/Pairing.cs): a `clipbubble://pair` link from the computer's QR code says where it is and carries a
-/// one-time code. The phone sends its key; the computer answers with its user and host key.
+/// Routes pairing codes and manages nearby discovery. Legacy SSH codes also carry the computer's address and a
+/// one-time token. The phone sends its SSH key and the computer answers with its user and host key.
 enum Pairing {
+    enum QRRoute: String {
+        case direct
+        case ssh = "pair"
+
+        init?(_ url: URL) {
+            guard url.scheme == "clipbubble", let host = url.host else { return nil }
+            self.init(rawValue: host)
+        }
+    }
+
+    static func displayName(for alias: String, reportedName: String? = nil) -> String {
+        if DirectPeers.isDirect(alias) {
+            let peer = DirectPeers.deviceId(from: alias).flatMap { DirectPeers.peer(id: $0) }
+            return peer?.name ?? reportedName ?? "Computer"
+        }
+        return reportedName ?? Platform.defaults.string(forKey: "sync.name.\(alias)")
+            ?? alias.split(separator: "@").last.map(String.init) ?? alias
+    }
+
+    static func displayName(of device: Hello) -> String {
+        displayName(for: DirectPeers.alias(for: device.device), reportedName: device.name)
+    }
+
+    static func unlinkDirect(id: String) {
+        SyncEngine.shared.setHost(DirectPeers.alias(for: id), on: false)
+        DirectPeers.remove(id: id)
+    }
+
+    /// Retry when a trusted computer becomes discoverable, so the next dial can use its current Bonjour endpoint.
+    @MainActor
+    static func browseNearby(onChange: @escaping ([DiscoveredPeer]) -> Void = { _ in }) -> DirectBrowser {
+        let engine = SyncEngine.shared
+        var previous: [DiscoveredPeer] = []
+        return DirectBrowser(localDeviceId: engine.device) { found in
+            for candidate in found where !previous.contains(candidate) {
+                guard let peer = DirectPeers.peer(id: candidate.id),
+                      peer.fingerprint.hasPrefix(candidate.fingerprintPrefix) else { continue }
+                engine.redial(DirectPeers.alias(for: peer.id))
+            }
+            previous = found
+            onChange(found)
+        }
+    }
+
     enum Failure: LocalizedError {
         case badLink, unreachable, keyUnavailable, refused(String)
         var errorDescription: String? {
@@ -125,5 +168,23 @@ enum Pairing {
             q.asyncAfter(deadline: .now() + 30) { if case .ready = c.state {} else { finish(nil) } }
             q.asyncAfter(deadline: .now() + 120) { finish(nil) }
         } } onCancel: { c.cancel() }
+    }
+}
+
+extension LinkState {
+    func phoneText(for alias: String) -> String {
+        switch self {
+        case .needsKeyAuth: return "Not allowed in. Link this iPhone again from the computer"
+        case .unknownHost, .hostKeyChanged: return "The computer's identity changed. Link it again to trust it"
+        case .unresolved where DirectPeers.isDirect(alias), .refused where DirectPeers.isDirect(alias):
+            return "Can't reach the computer. Make sure ClipBubble is open there"
+        case .unresolved: return "Can't find the computer. Is this iPhone on the same Wi-Fi?"
+        case .refused: return "The computer isn't accepting connections. Turn on Remote Login or SSH there"
+        case .notInstalled: return "ClipBubble isn't installed on the computer"
+        case .appNotRunning: return "Open ClipBubble on the computer"
+        case .live(let h): return "Linked with \(Pairing.displayName(for: alias, reportedName: h.name))"
+        case .versionMismatch(let h): return "Update ClipBubble on \(Pairing.displayName(for: alias, reportedName: h.name)) (it has \(h.version))"
+        default: return text
+        }
     }
 }

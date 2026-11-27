@@ -23,6 +23,7 @@ struct ClipBubbleApp: App {
                 // While the app is open it holds the link, and the keyboard leaves it alone (see SyncEngine.suspend).
                 .onChange(of: phase, initial: true) {
                     guard phase != .inactive else { return }
+                    model.setForeground(phase == .active)
                     model.heartbeat(phase == .active)
                     SyncEngine.shared.suspend(phase == .background)
                     if phase == .active { model.refreshSharedHistory() }
@@ -100,8 +101,25 @@ final class Model: ObservableObject {
     @Published var query = "" { didSet { reload() } }
     @Published private(set) var transfers: [String: Transfer] = [:]
     @Published private var toast: Line?
-    @Published private(set) var linking = false
+    @Published var showingLinkSheet = false { didSet { updateDiscovery() } }
+    @Published private(set) var nearby: [DiscoveredPeer] = []
+    @Published private(set) var verification: Verification?
+    @Published private var pairingTask: Task<Void, Never>?
+    var linking: Bool { pairingTask != nil }
+
+    struct Verification {
+        let name: String
+        var code: String?
+    }
+
+    private enum PairedComputer {
+        case direct(DirectPeer)
+        case ssh(alias: String, name: String)
+    }
+
     private var confirmingLink = false
+    private var inForeground = false
+    private var browser: DirectBrowser?
     private let db = DB()
     private var toastTask: Task<Void, Never>?
     private var shareObserver: NSObjectProtocol?
@@ -149,6 +167,20 @@ final class Model: ObservableObject {
         DispatchQueue.global(qos: .utility).async { ShareOutbox.recover() }
     }
 
+    func setForeground(_ active: Bool) {
+        inForeground = active
+        updateDiscovery()
+    }
+
+    private func updateDiscovery() {
+        if inForeground && (showingLinkSheet || !DirectPeers.all.isEmpty) {
+            if browser == nil { browser = Pairing.browseNearby { [weak self] in self?.nearby = $0 } }
+        } else {
+            browser?.stop()
+            browser = nil
+        }
+    }
+
     /// While the app is open it stamps the time every few seconds. The keyboard trusts a recent stamp, so an app that
     /// crashed while open doesn't leave it waiting for a link nobody holds.
     private var beat: Timer?
@@ -174,13 +206,24 @@ final class Model: ObservableObject {
     func whole(_ c: Clip) -> Clip { db.whole(c) }
 
     func add(_ alias: String) {
-        guard SSHTarget(alias) != nil, !hosts.contains(alias) else { return }
+        let valid: Bool
+        if DirectPeers.isDirect(alias) {
+            valid = DirectPeers.deviceId(from: alias).flatMap { DirectPeers.peer(id: $0) } != nil
+        } else {
+            valid = SSHTarget(alias) != nil
+        }
+        guard valid, !hosts.contains(alias) else { return }
         hosts.append(alias)
         SyncEngine.shared.setHost(alias, on: true)
     }
 
     func remove(_ alias: String) {
         hosts.removeAll { $0 == alias }
+        if let id = DirectPeers.deviceId(from: alias) {
+            Pairing.unlinkDirect(id: id)
+            updateDiscovery()
+            return
+        }
         SyncEngine.shared.setHost(alias, on: false)
         Addresses.forget(alias)
         // Left behind, the old host key would refuse this computer if it came back after a reinstall.
@@ -267,32 +310,104 @@ final class Model: ObservableObject {
     /// A pairing link from the Camera, a scan or anywhere else. Nothing leaves this iPhone until you say yes, because
     /// the computer you link gets everything you copy. Its address leads, since it can call itself anything.
     func open(_ url: URL) {
-        guard url.host == "pair", !linking, !confirmingLink else { return }
-        guard let link = Pairing.Link(url) else { return Prompt.show("Link a computer", Pairing.Failure.badLink.localizedDescription) }
-        confirmingLink = true
-        let name = link.name.map { "It calls itself \($0). " } ?? ""
-        Prompt.show("Link the computer at \(link.hosts[0])?",
-                    name + "Linking syncs the clipboard history ClipBubble keeps from the last 7 days and new copies between this iPhone and the computer. Only link a computer you're setting up right now.",
-                    ok: "Link", cancel: "Cancel") { [weak self] yes in
-            self?.confirmingLink = false
-            if yes { self?.pair(link) }
+        guard let route = Pairing.QRRoute(url), !linking, !confirmingLink else { return }
+        switch route {
+        case .direct:
+            let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+            guard let address = items?.first(where: { $0.name == "h" })?.value?.split(separator: ",").first else {
+                return Prompt.show("Link a computer", Pairing.Failure.badLink.localizedDescription)
+            }
+            confirmQR(address: String(address), name: items?.first(where: { $0.name == "n" })?.value) { [weak self] in
+                self?.pairDirectQR(url)
+            }
+        case .ssh:
+            guard let link = Pairing.Link(url) else {
+                return Prompt.show("Link a computer", Pairing.Failure.badLink.localizedDescription)
+            }
+            confirmQR(address: link.hosts[0], name: link.name) { [weak self] in
+                self?.beginPairing {
+                    let (alias, name) = try await Pairing.pair(link)
+                    return .ssh(alias: alias, name: name)
+                }
+            }
         }
     }
 
-    private func pair(_ link: Pairing.Link) {
-        linking = true
-        Task {
+    private func confirmQR(address: String, name: String?, onConfirm: @escaping () -> Void) {
+        confirmingLink = true
+        let claimedName = name.map { "The code says this computer is named \($0). " } ?? ""
+        Prompt.show("Link the computer at \(address)?",
+                    claimedName + "Linking syncs new copies and the last 7 days of ClipBubble history between this iPhone and the computer. Only link a computer you're setting up right now.",
+                    ok: "Link", cancel: "Cancel") { [weak self] yes in
+            self?.confirmingLink = false
+            if yes { onConfirm() }
+        }
+    }
+
+    func pairNearby(_ computer: DiscoveredPeer) {
+        guard !linking, !confirmingLink else { return }
+        verification = Verification(name: computer.name)
+        beginPairing { [weak self] in
+            let engine = SyncEngine.shared
+            let peer = try await DirectPairingClient.pairNearby(
+                endpoint: computer.endpoint, expectedFPPrefix: computer.fingerprintPrefix,
+                localIdentity: DirectIdentity.shared(deviceId: engine.device),
+                deviceId: engine.device, name: engine.name, os: Platform.os
+            ) { code in
+                guard let self, self.pairingTask?.isCancelled == false else { return }
+                self.verification?.code = code
+            }
+            guard peer.id == computer.id else { throw DirectPairError.invalidDevice }
+            return .direct(peer)
+        }
+    }
+
+    private func pairDirectQR(_ url: URL) {
+        beginPairing {
+            let engine = SyncEngine.shared
+            let peer = try await DirectPairingClient.pairQR(
+                url: url, localIdentity: DirectIdentity.shared(deviceId: engine.device),
+                deviceId: engine.device, name: engine.name, os: Platform.os
+            )
+            return .direct(peer)
+        }
+    }
+
+    func cancelPairing() { pairingTask?.cancel() }
+
+    private func beginPairing(_ pair: @escaping @MainActor () async throws -> PairedComputer) {
+        guard !linking else { return }
+        pairingTask = Task {
+            defer {
+                pairingTask = nil
+                verification = nil
+            }
             do {
-                let (alias, name) = try await Pairing.pair(link)
-                HostRow.remember(name, for: alias)
-                add(alias)
-                Pairing.olderLinks(than: alias).forEach(remove)
+                let computer = try await pair()
+                try Task.checkCancellation()
+                let alias: String
+                switch computer {
+                case .direct(let peer):
+                    DirectPeers.save(peer)
+                    alias = DirectPeers.alias(for: peer.id)
+                    add(alias)
+                case .ssh(let host, let name):
+                    alias = host
+                    HostRow.remember(name, for: alias)
+                    add(alias)
+                    Pairing.olderLinks(than: alias).forEach(remove)
+                }
                 SyncEngine.shared.redial(alias)
-                linking = false
-                say("Linked with \(name)")
+                showingLinkSheet = false
+                say("Linked with \(Pairing.displayName(for: alias))")
+            } catch is CancellationError {
+                return
+            } catch DirectPairError.network(_) {
+                if !Task.isCancelled {
+                    Prompt.show("Link a computer", "Can't reach the computer. Make sure ClipBubble is open there.")
+                }
             } catch {
-                linking = false
-                Prompt.show("Link a computer", error.localizedDescription)
+                if !Task.isCancelled { Prompt.show("Link a computer", error.localizedDescription) }
             }
         }
     }
@@ -317,6 +432,7 @@ struct HistoryView: View {
     @State private var next: Adding?
     @State private var photos: [PhotosPickerItem] = []
     @State private var viewing: Clip?
+    @State private var linkAfterWelcome = false
     @AppStorage("welcomed") private var welcomed = false
 
     enum Tab { case recent, library, add, settings }
@@ -340,9 +456,16 @@ struct HistoryView: View {
             AddPanel(paste: model.paste) { next = $0; adding = nil }
         }
         .sheet(isPresented: shows(.text)) { TextComposer(add: model.addText) }
-        .sheet(isPresented: Binding(get: { !welcomed && model.hosts.isEmpty }, set: { if !$0 { welcomed = true } })) {
-            Welcome { welcomed = true; tab = .settings }
+        .sheet(isPresented: Binding(get: { !welcomed && model.hosts.isEmpty }, set: { if !$0 { welcomed = true } }),
+               onDismiss: {
+                   if linkAfterWelcome {
+                       linkAfterWelcome = false
+                       model.showingLinkSheet = true
+                   }
+               }) {
+            Welcome { linkAfterWelcome = true; tab = .settings }
         }
+        .sheet(isPresented: $model.showingLinkSheet) { LinkSheet() }
         .onChange(of: model.linking) { if model.linking { welcomed = true } }
         .photosPicker(isPresented: shows(.photos), selection: $photos, maxSelectionCount: 20,
                       matching: .any(of: [.images, .videos]), preferredItemEncoding: .current)
@@ -370,9 +493,9 @@ struct HistoryView: View {
                     VStack(alignment: .leading, spacing: 10) {
                         Image(systemName: "laptopcomputer.and.iphone").font(.title).foregroundStyle(.tint).accessibilityHidden(true)
                         Text("Copy on your iPhone, paste on your computer, and back.").font(.headline)
-                        Text("Link a Mac, Windows PC or Linux computer running ClipBubble, and what you copy there shows up here. You can already add things with Add.")
+                        Text("Open ClipBubble on a nearby Mac, Windows or Linux computer, then select it to sync what you copy.")
                             .font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                        Button { tab = .settings } label: { Text("Link a computer").font(.body.weight(.semibold)).padding(.horizontal, 6) }
+                        Button { model.showingLinkSheet = true } label: { Text("Link a computer").font(.body.weight(.semibold)).padding(.horizontal, 6) }
                             .buttonStyle(.borderedProminent).buttonBorderShape(.capsule).padding(.top, 4)
                     }
                     .padding(.vertical, 8)
@@ -461,7 +584,8 @@ struct Welcome: View {
                 }
                 point("desktopcomputer", "Get ClipBubble for your computer",
                       "It's free for Mac, Windows and Linux at clipbubble.krnl.studio, and keeps 7 days of what you copy.")
-                point("qrcode.viewfinder", "Link them once", "Open Link iPhone in ClipBubble on your computer and scan the code. They talk directly over your Wi-Fi.")
+                point("laptopcomputer.and.iphone", "Link a nearby computer",
+                      "Open ClipBubble on your computer, then select it on your iPhone and confirm the matching code.")
                 point("keyboard", "Reuse your history", "Save items from the share sheet, or use the ClipBubble keyboard to type text in supported fields and copy images and files for pasting.")
             }
             .padding(28).padding(.top, 20)
@@ -652,12 +776,14 @@ struct HostRow: View {
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
-        .onChange(of: state) { if case .live(let h) = state { Self.remember(h.name, for: alias) } }
+        .onChange(of: state) {
+            if !DirectPeers.isDirect(alias), case .live(let h) = state { Self.remember(h.name, for: alias) }
+        }
     }
 
     private var subtitle: String {
         if case .live? = state { return "Linked" }
-        return state?.phoneText ?? "Connecting…"
+        return state?.phoneText(for: alias) ?? "Connecting…"
     }
 
     private var stuck: Bool {
@@ -668,8 +794,8 @@ struct HostRow: View {
     }
 
     private var name: String {
-        if case .live(let h) = state { return h.name }
-        return Platform.defaults.string(forKey: "sync.name.\(alias)") ?? alias.split(separator: "@").last.map(String.init) ?? alias
+        if case .live(let h) = state { return Pairing.displayName(for: alias, reportedName: h.name) }
+        return Pairing.displayName(for: alias)
     }
 
     /// The computer's own name, shown while it's offline instead of its address.
@@ -714,8 +840,6 @@ struct ClipRow: View {
 
 struct SettingsView: View {
     @EnvironmentObject var model: Model
-    @State private var scanning = false
-    @State private var scanFailed = false
     @State private var confirmClear = false
     @State private var removing: String?
     @AppStorage("appearance") private var appearance = Appearance.system
@@ -734,21 +858,11 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    step(1, "On your computer, open ClipBubble → Devices (or Settings on Windows/Linux) → Sync over SSH → Link iPhone…")
-                    step(2, DataScannerViewController.isSupported ? "Tap Scan code below, or point this iPhone's Camera at the code."
-                         : "Point this iPhone's Camera at the code.")
-                    if DataScannerViewController.isSupported {
-                        Button { scanning = true } label: { Label("Scan code", systemImage: "qrcode.viewfinder").font(.body.weight(.semibold)) }
+                    Button { model.showingLinkSheet = true } label: {
+                        Label("Link a computer", systemImage: "laptopcomputer.and.iphone")
                     }
-                    if scanFailed {
-                        Text("The camera isn't available. Allow ClipBubble to use it in the Settings app, or use the Camera app instead.")
-                            .font(.footnote).foregroundStyle(.secondary)
-                    }
-                    if model.linking {
-                        Label { Text("Linking…") } icon: { ProgressView() }
-                    }
-                } header: { Text(model.hosts.isEmpty ? "Link a computer" : "Link another computer") } footer: {
-                    Text("Don't have ClipBubble on your computer yet? It's free at clipbubble.krnl.studio.")
+                } footer: {
+                    Text("Link a nearby computer running ClipBubble. Get the free app at clipbubble.krnl.studio.")
                 }
 
                 Section {
@@ -772,7 +886,6 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    NavigationLink { ManualLink() } label: { Label("Link by hand with SSH", systemImage: "terminal") }
                     Link(destination: URL(string: "https://clipbubble.krnl.studio/support")!) { Label("Help and support", systemImage: "questionmark.circle") }
                     Link(destination: URL(string: "https://clipbubble.krnl.studio/privacy")!) { Label("Privacy policy", systemImage: "hand.raised") }
                 } header: { Text("More") } footer: {
@@ -789,37 +902,154 @@ struct SettingsView: View {
             } message: {
                 Text("To also take this iPhone's access away, unlink it in ClipBubble on the computer.")
             }
-            .sheet(isPresented: $scanning) {
-                NavigationStack {
-                    Scanner(found: { url in scanning = false; model.open(url) },
-                            failed: { scanning = false; scanFailed = true })
-                        .ignoresSafeArea()
-                        .overlay(alignment: .bottom) {
-                            Text("Open Link iPhone… in ClipBubble on your computer, then point the camera at its code.")
-                                .font(.subheadline.weight(.medium)).multilineTextAlignment(.center)
-                                .padding(.horizontal, 18).padding(.vertical, 12)
-                                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                                .padding(20)
-                        }
-                        .navigationTitle("Scan code").navigationBarTitleDisplayMode(.inline)
-                        .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { scanning = false } } }
-                }
-            }
-        }
-    }
-
-    private func step(_ n: Int, _ text: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 12) {
-            Text("\(n)").font(.subheadline.weight(.bold)).foregroundStyle(.white)
-                .frame(width: 24, height: 24).background(Circle().fill(Color.accentColor))
-                .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 5 }
-                .accessibilityHidden(true)
-            Text(text)
         }
     }
 }
 
-/// For a computer the QR code can't reach (a server, another network): this iPhone's key goes in its authorized_keys.
+struct LinkSheet: View {
+    @EnvironmentObject private var model: Model
+    @State private var scanning = false
+    @State private var scanFailed = false
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    if let verification = model.verification {
+                        verificationCard(verification)
+                    } else if model.linking {
+                        HStack {
+                            ProgressView()
+                            Text("Linking…")
+                            Spacer()
+                            Button("Cancel", action: model.cancelPairing).buttonStyle(.borderless)
+                        }
+                    } else {
+                        let computers = model.nearby.filter { $0.os != "ios" }
+                        if computers.isEmpty {
+                            Label { Text("Looking for nearby computers…") } icon: { ProgressView() }
+                        }
+                        ForEach(computers) { computer in
+                            computerRow(computer)
+                        }
+                    }
+                } header: {
+                    Text("Nearby Computers")
+                } footer: {
+                    if !model.linking {
+                        Text("Open ClipBubble on your computer. Linking syncs new copies and the last 7 days of ClipBubble history between your devices.")
+                    }
+                }
+
+                Section {
+                    Button {
+                        scanFailed = !DataScannerViewController.isSupported
+                        scanning = !scanFailed
+                    } label: {
+                        Label("Scan QR Code", systemImage: "qrcode.viewfinder")
+                    }
+                    if scanFailed {
+                        Text("Use the Camera app to scan the code, or allow camera access for ClipBubble in Settings.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
+                .disabled(model.linking)
+
+                Section {
+                    DisclosureGroup("Advanced (SSH)") {
+                        NavigationLink { ManualLink() } label: {
+                            Label("Enter a user and address", systemImage: "terminal")
+                        }
+                    }
+                }
+                .disabled(model.linking)
+            }
+            .navigationTitle("Link a computer")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                if !model.linking {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Close") { model.showingLinkSheet = false }
+                    }
+                }
+            }
+            .sheet(isPresented: $scanning) { scanner }
+        }
+        .interactiveDismissDisabled(model.linking)
+    }
+
+    private func computerRow(_ computer: DiscoveredPeer) -> some View {
+        let alias = DirectPeers.alias(for: computer.id)
+        let linked = model.statuses[alias]?.ok == true
+        let (icon, os): (String, String) = switch computer.os {
+        case "macos": ("laptopcomputer", "macOS")
+        case "windows": ("pc", "Windows")
+        default: ("desktopcomputer", "Linux")
+        }
+        return HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.title3).foregroundStyle(.tint)
+                .frame(width: 40, height: 40)
+                .background(.tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(computer.name).font(.subheadline.weight(.semibold))
+                Text(os)
+                    .font(.caption2.weight(.medium)).foregroundStyle(.secondary)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(.quaternary, in: Capsule())
+            }
+            Spacer()
+            if linked {
+                Label("Linked", systemImage: "checkmark").font(.caption).foregroundStyle(.secondary)
+            } else {
+                Button("Link") { model.pairNearby(computer) }
+                    .buttonStyle(.borderedProminent).buttonBorderShape(.capsule)
+                    .accessibilityLabel("Link \(computer.name)")
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func verificationCard(_ verification: Model.Verification) -> some View {
+        VStack(spacing: 12) {
+            if let code = verification.code {
+                Text("Confirm this code on \(verification.name)").font(.headline)
+                Text(code)
+                    .font(.largeTitle.monospaced().weight(.semibold))
+                    .accessibilityLabel(code.filter(\.isNumber).map(String.init).joined(separator: " "))
+                Text("Tap Allow on your computer.").foregroundStyle(.secondary)
+            } else {
+                ProgressView()
+                Text("Connecting to \(verification.name)…").font(.headline)
+            }
+            Button("Cancel", action: model.cancelPairing).buttonStyle(.bordered)
+                .padding(.top, 4)
+        }
+        .multilineTextAlignment(.center)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 16)
+    }
+
+    private var scanner: some View {
+        NavigationStack {
+            Scanner(found: { url in scanning = false; model.open(url) },
+                    failed: { scanning = false; scanFailed = true })
+                .ignoresSafeArea()
+                .overlay(alignment: .bottom) {
+                    Text("Point the camera at the pairing code shown in ClipBubble on your computer.")
+                        .font(.subheadline.weight(.medium)).multilineTextAlignment(.center)
+                        .padding(.horizontal, 18).padding(.vertical, 12)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+                        .padding(20)
+                }
+                .navigationTitle("Scan QR Code").navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { scanning = false } } }
+        }
+    }
+}
+
+/// For a computer the QR code can't reach (a server, another network), add this iPhone's SSH key.
 struct ManualLink: View {
     @EnvironmentObject var model: Model
     @State private var alias = ""
@@ -847,9 +1077,7 @@ struct ManualLink: View {
                         .onSubmit(add)
                     Button("Link", action: add).disabled(SSHTarget(trimmed) == nil)
                 }
-            } header: { Text("2. Enter its user and address") } footer: {
-                Text("Most people don't need this: Link iPhone… on the computer does both steps for you.")
-            }
+            } header: { Text("2. Enter its user and address") }
         }
         .navigationTitle("Link by hand")
         .navigationBarTitleDisplayMode(.inline)
@@ -894,7 +1122,7 @@ struct Scanner: UIViewControllerRepresentable {
 
         func dataScanner(_ s: DataScannerViewController, didAdd items: [RecognizedItem], allItems: [RecognizedItem]) {
             for case .barcode(let b) in items {
-                guard !done, let v = b.payloadStringValue, let url = URL(string: v), url.scheme == "clipbubble" else { continue }
+                guard !done, let v = b.payloadStringValue, let url = URL(string: v), Pairing.QRRoute(url) != nil else { continue }
                 done = true
                 found(url)
             }

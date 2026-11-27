@@ -2,7 +2,7 @@ import UIKit
 import UniformTypeIdentifiers
 
 /// What the shared sync engine needs from iOS. The app, the share extension and the keyboard all use one App Group,
-/// so they share the history, the linked computers and the SSH key.
+/// so they share the history, the linked computers and the device credentials.
 enum Platform {
     static let group = "group.studio.krnl.clipbubble"
     static let os = "ios"
@@ -37,23 +37,10 @@ enum Platform {
     }
 
     static func dial(_ alias: String, _ command: String, stderr: @escaping (Data) -> Void, exited: @escaping () -> Void) throws -> Tunnel {
-        try SSHTunnel(alias: alias, command: command, stderr: stderr, exited: exited)
-    }
-}
-
-/// What a link's state means on an iPhone, where there's no Terminal and linking again is the fix for most things.
-extension LinkState {
-    var phoneText: String {
-        switch self {
-        case .needsKeyAuth: return "Not allowed in. Link this iPhone again from the computer"
-        case .unknownHost, .hostKeyChanged: return "The computer's identity changed. Link it again to trust it"
-        case .unresolved: return "Can't find the computer. Is this iPhone on the same Wi-Fi?"
-        case .refused: return "The computer isn't accepting connections. Turn on Remote Login or SSH there"
-        case .notInstalled: return "ClipBubble isn't installed on the computer"
-        case .appNotRunning: return "Open ClipBubble on the computer"
-        case .versionMismatch(let h): return "Update ClipBubble on \(h.name) (it has \(h.version))"
-        default: return text
+        if DirectPeers.isDirect(alias) {
+            return try DirectTunnel.dial(alias, stderr: stderr, exited: exited)
         }
+        return try SSHTunnel(alias: alias, command: command, stderr: stderr, exited: exited)
     }
 }
 

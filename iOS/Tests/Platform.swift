@@ -2,6 +2,7 @@ import Foundation
 
 // Run the shared iOS code on the host with isolated storage and no external SSH dials.
 enum Platform {
+    static let group = "group.studio.krnl.clipbubble"
     static let os = "ios"
     static let defaults = UserDefaults(suiteName: "clipbubble.host-tests." + UUID().uuidString)!
     static let deviceName = "iOS Host Test"
@@ -15,8 +16,4 @@ enum Platform {
                      exited: @escaping () -> Void) throws -> Tunnel {
         throw POSIXError(.ECONNREFUSED)
     }
-}
-
-extension LinkState {
-    var phoneText: String { text }
 }

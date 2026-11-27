@@ -27,8 +27,44 @@ struct Wave3Tests {
             return
         }
         try transportTests()
+        try pairingTests()
         try await outboxTests()
         print("All Wave 3 Swift host tests passed")
+    }
+
+    private static func pairingTests() throws {
+        let id = UUID().uuidString.lowercased()
+        let fingerprint = String(repeating: "a", count: 64)
+        let code = String(repeating: "b", count: 32)
+        let direct = try requireURL("clipbubble://direct?v=2&id=\(id)&fp=\(fingerprint)&h=macbook.local&p=47822&c=\(code)&n=MacBook%20Pro&os=macos")
+        let legacy = try requireURL("clipbubble://pair?h=macbook.local&p=47823&c=123456")
+        let other = try requireURL("https://direct?h=macbook.local")
+        require(Pairing.QRRoute(direct) == .direct && Pairing.Link(direct) == nil, "Direct QR bypasses legacy pairing")
+        require(Pairing.QRRoute(legacy) == .ssh && Pairing.Link(legacy)?.hosts == ["macbook.local"], "legacy QR still parses")
+        require(Pairing.QRRoute(other) == nil, "non-ClipBubble URL cannot start pairing")
+
+        let peer = DirectPeer(id: id, name: "MacBook Pro", os: "macos", fingerprint: fingerprint,
+                              addresses: ["macbook.local"], port: 47822, lastSeen: 0)
+        DirectPeers.save(peer)
+        let alias = DirectPeers.alias(for: id)
+        let sshAlias = "you@macbook.local"
+        require(Pairing.displayName(for: alias) == peer.name, "offline Direct aliases show the saved name")
+        require(Pairing.displayName(for: alias, reportedName: "New name") == peer.name, "Direct names come from the saved peer")
+        require(Pairing.displayName(for: sshAlias) == "macbook.local", "SSH aliases retain their display fallback")
+        require(LinkState.refused.phoneText(for: alias).contains("ClipBubble is open"), "Direct refusal points to ClipBubble")
+        require(LinkState.refused.phoneText(for: sshAlias).contains("Remote Login or SSH"), "SSH refusal keeps SSH guidance")
+
+        Platform.defaults.set([alias, sshAlias], forKey: "sync.hosts")
+        Pairing.unlinkDirect(id: id)
+        require(DirectPeers.peer(id: id) == nil, "unlink removes the trusted Direct peer")
+        require(SyncEngine.enabledHosts == [sshAlias], "unlink disables the Direct host and preserves SSH hosts")
+        Platform.defaults.removeObject(forKey: "sync.hosts")
+        print("PASS Direct and SSH QR routing, link names, failure copy, and Direct unlink cleanup")
+    }
+
+    private static func requireURL(_ string: String) throws -> URL {
+        guard let url = URL(string: string) else { throw URLError(.badURL) }
+        return url
     }
 
     @MainActor

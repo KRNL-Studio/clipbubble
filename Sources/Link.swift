@@ -572,12 +572,23 @@ enum LinkState: Equatable {
     }
 }
 
-/// A relay running on a host over SSH: frames in on `input`, frames out on `output`.
+/// A relay running on a host over SSH.
 protocol Tunnel: AnyObject {
+    func makeSession(engine: SyncEngine) -> Session
+    func close()
+    #if !os(iOS)
     var input: FileHandle { get }
     var output: FileHandle { get }
-    func close()
+    #endif
 }
+
+#if !os(iOS)
+extension Tunnel {
+    func makeSession(engine: SyncEngine) -> Session {
+        Session(input: input, output: output, engine: engine)
+    }
+}
+#endif
 
 /// One host: runs `--peer` there over SSH, retries with backoff, and turns SSH's errors into a status.
 final class HostLink {
@@ -632,7 +643,7 @@ final class HostLink {
                 exited: { [weak self] in self?.engine.queue.async { self?.exited() } })
         } catch { set(.offline(Date().addingTimeInterval(backoff))); scheduleRetry(); return }
         tunnel = t
-        let s = Session(input: t.input, output: t.output, engine: engine)
+        let s = t.makeSession(engine: engine)
         s.link = self
         session = s
         engine.begin(s)
@@ -777,10 +788,18 @@ final class HostLink {
 
 // MARK: - Session
 
+/// Delivers bytes (nil at EOF) on the supplied queue and resumes reads once the receiver returns.
+/// A session writes one frame at a time, waiting for completion before reading the next file chunk.
+protocol SessionTransport: AnyObject {
+    func start(on queue: DispatchQueue, receive: @escaping (Data?) -> Void)
+    func write(_ bytes: Data, completion: @escaping (Bool) -> Void)
+    func close()
+}
+
 /// One peer: reads frames, and writes them with control frames always ahead of file chunks.
 final class Session {
-    private let input: FileHandle
-    private let output: FileHandle
+    private let handles: (input: FileHandle, output: FileHandle)?
+    private let transport: SessionTransport?
     private unowned let engine: SyncEngine
     weak var link: HostLink?
     var onClose: () -> Void = {}
@@ -806,24 +825,36 @@ final class Session {
     private let writeQueue = DispatchQueue(label: "clipbubble.sync.write", qos: .utility)
 
     init(input: FileHandle, output: FileHandle, engine: SyncEngine) {
-        self.input = input
-        self.output = output
+        handles = (input, output)
+        transport = nil
+        self.engine = engine
+    }
+
+    init(transport: SessionTransport, engine: SyncEngine) {
+        handles = nil
+        self.transport = transport
         self.engine = engine
     }
 
     func start(hello: Hello, summary: [Stamp]) {
-        input.readabilityHandler = { [weak self] h in
-            guard let self, let d = self.readReady(h) else { return }
-            self.engine.queue.async {
-                guard !self.closed else { return }
-                if d.isEmpty { self.close(); return }
-                self.heardAt = .now()
-                do { for f in try self.reader.feed(d) where !self.closed { self.engine.handle(f, from: self) } }
-                catch { SyncLog.write("dropped \(self.peer?.name ?? "peer"): malformed frame"); self.close() }
+        if let transport {
+            transport.start(on: engine.queue) { [weak self] in self?.receive($0) }
+        } else {
+            handles?.input.readabilityHandler = { [weak self] h in
+                guard let self, let d = self.readReady(h) else { return }
+                self.engine.queue.async { self.receive(d.isEmpty ? nil : d) }
             }
         }
         send(.hello(hello))
         send(.summary(summary))
+    }
+
+    private func receive(_ bytes: Data?) {
+        guard !closed else { return }
+        guard let bytes else { return close() }
+        heardAt = .now()
+        do { for f in try reader.feed(bytes) where !closed { engine.handle(f, from: self) } }
+        catch { SyncLog.write("dropped \(peer?.name ?? "peer"): malformed frame"); close() }
     }
 
     private func readReady(_ handle: FileHandle) -> Data? {
@@ -844,6 +875,7 @@ final class Session {
 
     func send(_ f: Frame) {
         lock.lock()
+        guard !closed else { lock.unlock(); return }
         control.append(f.encoded())
         lock.unlock()
         pump()
@@ -854,10 +886,26 @@ final class Session {
         guard !writing, !closed else { lock.unlock(); return }
         writing = true
         lock.unlock()
+        if let transport {
+            writeNext(to: transport)
+            return
+        }
+        guard let output = handles?.output else { return }
         writeQueue.async { [self] in
             while let data = next() {
                 do { try output.write(contentsOf: data) }
                 catch { engine.queue.async { self.close() }; break }
+            }
+        }
+    }
+
+    private func writeNext(to transport: SessionTransport) {
+        writeQueue.async { [self] in
+            guard let bytes = next() else { return }
+            transport.write(bytes) { [weak self] written in
+                guard let self else { return }
+                if written { self.writeNext(to: transport) }
+                else { self.engine.queue.async { self.close() } }
             }
         }
     }
@@ -968,11 +1016,13 @@ final class Session {
         let was = closed
         closed = true
         uploads.removeAll()
+        control.removeAll()
         lock.unlock()
         guard !was else { return }
-        input.readabilityHandler = nil
-        try? output.close()
-        try? input.close()
+        transport?.close()
+        handles?.input.readabilityHandler = nil
+        try? handles?.output.close()
+        try? handles?.input.close()
         // Partial files stay, so the next link resumes them from where this one stopped.
         downloads.values.forEach { $0.suspend() }
         downloads.removeAll()

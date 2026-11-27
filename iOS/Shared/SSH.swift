@@ -100,66 +100,77 @@ struct SSHTarget {
     }
 }
 
-/// Runs the remote relay over an in-process SSH connection, and joins its stdio to pipes the shared `Session` reads and writes.
-/// Failures are reported the way OpenSSH words them, so `HostLink` reads them like it does on the Mac.
+/// Runs the remote relay over an in-process SSH connection.
 final class SSHTunnel: Tunnel {
     private static let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 
-    let input: FileHandle
-    let output: FileHandle
-    private let toSession = Pipe()
-    private let fromSession = Pipe()
-    private var connection: Channel?
-    private let lock = NSLock()
-    private var ended = false
-    private var finished = false
+    private let loop: EventLoop
+    private let transport: SSHChannelTransport
     private let stderr: (Data) -> Void
     private let exited: () -> Void
     private let alias: String
     private let address: String
+
+    // Bootstrap attempts (including Happy Eyeballs candidates) and relay state all live on the same loop.
+    private var connecting: [ObjectIdentifier: Channel] = [:]
+    private var connection: Channel?
+    private var finished = false
     private var relayed = false
+    private var stderrRemaining = 8192
 
     init(alias: String, command: String, stderr: @escaping (Data) -> Void, exited: @escaping () -> Void) throws {
-        // The pipes below outlive a dropped link for a moment, and a write to a closed one would otherwise kill the process.
-        signal(SIGPIPE, SIG_IGN)
         guard let target = SSHTarget(alias) else { throw SSHTunnelError.badAlias }
-        input = toSession.fileHandleForReading
-        output = fromSession.fileHandleForWriting
+        let loop = Self.group.next()
+        self.loop = loop
+        transport = SSHChannelTransport(loop: loop)
         self.stderr = stderr
         self.exited = exited
+        self.alias = alias
+        let address = Addresses.next(for: alias, fallback: target.host)
+        self.address = address
+        transport.onClose = { [weak self] in self?.finish() }
+
         let say: (String) -> Void = { stderr(Data(($0 + "\n").utf8)) }
         let hostKeys = HostKeys(preference: target.hostKeyPreference, say: say)
         let auth = KeyAuth(user: target.user, say: say)
-        let address = Addresses.next(for: alias, fallback: target.host)
-        self.alias = alias
-        self.address = address
+        var configuration = SSHClientConfiguration(userAuthDelegate: auth, serverAuthDelegate: hostKeys)
+        configuration.maximumPacketSize = SSHChannelTransport.maximumPacketSize
+        let role = SSHConnectionRole.client(configuration)
 
-        ClientBootstrap(group: Self.group)
+        ClientBootstrap(group: loop)
             .connectTimeout(.seconds(8))
             .channelOption(ChannelOptions.socket(SocketOptionLevel(IPPROTO_TCP), TCP_NODELAY), value: 1)
-            // Notices a computer that went away (Wi-Fi change, sleep) within about 30 s, like ssh's ServerAliveInterval on the Mac.
+            // Notices a computer that went away (Wi-Fi change, sleep) within about 30 s.
             .channelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_KEEPALIVE), value: 1)
             .channelOption(ChannelOptions.socket(SocketOptionLevel(IPPROTO_TCP), TCP_KEEPALIVE), value: 15)
             .channelOption(ChannelOptions.socket(SocketOptionLevel(IPPROTO_TCP), TCP_KEEPINTVL), value: 5)
             .channelOption(ChannelOptions.socket(SocketOptionLevel(IPPROTO_TCP), TCP_KEEPCNT), value: 3)
-            .channelInitializer { channel in
+            .channelInitializer { [self] channel in
                 channel.eventLoop.makeCompletedFuture {
+                    guard !finished else { throw ChannelError.ioOnClosedChannel }
+                    let id = ObjectIdentifier(channel)
+                    connecting[id] = channel
+                    channel.closeFuture.whenComplete { [weak self] _ in self?.connecting[id] = nil }
                     try channel.pipeline.syncOperations.addHandlers(
-                        NIOSSHHandler(role: .client(.init(userAuthDelegate: auth, serverAuthDelegate: hostKeys)),
+                        NIOSSHHandler(role: role,
                                       allocator: channel.allocator, inboundChildChannelInitializer: nil),
                         CloseOnError())
                 }
             }
             .connect(host: address, port: target.port)
             .whenComplete { [self] result in
+                guard !finished else {
+                    if case .success(let channel) = result { channel.close(promise: nil) }
+                    return
+                }
                 switch result {
-                case .failure(let e):
-                    say("ssh: connect to host \(address) port \(target.port): \(e)")
+                case .failure(let error):
+                    say("ssh: connect to host \(address) port \(target.port): \(error)")
                     finish()
                 case .success(let channel):
-                    lock.lock(); connection = channel; let stop = ended; lock.unlock()
+                    connection = channel
+                    connecting[ObjectIdentifier(channel)] = nil
                     channel.closeFuture.whenComplete { [self] _ in finish() }
-                    if stop { channel.close(promise: nil); return }
                     open(command, on: channel)
                 }
             }
@@ -167,68 +178,63 @@ final class SSHTunnel: Tunnel {
 
     private func open(_ command: String, on channel: Channel) {
         guard let ssh = try? channel.pipeline.syncOperations.handler(type: NIOSSHHandler.self) else {
-            return channel.close(promise: nil)
+            return finish()
         }
         let opened = channel.eventLoop.makePromise(of: Channel.self)
-        opened.futureResult.whenFailure { _ in channel.close(promise: nil) }
+        opened.futureResult.whenFailure { [weak self] _ in self?.finish() }
         ssh.createChannel(opened, channelType: .session) { [self] child, _ in
-            child.eventLoop.makeCompletedFuture {
+            child.setOption(ChannelOptions.autoRead, value: false).flatMap {
+                child.setOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+            }.flatMapThrowing {
                 try child.pipeline.syncOperations.addHandler(RelayHandler(command: command, tunnel: self))
             }
         }
     }
 
-    /// Bytes from the host's stdout, for the session.
-    fileprivate func received(_ d: Data) {
-        do { try toSession.fileHandleForWriting.write(contentsOf: d) } catch { close() }
+    func makeSession(engine: SyncEngine) -> Session {
+        // The session closes on input EOF, after consuming the last stdout batch.
+        let session = Session(transport: transport, engine: engine)
+        ShareSync.observe(session, over: transport)
+        return session
     }
 
-    fileprivate func receivedError(_ d: Data) { stderr(d) }
-
-    /// Starts sending what the session writes, once the relay is running.
-    fileprivate func relayStarted(_ child: Channel) {
-        lock.lock()
-        guard !ended, !finished, !relayed else { lock.unlock(); return }
-        relayed = true
-        lock.unlock()
-        Addresses.worked(address, for: alias)
-        fromSession.fileHandleForReading.readabilityHandler = { h in
-            let d = h.availableData
-            guard !d.isEmpty else { h.readabilityHandler = nil; child.close(promise: nil); return }
-            // Waiting backs up into the pipe and then the session, which keeps a big upload out of memory and lets a ping overtake it.
-            do {
-                try child.writeAndFlush(SSHChannelData(type: .channel, data: .byteBuffer(ByteBuffer(bytes: d)))).wait()
-            } catch {
-                h.readabilityHandler = nil
-                child.close(promise: nil)
-            }
+    fileprivate func received(_ bytes: Data, stderr isError: Bool) {
+        if isError {
+            guard stderrRemaining > 0 else { return }
+            let limited = bytes.prefix(stderrRemaining)
+            stderrRemaining -= limited.count
+            stderr(limited)
+        } else {
+            transport.received(bytes)
         }
     }
 
-    fileprivate func relayEnded() {
-        lock.lock(); let c = connection; lock.unlock()
-        c?.close(promise: nil)
-        finish()
+    fileprivate func readComplete() { transport.readComplete() }
+    fileprivate func writabilityChanged() { transport.writabilityChanged() }
+    fileprivate func inputClosed() { transport.inputClosed() }
+
+    fileprivate func relayStarted(_ child: Channel) {
+        guard !finished, !relayed else { return }
+        relayed = true
+        Addresses.worked(address, for: alias)
+        transport.attach(child)
     }
 
-    func close() {
-        lock.lock(); ended = true; let c = connection; lock.unlock()
-        c?.close(promise: nil)
-    }
+    fileprivate func relayEnded() { close() }
 
-    /// Once: the session sees end of file, and the link hears it's over.
+    func close() { loop.execute { [self] in finish() } }
+
     private func finish() {
-        lock.lock()
-        let first = !finished
+        guard !finished else { return }
         finished = true
+        if !relayed { Addresses.failed(address, for: alias) }
+        transport.finish(afterEOF: exited)
+        let candidates = Array(connecting.values)
+        connecting.removeAll()
+        for candidate in candidates { candidate.close(promise: nil) }
+        let channel = connection
         connection = nil
-        let worked = relayed
-        lock.unlock()
-        guard first else { return }
-        if !worked { Addresses.failed(address, for: alias) }
-        fromSession.fileHandleForReading.readabilityHandler = nil
-        try? toSession.fileHandleForWriting.close()
-        exited()
+        channel?.close(promise: nil)
     }
 }
 
@@ -275,7 +281,6 @@ private final class RelayHandler: ChannelDuplexHandler {
     }
 
     func channelActive(context: ChannelHandlerContext) {
-        _ = context.channel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true)
         let channel = context.channel
         context.triggerUserOutboundEvent(SSHChannelRequestEvent.ExecRequest(command: command, wantReply: true))
             .whenFailure { _ in channel.close(promise: nil) }
@@ -285,7 +290,17 @@ private final class RelayHandler: ChannelDuplexHandler {
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let msg = unwrapInboundIn(data)
         guard case .byteBuffer(var buf) = msg.data, let bytes = buf.readData(length: buf.readableBytes) else { return }
-        if msg.type == .channel { tunnel.received(bytes) } else if msg.type == .stdErr { tunnel.receivedError(bytes) }
+        if msg.type == .channel || msg.type == .stdErr { tunnel.received(bytes, stderr: msg.type == .stdErr) }
+    }
+
+    func channelReadComplete(context: ChannelHandlerContext) {
+        tunnel.readComplete()
+        context.fireChannelReadComplete()
+    }
+
+    func channelWritabilityChanged(context: ChannelHandlerContext) {
+        tunnel.writabilityChanged()
+        context.fireChannelWritabilityChanged()
     }
 
     func channelInactive(context: ChannelHandlerContext) {
@@ -296,11 +311,12 @@ private final class RelayHandler: ChannelDuplexHandler {
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
         // The outbound write succeeding only means the request was sent. Wait for sshd to accept it.
         if event is ChannelSuccessEvent { tunnel.relayStarted(context.channel) }
-        if event is ChannelFailureEvent || (event as? ChannelEvent) == .inputClosed { context.close(promise: nil) }
+        if (event as? ChannelEvent) == .inputClosed { tunnel.inputClosed() }
+        if event is ChannelFailureEvent { tunnel.relayEnded() }
         context.fireUserInboundEventTriggered(event)
     }
 
-    func errorCaught(context: ChannelHandlerContext, error: Error) { context.close(promise: nil) }
+    func errorCaught(context: ChannelHandlerContext, error: Error) { tunnel.relayEnded() }
 }
 
 /// A failed handshake or refused login surfaces as an error; without this the connection would sit open forever.

@@ -24,17 +24,26 @@ final class ShareViewController: UIViewController {
             return []
         }
         delivery = Task { @MainActor [weak self, state] in
-            let message = await Courier.deliver(status: { [state] in state.text = $0 }) { [state] in
-                let hashes = await Inbox.add(providers, source: "Share", picturesAsFiles: true)
-                state.saved = !hashes.isEmpty
-                return hashes
-            }
+            let hashes = await Inbox.share(providers)
             guard !Task.isCancelled else { return }
-            state.text = message
+            state.saved = !hashes.isEmpty
+            let count = hashes.count < providers.count && !hashes.isEmpty ? " \(hashes.count) of \(providers.count) items saved." : ""
+            if state.saved, !SyncEngine.enabledHosts.isEmpty, !SyncEngine.paused {
+                state.text = "Saved in ClipBubble. Trying to sync…" + count
+            }
+            let message = await Courier.deliverSaved(hashes)
+            guard !Task.isCancelled else { return }
+            state.text = message + count
             state.done = true
+            guard hashes.count == providers.count, state.saved else { return }
             try? await Task.sleep(nanoseconds: 1_400_000_000)
             if !Task.isCancelled { self?.close() }
         }
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        delivery?.cancel()
     }
 
     override func viewIsAppearing(_ animated: Bool) {
@@ -50,14 +59,18 @@ final class ShareViewController: UIViewController {
     private func close() {
         guard !state.closed else { return }
         state.closed = true
-        delivery?.cancel()
+        let task = delivery
+        task?.cancel()
         delivery = nil
-        extensionContext?.completeRequest(returningItems: nil)
+        Task { [extensionContext] in
+            await task?.value
+            extensionContext?.completeRequest(returningItems: nil)
+        }
     }
 }
 
 final class ShareState: ObservableObject {
-    @Published var text = "Connecting…"
+    @Published var text = "Saving to ClipBubble…"
     @Published var done = false
     /// Hiding before this would close the share sheet with nothing saved.
     @Published var saved = false

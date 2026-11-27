@@ -8,8 +8,7 @@ enum Inbox {
         guard t.utf8.count <= Sync.maxText, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         let hash = "t:" + sha(t)
         let db = DB()
-        db.upsert(kind: "text", text: t, file: nil, source: source, hash: hash)
-        return db.exists(hash: hash) ? hash : nil
+        return db.upsert(kind: "text", text: t, file: nil, source: source, hash: hash) ? hash : nil
     }
 
     /// Stored as PNG, which computers check against the hash and paste as a picture.
@@ -88,15 +87,15 @@ enum Inbox {
     }
 
     /// A copy in ClipBubble's own folder, since what the share sheet hands over is gone once it closes.
-    static func file(_ src: URL, source: String) -> String? {
+    static func file(_ src: URL, named name: String? = nil, source: String) -> String? {
         let scoped = src.startAccessingSecurityScopedResource()
         defer { if scoped { src.stopAccessingSecurityScopedResource() } }
-        if src.pathExtension.lowercased() == "png",
+        if ((name ?? src.lastPathComponent) as NSString).pathExtension.lowercased() == "png",
            let size = try? src.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= Sync.autoFetchLimit {
             return image(src, source: source)
         }
         let dir = Paths.dir.appendingPathComponent("sent").appendingPathComponent(UUID().uuidString)
-        let dest = dir.appendingPathComponent(safeFileName(src.lastPathComponent))
+        let dest = dir.appendingPathComponent(safeFileName(name ?? src.lastPathComponent))
         let fm = FileManager.default
         var keepFile = false
         defer { if !keepFile { try? fm.removeItem(at: dir) } }
@@ -119,28 +118,58 @@ enum Inbox {
         return file(temp, source: source)
     }
 
-    /// Text, a link, a picture or a file from anything that hands over item providers: Paste and the share sheet.
-    /// Pasted pictures become images, so they paste as pictures on the computer; shared ones keep their file.
-    static func add(_ providers: [NSItemProvider], source: String, picturesAsFiles: Bool = false) async -> [String] {
+    /// Pasted pictures become images, so they paste as pictures on the computer.
+    static func add(_ providers: [NSItemProvider], source: String) async -> [String] {
         var hashes: [String] = []
         for p in providers {
             guard !Task.isCancelled else { break }
-            if let h = await add(p, source: source, picturesAsFiles: picturesAsFiles) { hashes.append(h) }
+            if let h = await add(p, source: source) { hashes.append(h) }
         }
         return hashes
     }
 
-    private static func add(_ p: NSItemProvider, source: String, picturesAsFiles: Bool) async -> String? {
+    /// Share keeps original file bytes and commits each item while its provider's URL is valid.
+    static func share(_ providers: [NSItemProvider]) async -> [String] {
+        ShareOutbox.recover()
+        var hashes: [String] = []
+        for p in providers {
+            guard !Task.isCancelled else { break }
+            if p.canLoadObject(ofClass: URL.self), let url = await object(p, URL.self),
+               let hash = url.isFileURL ? ShareOutbox.saveFile(url, name: url.lastPathComponent)
+                   : ShareOutbox.saveText(url.absoluteString) {
+                hashes.append(hash)
+                continue
+            }
+            let types = p.registeredTypeIdentifiers.compactMap(UTType.init)
+            if let type = types.first(where: { $0.conforms(to: .data) && !$0.conforms(to: .text) && !$0.conforms(to: .url) }),
+               let hash = await providedFile(p, type, save: ShareOutbox.saveFile) {
+                hashes.append(hash)
+            } else if p.canLoadObject(ofClass: String.self), let text = await object(p, String.self),
+                      let hash = ShareOutbox.saveText(text) {
+                hashes.append(hash)
+            } else if let type = types.first(where: { $0.conforms(to: .text) }),
+                      let hash = await providedFile(p, type, save: ShareOutbox.saveFile) {
+                hashes.append(hash)
+            }
+        }
+        return hashes
+    }
+
+    private static func add(_ p: NSItemProvider, source: String) async -> String? {
         let types = p.registeredTypeIdentifiers.compactMap(UTType.init)
         if p.canLoadObject(ofClass: URL.self), let url = await object(p, URL.self) {
             return url.isFileURL ? file(url, source: source) : text(url.absoluteString, source: source)
         }
-        if let t = types.first(where: { $0.conforms(to: .image) }) {
-            if picturesAsFiles, let url = await fileCopy(p, t) { return moved(url, source: source) }
-            if let d = await data(p, t) { return image(d, source: source) }
+        if let t = types.first(where: { $0.conforms(to: .image) }), let d = await data(p, t) {
+            return image(d, source: source)
         }
         if p.canLoadObject(ofClass: String.self), let s = await object(p, String.self) { return text(s, source: source) }
-        if let t = types.first(where: { $0.conforms(to: .data) }), let url = await fileCopy(p, t) { return moved(url, source: source) }
+        if let t = types.first(where: { $0.conforms(to: .data) }) {
+            return await providedFile(p, t) { url, name in
+                // Retain the provider's suggested filename for sync and paste.
+                file(url, named: name, source: source)
+            }
+        }
         return nil
     }
 
@@ -152,13 +181,13 @@ enum Inbox {
         await withCheckedContinuation { c in _ = p.loadDataRepresentation(for: t) { d, _ in c.resume(returning: d) } }
     }
 
-    /// The provider's file, moved somewhere that outlives its callback.
-    private static func fileCopy(_ p: NSItemProvider, _ t: UTType) async -> URL? {
+    /// The file URL is valid only during this callback. Keep the provider's suggested name and actual type.
+    private static func providedFile(_ p: NSItemProvider, _ t: UTType,
+                                     save: @escaping (URL, String) -> String?) async -> String? {
         let suggested = p.suggestedName
         return await withCheckedContinuation { c in
             _ = p.loadFileRepresentation(for: t, openInPlace: false) { url, _, _ in
                 guard let url else { return c.resume(returning: nil) }
-                let keep = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
                 var name = safeFileName(suggested ?? url.lastPathComponent)
                 let ext = url.pathExtension.lowercased()
                 let nameExt = (name as NSString).pathExtension.lowercased()
@@ -168,94 +197,8 @@ enum Inbox {
                         name = safeFileName(name + "." + url.pathExtension)
                     }
                 }
-                let dest = keep.appendingPathComponent(name)
-                do {
-                    try FileManager.default.createDirectory(at: keep, withIntermediateDirectories: true)
-                    try FileManager.default.copyItem(at: url, to: dest)
-                    c.resume(returning: dest)
-                } catch {
-                    try? FileManager.default.removeItem(at: keep)
-                    c.resume(returning: nil)
-                }
+                c.resume(returning: save(url, name))
             }
         }
-    }
-}
-
-/// Links to the computers just long enough to hand something over, for the share sheet and Shortcuts, when
-/// ClipBubble itself isn't open. Runs on the main thread.
-@MainActor
-enum Courier {
-    /// Adds the items, waits for a link, and returns once a computer has them on its clipboard or `timeout` passes.
-    /// Whatever didn't make it still syncs the next time ClipBubble opens.
-    static func deliver(timeout: Double = 25, status: @escaping (String) -> Void = { _ in },
-                        add: @escaping () async -> [String]) async -> String {
-        guard !Task.isCancelled else { return "Delivery stopped." }
-        let engine = SyncEngine.shared
-        guard !SyncEngine.enabledHosts.isEmpty else {
-            let hashes = await add()
-            guard !Task.isCancelled else { return "Delivery stopped." }
-            return hashes.isEmpty ? "Couldn't save that." : "Saved. Link a computer in ClipBubble to send it there."
-        }
-        engine.hold(true)
-        defer { engine.hold(false) }
-        engine.start()
-        status("Connecting…")
-        // Saved before the wait, so you can walk away from the share sheet with nothing lost.
-        let hashes = await add()
-        guard !Task.isCancelled else { return "Delivery stopped." }
-        guard !hashes.isEmpty else { return "Couldn't save that." }
-        let wasLinked = engine.statuses.values.contains { $0.ok }
-        let linked = await until(seconds: 10) { engine.statuses.values.contains { $0.ok } }
-        guard !Task.isCancelled else { return "Delivery stopped." }
-        // A computer only takes what's just been copied onto its clipboard, so the wait mustn't count against it.
-        if linked, !wasLinked {
-            let now = Date().timeIntervalSince1970
-            hashes.forEach { DB().bump(hash: $0, to: now) }
-        }
-        guard linked else {
-            // Connecting or offline needs nothing from you; anything else (an untrusted host, a missing key) does.
-            switch engine.statuses.values.first(where: { !$0.ok }) {
-            case nil, .connecting?, .offline?: return "Saved. It goes to your computer next time ClipBubble connects."
-            case let s?: return "Saved. \(s.phoneText). It goes over once that's fixed."
-            }
-        }
-        let names = Array(Set(engine.statuses.values.compactMap { s -> String? in if case .live(let h) = s { return h.name }; return nil }))
-        status("Sending to \(names.joined(separator: ", "))…")
-        // Each item and computer that confirmed it, so two of three photos arriving isn't reported as all of them.
-        var got: Set<String> = []
-        let (wasApplied, wasTransfers) = (engine.onApplied, engine.onTransfers)
-        engine.onApplied = { hash, peer in wasApplied(hash, peer); if hashes.contains(hash) { got.insert(hash + "\n" + peer) } }
-        engine.onTransfers = { t in
-            wasTransfers(t)
-            let sending = t.values.filter(\.sending)
-            if !sending.isEmpty {
-                let done = sending.map(\.done).reduce(0, +), total = max(1, sending.map(\.total).reduce(0, +))
-                status("Sending… \(Int(Double(done) / Double(total) * 100))%")
-            }
-        }
-        defer {
-            engine.onApplied = wasApplied
-            engine.onTransfers = wasTransfers
-        }
-        // Big files wait for Get on the computer; sending them from here means you want them there now.
-        for h in hashes where h.hasPrefix("f:") { engine.linked.forEach { engine.send(h, toDevice: $0.device) } }
-        _ = await until(seconds: timeout) { got.count >= names.count * hashes.count }
-        guard !Task.isCancelled else { return "Delivery stopped." }
-        // No answer yet doesn't mean it arrived: it's saved here and syncs again next time.
-        if got.isEmpty { return "Saved. Still waiting for \(names.joined(separator: ", ")) to confirm." }
-        let complete = names.filter { n in hashes.allSatisfy { got.contains($0 + "\n" + n) } }
-        if complete.count == names.count { return "On the clipboard of \(complete.sorted().joined(separator: ", "))." }
-        return "Saved. Some items are still on their way to \(names.joined(separator: ", "))."
-    }
-
-    private static func until(seconds: Double, _ cond: () -> Bool) async -> Bool {
-        let clock = ContinuousClock()
-        let end = clock.now + .seconds(seconds)
-        while !Task.isCancelled, clock.now < end {
-            if cond() { return true }
-            try? await Task.sleep(nanoseconds: 100_000_000)
-        }
-        return !Task.isCancelled && cond()
     }
 }

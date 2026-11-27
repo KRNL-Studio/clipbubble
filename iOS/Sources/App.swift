@@ -25,6 +25,7 @@ struct ClipBubbleApp: App {
                     guard phase != .inactive else { return }
                     model.heartbeat(phase == .active)
                     SyncEngine.shared.suspend(phase == .background)
+                    if phase == .active { model.refreshSharedHistory() }
                 }
         }
     }
@@ -103,6 +104,7 @@ final class Model: ObservableObject {
     private var confirmingLink = false
     private let db = DB()
     private var toastTask: Task<Void, Never>?
+    private var shareObserver: NSObjectProtocol?
 
     init() {
         #if DEBUG
@@ -123,10 +125,28 @@ final class Model: ObservableObject {
         engine.start()
         DB().prune()
         reload()
+        shareObserver = NotificationCenter.default.addObserver(forName: ShareOutbox.saved, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.refreshSharedHistory() }
+        }
+        ShareOutbox.forwardWakeups()
         // The share sheet and the keyboard write to the same history while the app is away.
         NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in DB().prune(); self?.hosts = SyncEngine.enabledHosts; self?.reload() }
+            Task { @MainActor in
+                DB().prune()
+                self?.hosts = SyncEngine.enabledHosts
+                self?.refreshSharedHistory()
+            }
         }
+    }
+
+    deinit {
+        if let shareObserver { NotificationCenter.default.removeObserver(shareObserver) }
+    }
+
+    func refreshSharedHistory() {
+        reload()
+        ShareSync.refresh()
+        DispatchQueue.global(qos: .utility).async { ShareOutbox.recover() }
     }
 
     /// While the app is open it stamps the time every few seconds. The keyboard trusts a recent stamp, so an app that

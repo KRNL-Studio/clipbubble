@@ -8,7 +8,7 @@ packages:
     from: 2.81.0
   swift-nio-ssh:
     url: https://github.com/apple/swift-nio-ssh
-    from: 0.14.1
+    from: 0.15.0
 settings:
   base:
     SWIFT_VERSION: "5.0"

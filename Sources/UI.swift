@@ -18,6 +18,7 @@ final class Model: ObservableObject {
     @Published var selection: Int64?
     @Published var previewing = false
     @Published var prefsTick = 0
+    @Published var folderAccess: [OnboardingFolder: Bool] = [:]
     @Published var showsScreenshotThumbnail = true
     @Published var shown = 0          // bumps on every open: refocuses search and refreshes relative times
     @Published var pulse = false
@@ -46,7 +47,7 @@ final class Model: ObservableObject {
     let db = DB()
     var pickClip: (Clip, _ paste: Bool) -> Bool = { _, _ in false }
     var hoverChanged: () -> Void = {}
-    var prefsChanged: () -> Void = {}
+    var prefsChanged: (String) -> Void = { _ in }
     var screenshotThumbnailChanged: (_ applyRequested: Bool) -> Void = { _ in }
     var bubbleModeChanged: () -> Void = {}
     var openApp: (AppPage) -> Void = { _ in }
@@ -86,7 +87,7 @@ final class Model: ObservableObject {
         prefsTick += 1
         reload()
         reloadRecent()
-        prefsChanged()
+        prefsChanged(key)
     }
 
     func loadMascots() {
@@ -874,6 +875,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidBecomeActive(_ n: Notification) {
         syncScreenshotThumbnail()
+        guard let window = appWindow?.window, window.isVisible, !window.isMiniaturized else { return }
+        screenshots?.retryIfPaused()
+        downloads?.retryIfPaused()
+        backfillWatchedFolders()
     }
 
     /// The bubble, panel and peek. Tests stop here, so they start no capture, sync or global shortcuts, and pass
@@ -980,10 +985,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Updater.shared.start()
         screencapture = .system()
         model.screenshotThumbnailChanged = { [weak self] in self?.syncScreenshotThumbnail(applyRequested: $0) }
-        model.prefsChanged = { [weak self] in self?.refreshFolderServices() }
+        model.prefsChanged = { [weak self] key in
+            self?.refreshFolderServices(retrying: OnboardingFolder(rawValue: key))
+        }
         refreshFolderServices()
         // Notice thumbnail and location changes in ⌘⇧5 → Options.
-        Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+        let refreshScreenshots: @MainActor @Sendable () -> Void = { [weak self] in
             guard let self else { return }
             self.syncScreenshotThumbnail()
             guard self.screenshots?.folder != FolderWatcher.screenshotFolder,
@@ -991,17 +998,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             else { return }
             self.refreshFolderServices()
         }
+        Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { _ in
+            MainActor.assumeIsolated(refreshScreenshots)
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.backfillWatchedFolders() }
-        Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
+        let maintainHistory: @MainActor @Sendable () -> Void = { [weak self] in
             self?.model.db.prune()
             self?.backfillWatchedFolders()
         }
+        Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { _ in
+            MainActor.assumeIsolated(maintainHistory)
+        }
+        let snapToDisplay: @MainActor @Sendable () -> Void = { [weak self] in self?.snap(animated: false) }
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
-                                               object: nil, queue: .main) { [weak self] _ in self?.snap(animated: false) }
+                                               object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated(snapToDisplay)
+        }
         // Mascot changes from the MCP server (another process) land here.
-        DistributedNotificationCenter.default().addObserver(forName: Mascots.changed, object: nil, queue: .main) { [weak self] _ in
+        let reloadMascots: @MainActor @Sendable () -> Void = { [weak self] in
             self?.model.loadMascots()
             self?.model.pulseTicks += 1
+        }
+        DistributedNotificationCenter.default().addObserver(forName: Mascots.changed, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated(reloadMascots)
         }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard let self else { return e }
@@ -1031,15 +1050,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         reveal()
     }
 
-    private func refreshFolderServices() {
+    private func refreshFolderServices(retrying folder: OnboardingFolder? = nil) {
         syncScreenshotThumbnail()
         if appWindow.onboarding.canWatch(.screenshots) {
             syncScreenshots()
         } else {
             screenshots?.stop()
             screenshots = nil
+            model.folderAccess[.screenshots] = nil
         }
-        if appWindow.onboarding.canWatch(.downloads) { syncDownloads() }
+        syncDownloads()
+        if folder == .screenshots { screenshots?.retryIfPaused() }
+        if folder == .downloads { downloads?.retryIfPaused() }
         backfillWatchedFolders()
     }
 
@@ -1059,13 +1081,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Every screenshot lands in history; copying it to the clipboard as well is optional.
     func syncScreenshots() {
         let folder = FolderWatcher.screenshotFolder
-        guard Prefs.on("screenshots") else { screenshots?.stop(); screenshots = nil; return }
-        guard screenshots?.folder != folder else { return }
+        let enabled = Prefs.on("screenshots")
+        if enabled, screenshots?.folder == folder { return }
         screenshots?.stop()
+        model.folderAccess[.screenshots] = nil
+        guard enabled else { screenshots = nil; return }
         // A picture that lands on the Desktop isn't a screenshot. Only macOS marks its own, so a folder picked in Settings isn't held to that.
         let markedOnly = folder == FolderWatcher.macOSScreenshotFolder
         screenshots = FolderWatcher(folder: folder, maxAge: 120, include: {
             isImagePath($0.path) ? !markedOnly || FolderWatcher.isScreenCapture($0) : ["mov", "mp4"].contains($0.pathExtension.lowercased())
+        }, onAccessChanged: { [weak model] allowed in
+            model?.folderAccess[.screenshots] = allowed
         }) { [weak self] url, date in
             self?.screenshotAdded(url, at: date)
         }
@@ -1122,16 +1148,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Watches ~/Downloads only while that's switched on (so the privacy prompt only shows up if you want it).
     private func syncDownloads() {
-        if Prefs.on("downloads") {
+        if Prefs.on("downloads"), appWindow.onboarding.canWatch(.downloads) {
             guard downloads == nil, let dir = FolderWatcher.downloadsFolder else { return }
             downloads = FolderWatcher(folder: dir, maxAge: nil,
-                                      include: { !FolderWatcher.tempExts.contains($0.pathExtension.lowercased()) && $0.lastPathComponent != "ClipBubble" }) { [weak self] url, date in
+                                      include: { !FolderWatcher.tempExts.contains($0.pathExtension.lowercased()) && $0.lastPathComponent != "ClipBubble" },
+                                      onAccessChanged: { [weak model] allowed in model?.folderAccess[.downloads] = allowed }) { [weak self] url, date in
                 self?.model.db.insertIfMissing(kind: "file", text: url.path, source: "Downloads", hash: "f:" + sha(url.path), created: date)
                 self?.captured()
             }
         } else {
             downloads?.stop()
             downloads = nil
+            model.folderAccess[.downloads] = nil
         }
     }
 

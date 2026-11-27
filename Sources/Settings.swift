@@ -483,7 +483,9 @@ struct PermissionRow<Extra: View>: View {
                     case .some(false):
                         Label("No access", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
                         Button("Fix", action: fix).buttonStyle(.link)
-                    case .none: Label("Off", systemImage: "minus.circle").foregroundStyle(.tertiary)
+                    case .none:
+                        if isOn { Text("Checking…").foregroundStyle(.secondary) }
+                        else { Label("Off", systemImage: "minus.circle").foregroundStyle(.tertiary) }
                     }
                 }
                 .font(.system(size: 11, weight: .medium)).labelStyle(.titleAndIcon)
@@ -529,37 +531,25 @@ enum Dialogs {
     }
 }
 
-/// What macOS lets ClipBubble read, checked every couple of seconds so a change in System Settings shows up.
+/// Refreshes Accessibility status while Capture settings are visible. Folder status comes from the watchers.
 final class Access: ObservableObject {
-    @Published var screenshots: Bool?
-    @Published var downloads: Bool?
     @Published var accessibility = AXIsProcessTrusted()
     private var timer: Timer?
-    private var checkingFolders = false
 
     func start() {
-        refresh()
         guard timer == nil else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
+        refresh()
     }
 
     func stop() { timer?.invalidate(); timer = nil }
 
+    deinit { timer?.invalidate() }
+
     func refresh() {
+        guard timer != nil, NSApp.isActive else { return }
         let ax = AXIsProcessTrusted()
         if ax != accessibility { accessibility = ax }
-        guard !checkingFolders else { return }
-        checkingFolders = true
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let shots = Prefs.on("screenshots") ? FolderWatcher.canRead(FolderWatcher.screenshotFolder) : nil
-            let dls = Prefs.on("downloads") ? FolderWatcher.canRead(FolderWatcher.downloadsFolder) : nil
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.checkingFolders = false
-                if shots != self.screenshots { self.screenshots = shots }
-                if dls != self.downloads { self.downloads = dls }
-            }
-        }
     }
 
     static func openFilesSettings() {
@@ -640,7 +630,7 @@ struct CapturePage: View {
             SettingsCard(title: "Permissions",
                          footer: "macOS doesn't let apps change these themselves. Switching one on asks for access; if it was blocked, Fix opens the right page in System Settings.") {
                 PermissionRow(icon: "arrow.down.circle", tint: .teal, title: "Recent downloads", folder: FolderWatcher.downloadsFolder,
-                              note: "New files in your Downloads folder", ok: access.downloads, isOn: pref("downloads"),
+                              note: "New files in your Downloads folder", ok: model.folderAccess[.downloads], isOn: pref("downloads"),
                               fix: Access.openFilesSettings) { EmptyView() }
                 RowDivider()
                 PermissionRow(icon: "return", tint: .orange, title: "Auto-paste", folder: nil, note: autoPasteNote,
@@ -649,7 +639,6 @@ struct CapturePage: View {
         }
         .onReceive(nav.windowVisibility) { $0 ? access.start() : access.stop() }
         .onDisappear { access.stop() }
-        .onChange(of: model.prefsTick) { access.refresh() }
         .onChange(of: autoPaste) { _, on in
             UserDefaults.standard.set(on, forKey: "autoPaste")
             if on && !AXIsProcessTrusted() {
@@ -674,7 +663,6 @@ struct CapturePage: View {
 struct ScreenshotsPage: View {
     @ObservedObject var model: Model
     @EnvironmentObject private var nav: AppNav
-    @StateObject private var access = Access()
     @State private var copyShots = UserDefaults.standard.bool(forKey: "copyScreenshots")
     @State private var polishCard = UserDefaults.standard.bool(forKey: "polishCard")
     @AppStorage(Screencapture.replacementKey) private var replaceThumbnail = true
@@ -688,7 +676,7 @@ struct ScreenshotsPage: View {
             SettingsCard(title: "Screenshots") {
                 PermissionRow(icon: "camera.viewfinder", tint: .pink, title: "Save every screenshot", folder: FolderWatcher.screenshotFolder,
                               note: customFolder ? "Folder you picked" : "From your macOS screenshot setting",
-                              ok: access.screenshots, isOn: pref("screenshots"), fix: Access.openFilesSettings) {
+                              ok: model.folderAccess[.screenshots], isOn: pref("screenshots"), fix: Access.openFilesSettings) {
                     HStack(spacing: 12) {
                         Button("Change folder…", action: pickFolder)
                         if customFolder {
@@ -748,11 +736,8 @@ struct ScreenshotsPage: View {
             }
         }
         .onReceive(nav.windowVisibility) { visible in
-            if visible { access.start(); model.screenshotThumbnailChanged(false) }
-            else { access.stop() }
+            if visible { model.screenshotThumbnailChanged(false) }
         }
-        .onDisappear { access.stop() }
-        .onChange(of: model.prefsTick) { access.refresh() }
         .onChange(of: copyShots) { _, on in UserDefaults.standard.set(on, forKey: "copyScreenshots") }
         .onChange(of: polishCard) { _, on in
             UserDefaults.standard.set(on, forKey: "polishCard")

@@ -154,7 +154,10 @@ final class FolderWatcher {
     private let include: (URL) -> Bool
     private let maxAge: TimeInterval?
     private let onNew: (URL, Date) -> Void
-    private let list: (URL) -> [URL]?
+    private let openFolder: (URL) throws -> Int32
+    private let list: (URL) throws -> [URL]
+    private let onAccessChanged: (Bool) -> Void
+    private let retryDelay: TimeInterval
     private let queue = DispatchQueue(label: "clipbubble.folder", qos: .utility)
     private let lifecycle = NSLock()
     private var cancelled = false
@@ -162,17 +165,26 @@ final class FolderWatcher {
     private var known: Set<URL> = []
     private var source: DispatchSourceFileSystemObject?
     private var pending: DispatchWorkItem?
+    private var since: Date? = Date()
+    private var paused = false
+    private var canAccess: Bool?
+    private var nextRetryDelay: TimeInterval
 
     /// `maxAge` ignores files older than that (so moving old screenshots in doesn't count); nil takes everything new.
     init(folder: URL, maxAge: TimeInterval?, include: @escaping (URL) -> Bool,
-         list: @escaping (URL) -> [URL]? = FolderWatcher.listFiles, onNew: @escaping (URL, Date) -> Void) {
+         retryDelay: TimeInterval = 5, openFolder: @escaping (URL) throws -> Int32 = FolderWatcher.openFolder,
+         list: @escaping (URL) throws -> [URL] = FolderWatcher.listFiles,
+         onAccessChanged: @escaping (Bool) -> Void = { _ in }, onNew: @escaping (URL, Date) -> Void) {
         self.folder = folder
         self.maxAge = maxAge
         self.include = include
+        self.retryDelay = retryDelay
+        self.nextRetryDelay = retryDelay
+        self.openFolder = openFolder
         self.list = list
+        self.onAccessChanged = onAccessChanged
         self.onNew = onNew
-        let since = Date()
-        queue.async { [weak self] in self?.start(since: since) }
+        queue.async { [weak self] in self?.start() }
     }
 
     deinit { source?.cancel() }
@@ -182,6 +194,14 @@ final class FolderWatcher {
         queue.async { self.stopWatching() }
     }
 
+    func retryIfPaused() {
+        queue.async { [weak self] in
+            guard let self, !self.stopped, self.paused else { return }
+            self.paused = false
+            self.start()
+        }
+    }
+
     private func stopWatching() {
         pending?.cancel()
         pending = nil
@@ -189,12 +209,11 @@ final class FolderWatcher {
         source = nil
     }
 
-    /// Retries until macOS grants access to the folder (the privacy prompt may still be open).
-    private func start(since: Date) {
+    private func start() {
         guard !stopped else { return }
-        let fd = open(folder.path, O_EVTONLY)
-        guard fd >= 0 else {
-            retry(since: since, after: 5)
+        let fd: Int32
+        do { fd = try openFolder(folder) } catch {
+            handleFailure(error)
             return
         }
         let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename, .delete], queue: queue)
@@ -203,7 +222,8 @@ final class FolderWatcher {
             // The folder itself moved or vanished: the old handle is dead, so watch the path afresh.
             if !src.data.isDisjoint(with: [.rename, .delete]) {
                 self.stopWatching()
-                self.retry(since: Date(), after: 1)
+                self.since = Date()
+                self.schedule(after: 1) { $0.start() }
                 return
             }
             self.scheduleScan()
@@ -212,29 +232,51 @@ final class FolderWatcher {
         source = src
         // Arm the watch before taking the first snapshot so writes during that read still trigger a scan.
         src.activate()
-        if scan(since: since) {
+        do {
+            try scan()
             scheduleScan()
-        } else {
-            stopWatching()
-            retry(since: since, after: 5)
+        } catch {
+            handleFailure(error)
         }
     }
 
-    private func scheduleScan(after delay: TimeInterval = 0.4) {
+    private func scheduleScan() {
+        schedule(after: 0.4) { watcher in
+            do { try watcher.scan() } catch { watcher.handleFailure(error) }
+        }
+    }
+
+    private func schedule(after delay: TimeInterval, _ action: @escaping (FolderWatcher) -> Void) {
         guard !stopped else { return }
         pending?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self, !self.stopped else { return }
             self.pending = nil
-            // A transient read error may be the last event we see for this write.
-            if !self.scan() { self.scheduleScan(after: min(delay * 2, 5)) }
+            action(self)
         }
         pending = work
         queue.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    private func retry(since: Date, after seconds: TimeInterval) {
-        queue.asyncAfter(deadline: .now() + seconds) { [weak self] in self?.start(since: since) }
+    private func handleFailure(_ error: Error) {
+        stopWatching()
+        reportAccess(false)
+        let error = error as NSError
+        if (error.domain == NSPOSIXErrorDomain && (error.code == Int(EPERM) || error.code == Int(EACCES)))
+            || (error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoPermissionError) {
+            paused = true
+            nextRetryDelay = retryDelay
+            return
+        }
+        let delay = nextRetryDelay
+        nextRetryDelay = min(delay * 2, 60)
+        schedule(after: delay) { $0.start() }
+    }
+
+    private func reportAccess(_ allowed: Bool) {
+        guard canAccess != allowed else { return }
+        canAccess = allowed
+        deliver { $0.onAccessChanged(allowed) }
     }
 
     static func added(_ u: URL) -> Date {
@@ -245,24 +287,38 @@ final class FolderWatcher {
     /// Everything already in the folder from the last `days` days, for backfilling history.
     func existing(days: Double, done: @escaping ([(URL, Date)]) -> Void) {
         queue.async { [weak self] in
-            guard let self, !self.stopped else { return }
+            guard let self, !self.stopped, self.source != nil else { return }
             let cutoff = Date().addingTimeInterval(-days * 86400)
-            let found = (self.list(self.folder) ?? []).filter(self.include).map { ($0, Self.added($0)) }.filter { $0.1 > cutoff }
-            self.deliver { _ in done(found) }
+            do {
+                let found = try self.list(self.folder).filter(self.include).map { ($0, Self.added($0)) }.filter { $0.1 > cutoff }
+                self.deliver { _ in done(found) }
+            } catch {
+                self.handleFailure(error)
+            }
         }
     }
 
-    static func listFiles(_ folder: URL) -> [URL]? {
-        try? FileManager.default.contentsOfDirectory(
+    static func openFolder(_ folder: URL) throws -> Int32 {
+        let fd = open(folder.path, O_EVTONLY | O_CLOEXEC)
+        guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        return fd
+    }
+
+    static func listFiles(_ folder: URL) throws -> [URL] {
+        try FileManager.default.contentsOfDirectory(
             at: folder, includingPropertiesForKeys: [.creationDateKey, .addedToDirectoryDateKey], options: [.skipsHiddenFiles])
     }
 
-    private func scan(since: Date? = nil) -> Bool {
-        guard !stopped, let urls = list(folder) else { return false }
+    private func scan() throws {
+        let urls = try list(folder)
+        guard !stopped else { return }
         let now = urls.filter(include)
         let fresh = since == nil ? now.filter { !known.contains($0) } : now
         known = Set(now)
         let cutoff = max(since ?? .distantPast, maxAge.map { Date().addingTimeInterval(-$0) } ?? .distantPast)
+        since = nil
+        nextRetryDelay = retryDelay
+        reportAccess(true)
         let added = fresh.map { ($0, Self.added($0)) }.filter { $0.1 >= cutoff }.sorted { $0.1 < $1.1 }
         if !added.isEmpty {
             deliver { watcher in
@@ -271,7 +327,6 @@ final class FolderWatcher {
                 }
             }
         }
-        return true
     }
 
     private func deliver(_ action: @escaping (FolderWatcher) -> Void) {

@@ -16,14 +16,19 @@ enum Platform {
         DispatchQueue.main.async { if Board.write(c) { Capture.ignoreChange(NSPasteboard.general.changeCount, hash: c.hash) } }
     }
 
-    static func listen(_ engine: SyncEngine) -> AnyObject? { PeerServer(engine: engine) }
+    static func listen(_ engine: SyncEngine) -> AnyObject? {
+        let listeners = MacSyncListeners(engine: engine)
+        DispatchQueue.main.async { [weak direct = listeners.direct] in DirectRuntime.shared.server = direct }
+        return listeners
+    }
 
     static func onWake(_ f: @escaping () -> Void) {
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: nil) { _ in f() }
     }
 
-    /// Runs `command` on `alias` with /usr/bin/ssh, so ~/.ssh/config, keys and the agent all apply.
+    /// Direct aliases use pinned TLS. SSH aliases run `command` with the user's config, keys and agent.
     static func dial(_ alias: String, _ command: String, stderr: @escaping (Data) -> Void, exited: @escaping () -> Void) throws -> Tunnel {
+        if DirectPeers.isDirect(alias) { return try DirectTunnel.dial(alias, stderr: stderr, exited: exited) }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         // A computer linked with Add a computer brings its own key, user and pinned identity; anything else is ~/.ssh/config's.
@@ -40,6 +45,93 @@ enum Platform {
         p.terminationHandler = { _ in exited() }
         try p.run()
         return ProcessTunnel(process: p, input: outPipe.fileHandleForReading, output: inPipe.fileHandleForWriting)
+    }
+}
+
+/// Owned by SyncEngine so the SSH relay and the Direct listener stay up together.
+final class MacSyncListeners {
+    let peer: PeerServer?
+    let direct: DirectServer?
+
+    init(engine: SyncEngine, identity: (String) throws -> DirectIdentity = DirectIdentity.shared) {
+        peer = PeerServer(engine: engine)
+        do {
+            let server = try DirectServer(engine: engine, identity: identity(engine.device))
+            server.onPairRequest = { request, decide in DirectRuntime.shared.onPairRequest(request, decide) }
+            direct = server
+        } catch {
+            SyncLog.write("Direct Sync unavailable: \(error.localizedDescription)")
+            direct = nil
+        }
+    }
+}
+
+/// The main-thread bridge between the sync engine and the Devices page.
+final class DirectRuntime {
+    static let shared = DirectRuntime()
+    weak var server: DirectServer?
+    var onPairRequest: (DirectPairRequest, @escaping (Bool) -> Void) -> Void = { _, decide in decide(false) }
+    var onNearbyChange: ([DiscoveredPeer]) -> Void = { _ in }
+    private var browser: DirectBrowser?
+    private var devicesVisible = false
+
+    private init() {}
+
+    func setDevicesVisible(_ visible: Bool) {
+        devicesVisible = visible
+        updateDiscovery()
+        if visible { browser?.start() }
+    }
+
+    func updateDiscovery() {
+        let enabled = SyncEngine.enabledHosts.contains(where: DirectPeers.isDirect)
+        if devicesVisible || enabled {
+            guard browser == nil else { return }
+            let engine = SyncEngine.shared
+            var previous: [DiscoveredPeer] = []
+            browser = DirectBrowser(localDeviceId: engine.device) { [weak self] peers in
+                self?.onNearbyChange(peers)
+                // A newly discovered endpoint can replace a stale or missing cached address.
+                defer { previous = peers }
+                let enabled = Set(SyncEngine.enabledHosts)
+                for found in peers where !previous.contains(found) {
+                    let alias = DirectPeers.alias(for: found.id)
+                    guard enabled.contains(alias), engine.statuses[alias]?.ok != true,
+                          DirectPeers.peer(id: found.id)?.fingerprint.hasPrefix(found.fingerprintPrefix) == true else { continue }
+                    engine.redial(alias)
+                }
+            }
+        } else {
+            browser?.stop()
+            browser = nil
+        }
+    }
+
+    func startQRPairing(addresses: [String] = PairingServer.addresses()) -> URL? {
+        server?.startQRPairing(addresses: addresses)
+    }
+
+    func stopQRPairing() { server?.stopQRPairing() }
+}
+
+enum DirectDeviceKind: String {
+    case macos, ios, linux, windows
+
+    var name: String {
+        switch self {
+        case .macos: return "macOS"
+        case .ios: return "iOS"
+        case .linux: return "Linux"
+        case .windows: return "Windows"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .macos: return "laptopcomputer"
+        case .ios: return "iphone"
+        case .linux, .windows: return "desktopcomputer"
+        }
     }
 }
 
@@ -74,6 +166,8 @@ var peerSocketPath: String {
 /// The app's Unix socket. Each connection is a peer that came in over SSH through `--peer`.
 final class PeerServer {
     private var source: DispatchSourceRead?
+
+    deinit { source?.cancel() }
 
     init?(engine: SyncEngine) {
         let path = peerSocketPath

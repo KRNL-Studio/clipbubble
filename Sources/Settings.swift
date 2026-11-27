@@ -7,7 +7,7 @@ struct SyncSettings: View {
     @ObservedObject var model: Model
     @State private var configHosts: [String] = []
     @State private var peers: [Peer] = Peers.all
-    @State private var enabled = Set(SyncEngine.enabledHosts)
+    @State private var enabled = Set(SyncEngine.enabledHosts.filter { !DirectPeers.isDirect($0) })
     @State private var setup: [String: String] = [:]   // progress or result text per host
     @State private var installing: Set<String> = []
     @State private var adding = false
@@ -43,16 +43,6 @@ struct SyncSettings: View {
                 Text("Computers you add show up here, along with any hosts in ~/.ssh/config.")
                     .font(.system(size: 11)).foregroundStyle(.tertiary)
             }
-            if !enabled.isEmpty {
-                HStack(spacing: 10) {
-                    SettingIcon(symbol: "pause.circle", tint: .green)
-                    Text("Pause sync").font(.system(size: 13, weight: .medium))
-                    Spacer()
-                    Toggle("", isOn: Binding(get: { model.syncPaused }, set: { model.syncPaused = $0; SyncEngine.shared.setPaused($0) }))
-                        .toggleStyle(.switch).controlSize(.mini).labelsHidden()
-                }
-                .padding(.vertical, 5)
-            }
             Text("This Mac shows up as \(SyncEngine.shared.name). Files up to 25 MB move on their own. Password-manager copies never leave this Mac.")
                 .font(.system(size: 10.5)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true).padding(.top, 2)
             if let id = HostIdentity.mine {
@@ -60,7 +50,11 @@ struct SyncSettings: View {
                     .textSelection(.enabled).padding(.top, 2)
             }
         }
-        .onAppear { configHosts = SSHConfig.hosts(); peers = Peers.all }
+        .onAppear {
+            configHosts = SSHConfig.hosts().filter { !DirectPeers.isDirect($0) }
+            peers = Peers.all
+            enabled = Set(SyncEngine.enabledHosts.filter { !DirectPeers.isDirect($0) })
+        }
     }
 
     private func hostRow(_ host: String) -> some View {
@@ -182,8 +176,8 @@ struct AddComputer: View {
                 }
                 .controlSize(.small)
             } else {
-                detail(relinking.map { "On \($0.name), open ClipBubble → Settings → Sync over SSH → Link iPhone…, then enter what it shows." }
-                       ?? "On the other computer, open ClipBubble → Settings → Sync over SSH → Link iPhone…, then enter what it shows. On Linux without a desktop, run clipbubble --pair there.")
+                detail(relinking.map { "On \($0.name), open ClipBubble → Devices → Advanced → Link iPhone (SSH)…, then enter what it shows." }
+                       ?? "On the other computer, open ClipBubble → Devices → Advanced → Link iPhone (SSH)…, then enter what it shows. On Linux without a desktop, run clipbubble --pair there.")
                 HStack(spacing: 6) {
                     TextField("Address, like rohits-mac.local", text: $address).frame(minWidth: 170)
                     TextField("Code", text: $code).frame(width: 96)
@@ -237,7 +231,7 @@ struct IdentityCheck: View {
             if let scanned, let id = fingerprint(scanned.key) {
                 Text("It says its identity is").font(.system(size: 11)).foregroundStyle(.secondary)
                 Text(id).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
-                Text("On that computer, ClipBubble shows its identity under Settings → Sync over SSH. Trust it only if they match.")
+                Text("On that computer, ClipBubble shows its identity under Devices → Advanced. Trust it only if they match.")
                     .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 HStack {
                     Button("They match, trust it") { trust(scanned) }
@@ -289,7 +283,7 @@ struct PhonePairing: View {
                     if let note { Text(note).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
                 }
                 Spacer(minLength: 8)
-                Button(server == nil ? "Link iPhone…" : "Done") { server == nil ? start() : stop() }.controlSize(.small)
+                Button(server == nil ? "Link iPhone (SSH)…" : "Done") { server == nil ? start() : stop() }.controlSize(.small)
             }
             if let qr, let server {
                 Image(nsImage: qr).interpolation(.none).resizable().frame(width: 150, height: 150)
@@ -336,7 +330,7 @@ struct PhonePairing: View {
         let s = PairingServer()
         s.onReady = { qr = PairingServer.qr($0); note = "Scan with the iPhone's Camera, or in ClipBubble on the iPhone. Same Wi-Fi as this Mac." }
         s.onPaired = { name in qr = nil; server = nil; phones = AuthorizedKeys.phones(); note = "Linked \(name). It syncs whenever ClipBubble is open there." }
-        s.onGaveUp = { qr = nil; server = nil; note = "Too many wrong codes, so linking stopped. Press Link iPhone… for a new code." }
+        s.onGaveUp = { qr = nil; server = nil; note = "Too many wrong codes. Choose Link iPhone (SSH)… for a new code." }
         server = s
         s.start()
     }
@@ -865,11 +859,240 @@ final class Screencapture {
 
 struct DevicesPage: View {
     @ObservedObject var model: Model
+    @EnvironmentObject private var nav: AppNav
+    @State private var advanced = false
+    @State private var pairing: NearbyPairing?
+    @State private var pairingTask: Task<Void, Never>?
+    @State private var pairingError: String?
+    @State private var qr: DirectQR?
+    @State private var qrError: String?
+
+    private struct NearbyPairing {
+        let id = UUID()
+        let peer: DiscoveredPeer
+        var code: String?
+    }
+
+    private struct DirectQR {
+        let id = UUID()
+        let image: NSImage
+        let phones: [DirectPeer]
+        let expires = ProcessInfo.processInfo.systemUptime + 600
+    }
+
+    private var nearbyRows: [DiscoveredPeer] {
+        let peers = model.nearbyDevices
+        // Keep the code and Cancel button available if the advertisement goes away during pairing.
+        guard let pairing, !peers.contains(where: { $0.id == pairing.peer.id }) else { return peers }
+        return peers + [pairing.peer]
+    }
 
     var body: some View {
         SettingsPage(page: .devices) {
-            SettingsCard(title: "Sync over SSH") { SyncSettings(model: model) }
+            SettingsCard(title: "Linked Devices") {
+                if model.directPeers.isEmpty { note("No devices linked yet. Choose a nearby device or scan a QR code.").padding(.vertical, 6) }
+                ForEach(model.directPeers) { peer in linkedRow(peer) }
+                Divider().padding(.vertical, 5)
+                Toggle("Pause sync", isOn: Binding(get: { model.syncPaused }, set: {
+                    model.syncPaused = $0
+                    SyncEngine.shared.setPaused($0)
+                }))
+                .toggleStyle(.switch).controlSize(.small).padding(.vertical, 4)
+            }
+            SettingsCard(title: "Nearby Devices") {
+                if nearbyRows.isEmpty { note("Looking for nearby ClipBubble devices…").padding(.vertical, 6) }
+                ForEach(nearbyRows) { peer in nearbyRow(peer) }
+                if let pairingError { note(pairingError).padding(.vertical, 4) }
+                Divider().padding(.vertical, 5)
+                HStack(alignment: .center, spacing: 10) {
+                    SettingIcon(symbol: "qrcode", tint: .blue)
+                    note("Scan with your iPhone's Camera or ClipBubble app. No Remote Login or SSH needed.")
+                    Spacer(minLength: 8)
+                    Button(qr == nil ? "Show QR Code…" : "Done") { qr == nil ? showQR() : hideQR() }
+                        .controlSize(.small)
+                }
+                .padding(.vertical, 5)
+                if let qr {
+                    Image(nsImage: qr.image).interpolation(.none).resizable().frame(width: 184, height: 184)
+                        .padding(12).background(.white, in: RoundedRectangle(cornerRadius: 8))
+                        .accessibilityLabel("Direct Sync pairing QR code")
+                        .frame(maxWidth: .infinity).padding(.vertical, 8)
+                        .task(id: qr.id) { await watchQR(qr) }
+                }
+                if let qrError { note(qrError).padding(.vertical, 4) }
+            }
+            SettingsCard {
+                DisclosureGroup("Advanced — Connect via SSH", isExpanded: $advanced) {
+                    if advanced { SyncSettings(model: model).padding(.top, 8) }
+                }
+                .padding(.vertical, 5)
+            }
         }
+        .onReceive(nav.windowVisibility) { visible in
+            DirectRuntime.shared.setDevicesVisible(visible)
+            if visible { model.refreshDirectPeers() } else { stopPairing() }
+        }
+        .onDisappear {
+            DirectRuntime.shared.setDevicesVisible(false)
+            stopPairing()
+        }
+    }
+
+    private func linkedRow(_ peer: DirectPeer) -> some View {
+        let alias = DirectPeers.alias(for: peer.id)
+        let enabled = model.directHosts.contains(alias)
+        let connected = model.isDirectConnected(peer)
+        return HStack(spacing: 10) {
+            deviceLabel(peer.name, os: peer.os)
+            Spacer(minLength: 8)
+            Circle().fill(connected ? Color.green : Color.gray).frame(width: 7, height: 7)
+                .accessibilityHidden(true)
+            note(linkStatus(peer, connected: connected, enabled: enabled))
+            if peer.os != "ios" {
+                Toggle("Connect to \(peer.name)", isOn: Binding(get: { model.directHosts.contains(alias) },
+                    set: { model.setDirectHost(peer, on: $0) }))
+                    .toggleStyle(.switch).controlSize(.mini).labelsHidden()
+            }
+            Button("Unlink") { model.unlinkDirect(peer) }.controlSize(.small)
+                .accessibilityLabel("Unlink \(peer.name)")
+        }
+        .padding(.vertical, 6)
+    }
+
+    private func linkStatus(_ peer: DirectPeer, connected: Bool, enabled: Bool) -> String {
+        if connected { return "Connected" }
+        if model.syncPaused { return "Paused" }
+        if peer.os == "ios" { return "Waiting for iPhone" }
+        guard enabled else { return "Outbound off" }
+        switch model.links[DirectPeers.alias(for: peer.id)] {
+        case .none, .connecting?: return "Connecting…"
+        case .hostKeyChanged?: return "Identity changed"
+        case .needsKeyAuth?: return "Link again to connect"
+        case .versionMismatch?: return "Update needed"
+        default: return "Offline"
+        }
+    }
+
+    private func nearbyRow(_ peer: DiscoveredPeer) -> some View {
+        let attempt = pairing.flatMap { $0.peer.id == peer.id ? $0 : nil }
+        return VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 10) {
+                deviceLabel(attempt?.peer.name ?? peer.name, os: attempt?.peer.os ?? peer.os)
+                Spacer(minLength: 8)
+                if let attempt {
+                    if attempt.code == nil { ProgressView().controlSize(.small) }
+                    Button("Cancel", action: cancelNearby).controlSize(.small)
+                } else {
+                    Button("Link") { pairNearby(peer) }.controlSize(.small).disabled(pairing != nil)
+                        .accessibilityLabel("Link with \(peer.name)")
+                }
+            }
+            if let attempt {
+                Group {
+                    if let code = attempt.code {
+                        let formatted = Text(code).font(.system(.body, design: .monospaced).weight(.semibold))
+                        Text("Confirm \(formatted) on \(attempt.peer.name)…")
+                    } else {
+                        note("Connecting to \(attempt.peer.name)…")
+                    }
+                }
+                .padding(.leading, 34)
+            }
+        }
+        .padding(.vertical, 6)
+    }
+
+    private func deviceLabel(_ name: String, os: String) -> some View {
+        let kind = DirectDeviceKind(rawValue: os) ?? .macos
+        return HStack(spacing: 10) {
+            SettingIcon(symbol: kind.symbol, tint: .blue).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(name).font(.system(size: 13, weight: .medium))
+                note(kind.name)
+            }
+        }
+    }
+
+    private func note(_ text: String) -> some View {
+        Text(text).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func pairNearby(_ peer: DiscoveredPeer) {
+        let attempt = NearbyPairing(peer: peer)
+        pairing = attempt
+        pairingError = nil
+        let engine = SyncEngine.shared
+        pairingTask = Task { @MainActor in
+            do {
+                let identity = try DirectIdentity.shared(deviceId: engine.device)
+                let linked = try await DirectPairingClient.pairNearby(endpoint: peer.endpoint,
+                    expectedFPPrefix: peer.fingerprintPrefix, localIdentity: identity,
+                    deviceId: engine.device, name: engine.name, os: Platform.os) { code in
+                    if pairing?.id == attempt.id { pairing?.code = code }
+                }
+                guard pairing?.id == attempt.id, !Task.isCancelled else { return }
+                guard linked.id == peer.id else { throw DirectPairError.invalidDevice }
+                DirectPeers.save(linked)
+                if linked.os == "ios" { model.refreshDirectPeers() }
+                else { model.setDirectHost(linked, on: true) }
+            } catch {
+                guard pairing?.id == attempt.id, !Task.isCancelled else { return }
+                pairingError = "Couldn't link with \(peer.name). \(error.localizedDescription)"
+            }
+            pairing = nil
+            pairingTask = nil
+        }
+    }
+
+    private func cancelNearby() {
+        pairing = nil
+        pairingTask?.cancel()
+        pairingTask = nil
+    }
+
+    private func showQR() {
+        qrError = nil
+        let runtime = DirectRuntime.shared
+        guard runtime.server?.port != nil else {
+            qrError = "Direct Sync is unavailable. Try again when it is listening."
+            return
+        }
+        let phones = DirectPeers.all.filter { $0.os == "ios" }
+        guard let url = runtime.startQRPairing(), let image = PairingServer.qr(url) else {
+            runtime.stopQRPairing()
+            qrError = "Couldn't create a QR code. Check your network connection and try again."
+            return
+        }
+        qr = DirectQR(image: image, phones: phones)
+    }
+
+    @MainActor private func watchQR(_ offer: DirectQR) async {
+        while qr?.id == offer.id {
+            do { try await Task.sleep(for: .seconds(1)) } catch { return }
+            guard qr?.id == offer.id, !Task.isCancelled else { return }
+            model.refreshDirectPeers()
+            if model.directPeers.contains(where: { $0.os == "ios" && !offer.phones.contains($0) }) {
+                hideQR()
+                return
+            }
+            if ProcessInfo.processInfo.systemUptime >= offer.expires {
+                hideQR()
+                qrError = "This QR code expired. Show a new code to link your iPhone."
+                return
+            }
+        }
+    }
+
+    private func hideQR() {
+        DirectRuntime.shared.stopQRPairing()
+        qr = nil
+    }
+
+    private func stopPairing() {
+        cancelNearby()
+        hideQR()
+        pairingError = nil
+        qrError = nil
     }
 }
 

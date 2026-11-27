@@ -36,6 +36,9 @@ final class Model: ObservableObject {
     @Published var devices: [String: String] = [:]
     @Published var transfers: [String: Transfer] = [:]
     @Published var linked: [Hello] = []
+    @Published private(set) var directPeers = DirectPeers.all
+    @Published private(set) var directHosts = Set(SyncEngine.enabledHosts.filter(DirectPeers.isDirect))
+    @Published var discoveredPeers: [DiscoveredPeer] = []
     @Published var mascot = Mascots.active()
     @Published var mascots = Mascots.all()
     @Published var hideBubble = UserDefaults.standard.bool(forKey: "hideBubble") {
@@ -66,6 +69,33 @@ final class Model: ObservableObject {
     }
 
     var selected: Clip? { clips.first { $0.id == selection } ?? clips.first }
+
+    var nearbyDevices: [DiscoveredPeer] {
+        let linkedIDs = Set(directPeers.map(\.id))
+        return discoveredPeers.filter { !linkedIDs.contains($0.id) }
+    }
+
+    func refreshDirectPeers() {
+        let peers = DirectPeers.all
+        if directPeers != peers { directPeers = peers }
+        let hosts = Set(SyncEngine.enabledHosts.filter(DirectPeers.isDirect))
+        if directHosts != hosts { directHosts = hosts }
+    }
+
+    func isDirectConnected(_ peer: DirectPeer) -> Bool {
+        !syncPaused && (linked.contains { $0.device == peer.id } || links[DirectPeers.alias(for: peer.id)]?.ok == true)
+    }
+
+    func setDirectHost(_ peer: DirectPeer, on: Bool) {
+        SyncEngine.shared.setHost(DirectPeers.alias(for: peer.id), on: on)
+        refreshDirectPeers()
+    }
+
+    func unlinkDirect(_ peer: DirectPeer) {
+        SyncEngine.shared.setHost(DirectPeers.alias(for: peer.id), on: false)
+        DirectPeers.remove(id: peer.id)
+        refreshDirectPeers()
+    }
 
     @discardableResult
     func pick(_ clip: Clip, _ paste: Bool) -> Bool { pickClip(clip, paste) }
@@ -1115,12 +1145,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func connectSync() {
         let sync = SyncEngine.shared
+        let direct = DirectRuntime.shared
+        direct.onNearbyChange = { [weak model] in model?.discoveredPeers = $0 }
+        direct.onPairRequest = { [weak self] request, decide in
+            guard let self, let appWindow else { return decide(false) }
+            appWindow.confirmDirectPairing(request) { [weak model = self.model] allowed in
+                decide(allowed)
+                guard allowed else { return }
+                // The server handles the decision on the sync queue and saves the peer before replying.
+                sync.queue.async { [weak model] in
+                    DispatchQueue.main.async { [weak model] in model?.refreshDirectPeers() }
+                }
+            }
+        }
         sync.apply = { [weak self] c in DispatchQueue.main.async { self?.applySynced(c) } }
         sync.onReceived = { [weak self] in self?.refreshLists() }
         sync.onNew = { [weak self] in self?.captured() }
         sync.onStatus = { [weak self] in
             self?.model.links = sync.statuses
             self?.model.linked = sync.linked
+            self?.model.refreshDirectPeers()
+            direct.updateDiscovery()
             if self?.model.refreshDeviceNames() == true { self?.model.historyChanged() }
             SyncStatus.write(sync.statuses, paused: self?.model.syncPaused ?? false, openAtLogin: LoginItem.describe())
         }

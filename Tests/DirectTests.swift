@@ -174,6 +174,84 @@ private func directLoopbackTests() throws {
     }
     try directOutboundRemainder(local: clientIdentity, engine: engine)
     try directTwoEngines(server: server)
+    try macDirectWiringTests(engine: engine, client: clientIdentity)
+}
+
+private func macDirectWiringTests(engine: SyncEngine, client: DirectIdentity) throws {
+    do {
+        let unavailable = engine.queue.sync {
+            MacSyncListeners(engine: engine, identity: { _ in throw DirectPairError.invalidDevice })
+        }
+        check(unavailable.peer != nil && unavailable.direct == nil, "an unavailable Direct identity leaves the SSH relay listening")
+    }
+    guard let listeners = engine.queue.sync(execute: { Platform.listen(engine) as? MacSyncListeners }),
+          let server = listeners.direct else { return check(false, "macOS starts a Direct listener") }
+    defer { server.stop(); engine.queue.sync {} }
+    check(listeners.peer != nil, "macOS binds the SSH relay with the Direct listener running")
+    let runtime = DirectRuntime.shared
+    guard directWait("macOS Direct listener", { runtime.server === server && server.port != nil }),
+          let port = server.port else { return check(false, "the active Direct listener exposes its port") }
+    let socket = DirectTestSocket(port: port, identity: client)
+    check(socket.ready(), "the macOS listener accepts a mutually authenticated TLS connection")
+    socket.close()
+
+    let alias = DirectPeers.alias(for: client.deviceId)
+    do {
+        let tunnel = try Platform.dial(alias, "unused", stderr: { _ in }, exited: {})
+        tunnel.close()
+        check(false, "macOS rejects an unpaired Direct alias before dialing")
+    } catch DirectPairError.unpaired {
+        check(true, "macOS routes an unpaired Direct alias to Direct authentication")
+    }
+
+    let peer = DirectPeer(id: client.deviceId, name: "Test iPhone", os: "ios", fingerprint: client.fingerprint,
+                          addresses: ["127.0.0.1"], port: port, lastSeen: 0)
+    let endpoint = NWEndpoint.service(name: peer.name, type: DirectBrowser.serviceType, domain: "local.", interface: nil)
+    let txt = NWTXTRecord(["v": "2", "id": peer.id, "name": peer.name, "os": peer.os,
+                           "fp": String(peer.fingerprint.prefix(16))])
+    let model = Model()
+    model.discoveredPeers = [DiscoveredPeer(endpoint: endpoint, txt: txt, localDeviceId: engine.device)].compactMap { $0 }
+    check(model.nearbyDevices.map(\.id) == [peer.id], "the Devices model lists an unpaired advertisement nearby")
+    DirectPeers.save(peer)
+    defer { model.unlinkDirect(peer) }
+    model.refreshDirectPeers()
+    check(model.directPeers.contains(peer) && model.nearbyDevices.isEmpty, "a paired device moves from Nearby to Linked")
+    check(!model.isDirectConnected(peer), "a paired device starts as disconnected")
+    let hello = Hello(proto: Sync.proto, device: peer.id, name: peer.name, os: peer.os, version: "test", clock: 0)
+    model.linked = [hello]
+    check(model.isDirectConnected(peer), "incoming Direct sessions mark a device connected")
+    model.linked = []
+    model.links[alias] = .live(hello)
+    check(model.isDirectConnected(peer), "outbound Direct sessions also mark a device connected")
+    let tunnel = try Platform.dial(alias, "unused", stderr: { _ in }, exited: {})
+    check(tunnel is DirectTunnel, "a paired Direct alias creates a TLS tunnel")
+    tunnel.close()
+    let oldHosts = Platform.defaults.object(forKey: "sync.hosts")
+    defer { Platform.defaults.set(oldHosts, forKey: "sync.hosts") }
+    Platform.defaults.set(SyncEngine.enabledHosts + [alias], forKey: "sync.hosts")
+    model.refreshDirectPeers()
+    check(model.directHosts.contains(alias), "the Devices model reflects outbound enablement")
+    model.unlinkDirect(peer)
+    check(DirectPeers.peer(fingerprint: peer.fingerprint) == nil && !SyncEngine.enabledHosts.contains(alias),
+          "unlinking revokes the stored certificate and disables outbound dialing")
+    check(!model.directPeers.contains(peer) && model.nearbyDevices.map(\.id) == [peer.id], "unlinking refreshes both Devices lists")
+
+    guard let qr = runtime.startQRPairing(addresses: ["127.0.0.1"]) else {
+        return check(false, "macOS can offer a Direct QR code on a running listener")
+    }
+    let items = URLComponents(url: qr, resolvingAgainstBaseURL: false)?.queryItems ?? []
+    check(qr.scheme == "clipbubble" && qr.host == "direct" && items.contains(URLQueryItem(name: "p", value: String(port))),
+          "the macOS QR contains the Direct listener port without a Remote Login check")
+    check(PairingServer.qr(qr) != nil, "the Direct URL renders as a QR image")
+    runtime.stopQRPairing()
+    let stopped = directResult {
+        try await DirectPairingClient.pairQR(url: qr, localIdentity: client, deviceId: client.deviceId, name: peer.name, os: peer.os)
+    }
+    if case .failure(DirectPairError.rejected("Invalid or expired pairing code.")) = stopped {
+        check(true, "dismissing the macOS QR code revokes its pairing token")
+    } else {
+        check(false, "dismissing the macOS QR code revokes its pairing token")
+    }
 }
 
 private func directTunnelFailure(_ peer: DirectPeer, local: DirectIdentity, engine: SyncEngine) -> LinkState? {

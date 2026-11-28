@@ -57,4 +57,4 @@ Local Network is used to find nearby computers and sync with linked computers. F
 ## Still to make
 
 - A sync video recorded on a real iPhone and computer: linking, the Local Network prompt, a copy each way, Share and the keyboard.
-- All seven 6.9-inch screenshots (`1-recent.png` through `7-share.png`) are ready in `iOS/AppStore/screenshots/`.
+- All seven 6.9-inch screenshots (`1-mac-to-iphone.png` through `7-private.png`) are in `iOS/AppStore/screenshots/`. Edit `iOS/AppStore/design/index.html` and run `iOS/AppStore/design/render.sh` to regenerate them.

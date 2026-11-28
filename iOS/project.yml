@@ -12,11 +12,11 @@ packages:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "1.6.2"
+    MARKETING_VERSION: "2.0.0"
     CURRENT_PROJECT_VERSION: "1"
     DEVELOPMENT_TEAM: BHAM5T9649
     CODE_SIGN_STYLE: Automatic
-# The sync engine, store and SSH go into every target: the app, the share extension and the keyboard each link on their own.
+# The app, share extension and keyboard share the engine, store and both transports.
 targetTemplates:
   Synced:
     # On the targets, not the project: XcodeGen's iOS preset sets "1,2" on every target, which made it an iPad app too.
@@ -28,6 +28,9 @@ targetTemplates:
       - ../Sources/Sync.swift
       - ../Sources/Store.swift
       - ../Sources/Link.swift
+      - ../Sources/DirectIdentity.swift
+      - ../Sources/DirectPeers.swift
+      - ../Sources/DirectTransport.swift
     dependencies:
       - package: swift-nio
         product: NIOCore
@@ -57,9 +60,9 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
-        # SSH runs on CryptoKit (swift-crypto ships no BoringSSL on iOS), so all encryption is the OS's own.
         ITSAppUsesNonExemptEncryption: false
-        NSLocalNetworkUsageDescription: ClipBubble connects to your computers on this network to sync your clipboard.
+        NSLocalNetworkUsageDescription: ClipBubble finds nearby computers and syncs your clipboard over a direct, encrypted connection.
+        NSBonjourServices: ["_clipbubble._tcp"]
         NSCameraUsageDescription: To scan the code your computer shows when you link this iPhone.
         CFBundleURLTypes:
           - CFBundleURLName: studio.krnl.clipbubble
@@ -78,6 +81,9 @@ targets:
         CFBundleDisplayName: ClipBubble
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        ITSAppUsesNonExemptEncryption: false
+        NSLocalNetworkUsageDescription: ClipBubble finds nearby computers and syncs your clipboard over a direct, encrypted connection.
+        NSBonjourServices: ["_clipbubble._tcp"]
         NSExtension:
           NSExtensionPointIdentifier: com.apple.share-services
           NSExtensionPrincipalClass: ShareViewController
@@ -105,6 +111,9 @@ targets:
         CFBundleDisplayName: ClipBubble
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        ITSAppUsesNonExemptEncryption: false
+        NSLocalNetworkUsageDescription: ClipBubble finds nearby computers and syncs your clipboard over a direct, encrypted connection.
+        NSBonjourServices: ["_clipbubble._tcp"]
         NSExtension:
           NSExtensionPointIdentifier: com.apple.keyboard-service
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).KeyboardViewController

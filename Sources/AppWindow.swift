@@ -90,6 +90,7 @@ final class AppWindow: NSObject, NSWindowDelegate {
     let history: HistoryBrowser
     let onboarding: OnboardingState
     private(set) var window: NSWindow?
+    private var confirmingDirectPair = false
     private var frameBeforeSetup: NSRect?
     private lazy var accessibilityDrag = AccessibilityDragPanelController(state: onboarding) { [weak self] in
         guard let self, let window = self.window else { return }
@@ -111,6 +112,58 @@ final class AppWindow: NSObject, NSWindowDelegate {
         if let page { nav.page = page }
         if nav.page == .history { history.reload() }
         reveal(window ?? make())
+    }
+
+    func confirmDirectPairing(_ request: DirectPairRequest, decide: @escaping (Bool) -> Void) {
+        guard !confirmingDirectPair else { return decide(false) }
+        confirmingDirectPair = true
+        let alert = NSAlert()
+        alert.messageText = "Link with \(request.name)?"
+        alert.informativeText = "Confirm this code matches on \(request.name). Your clipboard history from the last 7 days will sync directly over your network."
+        alert.addButton(withTitle: "Allow").keyEquivalent = "\r"
+        alert.addButton(withTitle: "Decline").keyEquivalent = "\u{1b}"
+
+        let kind = DirectDeviceKind(rawValue: request.os) ?? .macos
+        let badge = NSTextField(labelWithString: kind.name)
+        badge.font = .systemFont(ofSize: 12, weight: .semibold)
+        badge.textColor = .secondaryLabelColor
+        let icon = NSImageView(image: NSImage(systemSymbolName: kind.symbol, accessibilityDescription: nil) ?? NSImage())
+        icon.contentTintColor = .secondaryLabelColor
+        let platform = NSStackView(views: [icon, badge])
+        platform.alignment = .centerY
+        platform.spacing = 6
+        let code = NSTextField(labelWithString: request.code)
+        code.font = .monospacedDigitSystemFont(ofSize: 30, weight: .semibold)
+        let accessory = NSStackView(views: [platform, code])
+        accessory.orientation = .vertical
+        accessory.alignment = .leading
+        accessory.spacing = 6
+        accessory.frame.size = accessory.fittingSize
+        alert.accessoryView = accessory
+
+        let parent = window.flatMap { $0.isVisible && !$0.isMiniaturized && $0.attachedSheet == nil ? $0 : nil }
+        let expires = ProcessInfo.processInfo.systemUptime + 90
+        let timeout = Timer(timeInterval: 90, repeats: false) { [weak panel = alert.window] _ in
+            guard let panel else { return }
+            if let parent = panel.sheetParent {
+                parent.endSheet(panel, returnCode: .cancel)
+            } else if NSApp.modalWindow === panel {
+                NSApp.stopModal(withCode: .cancel)
+            }
+        }
+        let finish: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            timeout.invalidate()
+            self?.confirmingDirectPair = false
+            decide(response == .alertFirstButtonReturn && ProcessInfo.processInfo.systemUptime < expires)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        RunLoop.main.add(timeout, forMode: .common)
+        if let parent {
+            alert.beginSheetModal(for: parent, completionHandler: finish)
+        } else {
+            RunLoop.main.add(timeout, forMode: .modalPanel)
+            finish(alert.runModal())
+        }
     }
 
     private func reveal(_ w: NSWindow) {
@@ -223,7 +276,9 @@ final class AppWindow: NSObject, NSWindowDelegate {
 
     func windowDidResignKey(_ n: Notification) { cancelRecording() }
     func windowWillMiniaturize(_ n: Notification) { cancelRecording() }
+    func windowDidMiniaturize(_ n: Notification) { nav.windowVisibility.send(false) }
     func windowDidDeminiaturize(_ n: Notification) {
+        nav.windowVisibility.send(true)
         if nav.page == .history { history.reload() }
     }
 
@@ -387,7 +442,8 @@ struct Sidebar: View {
         let connecting = !SyncEngine.enabledHosts.isEmpty
         let text = model.syncPaused ? "Sync paused"
             : live > 0 ? "\(live) \(live == 1 ? "device" : "devices") linked"
-            : connecting ? "Connecting to your devices…" : "No devices linked"
+            : connecting ? "Connecting to your devices…"
+            : model.directPeers.isEmpty ? "No devices linked" : "Waiting for linked devices"
         return Button { nav.page = .devices } label: {
             HStack(spacing: 8) {
                 Circle().fill(model.syncPaused ? Color.gray : live > 0 ? Color.green : connecting ? Color.orange : Color.gray)

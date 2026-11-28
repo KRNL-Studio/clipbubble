@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import store
+from . import direct, store
 
 PORT = 47821
 # In ~/.ssh, except for tests and second instances (CLIPBUBBLE_HOME), which keep their own.
@@ -25,8 +25,13 @@ def known_hosts():
     return store.DIR / "known_hosts"
 
 
-def all_peers():
+def _ssh_peers():
     return [p for p in store.Prefs.get("sync.peers", []) if isinstance(p, dict) and p.get("alias")]
+
+
+def all_peers():
+    return _ssh_peers() + [{"alias": p.alias, "name": p.name, "fingerprint": p.fingerprint}
+                           for p in direct.DirectPeers(store.DIR).all()]
 
 
 def peer(alias):
@@ -34,11 +39,30 @@ def peer(alias):
 
 
 def save(p):
-    _store([q for q in all_peers() if q["alias"] != p["alias"]] + [p])
+    _store([q for q in _ssh_peers() if q["alias"] != p["alias"]] + [p])
 
 
 def remove(alias):
-    _store([q for q in all_peers() if q["alias"] != alias])
+    if alias.startswith("direct:"):
+        direct.DirectPeers(store.DIR).remove(alias[7:])
+        _set_direct_host(alias, enabled=False)
+    else:
+        _store([q for q in _ssh_peers() if q["alias"] != alias])
+
+
+def enable_direct(peer):
+    _set_direct_host(peer.alias, enabled=True)
+
+
+def _set_direct_host(alias, enabled):
+    # The running app and CLI can both finish pairings. Serialize their preference updates.
+    with direct._locked(store.DIR / "direct-hosts.lock"), store.Prefs._lock:
+        prefs = store.Prefs.load()
+        hosts = prefs.get("sync.hosts", [])
+        if enabled == (alias in hosts):
+            return
+        prefs["sync.hosts"] = hosts + [alias] if enabled else [a for a in hosts if a != alias]
+        direct._replace(store.Prefs.path(), json.dumps(prefs, indent=1).encode(), 0o600)
 
 
 def _store(peers):
@@ -58,12 +82,14 @@ def free_alias(name, taken):
 
 
 def summary(p):
+    if p["alias"].startswith("direct:"):
+        return "Direct Sync"
     return f"{p['user']}@{p['host']}, with the key {str(KEY).replace(str(Path.home()), '~', 1)}"
 
 
 def ssh_args(alias):
     """For a linked computer: this key only, its pinned identity only, strict checking always. None for other hosts."""
-    p = peer(alias)
+    p = next((p for p in _ssh_peers() if p["alias"] == alias), None)
     if not p:
         return None
     return ["-i", str(KEY), "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
@@ -185,7 +211,8 @@ def write_status(statuses, state_text, name, paused):
         row = {"alias": alias, "state": kind, "text": state_text((kind, arg))}
         p = peer(alias)
         if p:
-            row.update(name=p["name"], connection=summary(p), identity=fingerprint(p.get("hostKey")) or "")
+            row.update(name=p["name"], connection=summary(p),
+                       identity=p.get("fingerprint") or fingerprint(p.get("hostKey")) or "")
         if kind == "live":
             row["name"] = arg
         last = store.Prefs.get("sync.lastLive." + alias)

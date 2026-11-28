@@ -12,6 +12,7 @@ using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace ClipBubble;
 
@@ -304,7 +305,7 @@ if ($LASTEXITCODE -ne 0) {{ exit 1 }}";
     }
 
     /// The IPv4 address of every adapter a phone could reach: Wi-Fi and Ethernet first, never VMs, WSL or containers.
-    static IEnumerable<string> Addresses()
+    internal static IEnumerable<string> Addresses()
     {
         var skip = new[] { "virtual", "hyper-v", "vethernet", "vmware", "virtualbox", "wsl", "docker", "bluetooth", "loopback" };
         return NetworkInterface.GetAllNetworkInterfaces()
@@ -363,5 +364,203 @@ if (-not (Get-NetFirewallRule -DisplayName '{FirewallRule}' -ErrorAction Silentl
 }}";
         if (RunElevated(script) != 0 || !SshServerOn())
             throw new PairingException("Couldn't turn on OpenSSH Server. Turn it on in Settings → System → Optional features, then try again.");
+    }
+}
+
+sealed record DirectQr(string Id, string Fingerprint, string[] Addresses, int Port, string Code, string Name, string Os)
+{
+    public static DirectQr Parse(string link)
+    {
+        const string prefix = "clipbubble://direct?";
+        const string invalid = "That is not a ClipBubble Direct pairing link.";
+        if (link.Length > 4096 || !link.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) || link.Contains("#"))
+            throw new PairingException(invalid);
+        var fields = new Dictionary<string, string>();
+        foreach (var part in link.Substring(prefix.Length).Split('&'))
+        {
+            var eq = part.IndexOf('=');
+            if (eq <= 0 || fields.ContainsKey(part.Substring(0, eq))) throw new PairingException(invalid);
+            fields.Add(part.Substring(0, eq), part.Substring(eq + 1));
+        }
+        string Get(string key) => fields.TryGetValue(key, out var value) ? Uri.UnescapeDataString(value) : "";
+        var id = Get("id");
+        var fp = Get("fp");
+        var code = Get("c");
+        var name = Get("n");
+        var os = Get("os");
+        var addresses = Get("h").Split(',').Distinct().ToArray();
+        if (Get("v") != "2" || !DirectWire.DeviceId(id) || !DirectWire.Hex(fp, 64) || !DirectWire.Hex(code, 32)
+            || addresses.Any(a => Uri.CheckHostName(a) == UriHostNameType.Unknown) || string.IsNullOrWhiteSpace(name)
+            || !DirectWire.KnownOs(os) || !int.TryParse(Get("p"), System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out var port) || port is < 1 or > 65535)
+            throw new PairingException(invalid);
+        return new DirectQr(id, fp, addresses, port, code, name, os);
+    }
+}
+
+static class DirectPairingClient
+{
+    public static Task<DirectPeer> Nearby(DirectIdentity identity, string name, DirectNearby nearby,
+        Func<DirectPairRequest, CancellationToken, Task<bool>> approve, CancellationToken token = default) =>
+        Pair(identity, name, nearby.Id, nearby.Name, nearby.Os, nearby.Addresses, nearby.Port, null, null, approve, token);
+
+    public static Task<DirectPeer> Scan(DirectIdentity identity, string name, DirectQr qr, CancellationToken token = default) =>
+        Pair(identity, name, qr.Id, qr.Name, qr.Os, qr.Addresses, qr.Port, qr.Fingerprint, qr.Code, null, token);
+
+    internal static async Task<bool> Confirm(Func<DirectPairRequest, CancellationToken, Task<bool>>? approve,
+        DirectPairRequest request, CancellationToken token)
+    {
+        if (approve == null) return false;
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+        deadline.CancelAfter(DirectWire.ApprovalMs);
+        var approvalToken = deadline.Token;
+        // UI callers marshal the prompt to their dispatcher and honor cancellation when it expires.
+        var decision = Task.Run(() => approve(request, approvalToken), approvalToken);
+        var expired = Task.Delay(Timeout.Infinite, approvalToken);
+        try
+        {
+            if (await Task.WhenAny(decision, expired).ConfigureAwait(false) == decision)
+                return await decision.ConfigureAwait(false);
+            _ = decision.ContinueWith(t => { _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
+            return false;
+        }
+        catch (OperationCanceledException) when (deadline.IsCancellationRequested) { return false; }
+        finally { deadline.Cancel(); }
+    }
+
+    static async Task<DirectPeer> Pair(DirectIdentity identity, string name, string id, string peerName, string os,
+        string[] addresses, int port, string? fingerprint, string? code,
+        Func<DirectPairRequest, CancellationToken, Task<bool>>? approve, CancellationToken token)
+    {
+        if (id == identity.Id) throw new PairingException("This is this computer's Direct pairing link.");
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+        deadline.CancelAfter(DirectWire.TimeoutMs);
+        using var connection = await DirectTunnel.Open(identity, addresses, port, fingerprint, deadline.Token).ConfigureAwait(false);
+        using var abort = deadline.Token.Register(connection.Abort);
+        var fields = new Dictionary<string, object?>
+        {
+            ["mode"] = code == null ? "pair" : "pair-qr", ["v"] = DirectWire.Version,
+            ["device"] = identity.Id, ["name"] = name, ["os"] = DirectWire.Os,
+        };
+        // Open has already verified the full QR fingerprint before the secret enters the stream.
+        if (code != null) fields["code"] = code;
+        await DirectWire.Write(connection.Stream, fields).ConfigureAwait(false);
+        if (code == null) deadline.CancelAfter(120_000);
+        using var prompt = CancellationTokenSource.CreateLinkedTokenSource(deadline.Token);
+        try
+        {
+            var response = DirectWire.Read(connection.Stream);
+            if (code == null)
+            {
+                var request = new DirectPairRequest(peerName, os, DirectSas.Formatted(identity.Fingerprint, connection.Fingerprint));
+                var confirm = Confirm(approve, request, prompt.Token);
+                if (await Task.WhenAny(response, confirm).ConfigureAwait(false) == response)
+                    CheckReply(await response.ConfigureAwait(false));
+                if (!await confirm.ConfigureAwait(false))
+                {
+                    connection.Abort();
+                    _ = response.ContinueWith(t => { _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
+                    throw new PairingException("Direct pairing was declined.");
+                }
+            }
+            var reply = await response.ConfigureAwait(false);
+            CheckReply(reply);
+            var peer = DirectWire.Peer(reply, connection.Fingerprint);
+            if (!peer.Valid || peer.Id != id) throw new PairingException("The Direct peer returned a different device identity.");
+            return peer with { Addresses = addresses.ToArray(), Port = port };
+        }
+        finally { prompt.Cancel(); }
+    }
+
+    static void CheckReply(Dictionary<string, object?> reply)
+    {
+        if (DirectWire.Ok(reply)) return;
+        var error = DirectWire.Field(reply, "error");
+        throw new PairingException(error.Length > 0 ? error : "The Direct peer rejected pairing.");
+    }
+}
+
+/// Running Direct service and the entry points for the link settings UI.
+sealed class DirectPairing : IDisposable
+{
+    internal DirectIdentity Identity { get; }
+    internal DirectPeers Peers { get; }
+
+    readonly Func<string> name;
+    readonly Action<DirectPeer> paired;
+    readonly DirectServer server;
+    readonly DirectMdns? discovery;
+
+    public DirectPairing(string directory, string id, Func<string> name, Action<DirectPeer, DirectConnection> sync,
+        Action<DirectPeer> paired)
+    {
+        this.name = name;
+        this.paired = paired;
+        Peers = new DirectPeers(directory);
+        Identity = DirectIdentity.Open(directory, id);
+        try { server = new DirectServer(Identity, Peers, name, sync); }
+        catch { Identity.Dispose(); throw; }
+        try { discovery = new DirectMdns(Identity, name, server.Port); }
+        catch (Exception e) when (e is SocketException or NetworkInformationException)
+        { SyncLog.Write("Direct discovery: " + e.Message); }
+    }
+
+    /// Invoked on a background thread. Display the name, OS and code, and return the user's choice.
+    public Func<DirectPairRequest, CancellationToken, Task<bool>>? Approve
+    {
+        get => server.Approve;
+        set => server.Approve = value;
+    }
+
+    public string CreateQrLink() => server.CreateQrLink(Pairing.Addresses());
+
+    public DirectNearby[] NearbyDevices() => discovery?.Nearby() ?? Array.Empty<DirectNearby>();
+    public void RefreshNearby() => discovery?.Browse();
+
+    public Task<DirectPeer> PairNearby(DirectNearby device, Func<DirectPairRequest, CancellationToken, Task<bool>> approve,
+        CancellationToken token = default) => Save(DirectPairingClient.Nearby(Identity, name(), device, approve, token), token);
+
+    public Task<DirectPeer> PairQr(string link, CancellationToken token = default) =>
+        Save(DirectPairingClient.Scan(Identity, name(), DirectQr.Parse(link), token), token);
+
+    async Task<DirectPeer> Save(Task<DirectPeer> exchange, CancellationToken token)
+    {
+        var peer = await exchange.ConfigureAwait(false);
+        token.ThrowIfCancellationRequested();
+        Peers.Save(peer);
+        paired(peer);
+        return peer;
+    }
+
+    public DirectPeer[] LinkedDevices() => Peers.All();
+    public void Unlink(string id) => Peers.Remove(id);
+
+    internal async Task<DirectConnection> Connect(DirectPeer peer, CancellationToken token)
+    {
+        if (NearbyDevices().FirstOrDefault(p => p.Id == peer.Id) is { } nearby)
+        {
+            if (nearby.Port == peer.Port)
+                peer = peer with { Addresses = nearby.Addresses.Concat(peer.Addresses).Distinct().ToArray() };
+            else
+            {
+                try
+                {
+                    return await DirectTunnel.Connect(Identity, peer with
+                    {
+                        Addresses = nearby.Addresses, Port = nearby.Port,
+                    }, token).ConfigureAwait(false);
+                }
+                catch (Exception e) when (DirectWire.ConnectionError(e) && !token.IsCancellationRequested && peer.Addresses.Length > 0)
+                { /* The last paired endpoint may still be reachable. */ }
+            }
+        }
+        return await DirectTunnel.Connect(Identity, peer, token).ConfigureAwait(false);
+    }
+
+    public void Dispose()
+    {
+        discovery?.Dispose();
+        server.Dispose();
+        Identity.Dispose();
     }
 }

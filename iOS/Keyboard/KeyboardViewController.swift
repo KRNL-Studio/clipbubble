@@ -72,6 +72,7 @@ final class KeyboardModel: ObservableObject {
     private var viaApp = false
     private weak var keyboard: UIInputViewController?
     private var started = false
+    private var browser: DirectBrowser?
     private lazy var db = DB()
     /// A picture fetched from a computer by a tap goes on the clipboard as soon as it arrives.
     private var fetching: String?
@@ -104,6 +105,12 @@ final class KeyboardModel: ObservableObject {
         let was = viaApp
         viaApp = Date().timeIntervalSince1970 - Platform.defaults.double(forKey: "app.alive") < 10
         if was != viaApp || watching == nil { SyncEngine.shared.suspend(viaApp) }
+        if !viaApp && SyncEngine.enabledHosts.contains(where: DirectPeers.isDirect) {
+            if browser == nil { browser = Pairing.browseNearby() }
+        } else {
+            browser?.stop()
+            browser = nil
+        }
         if viaApp && watching == nil {
             watching = .scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in Task { @MainActor in self?.checkApp() } }
         } else if !viaApp {
@@ -114,6 +121,8 @@ final class KeyboardModel: ObservableObject {
     }
 
     func disappear() {
+        browser?.stop()
+        browser = nil
         fetching = nil
         watching?.invalidate()
         watching = nil
@@ -132,11 +141,17 @@ final class KeyboardModel: ObservableObject {
             return
         }
         #endif
-        let live = SyncEngine.shared.statuses.values.compactMap { s -> String? in if case .live(let h) = s { return h.name }; return nil }
-        linked = !SyncEngine.enabledHosts.isEmpty && (viaApp || !live.isEmpty)
-        status = SyncEngine.enabledHosts.isEmpty ? "No computers linked yet"
+        let hosts = SyncEngine.enabledHosts
+        let states = SyncEngine.shared.statuses
+        let live = hosts.compactMap { alias -> String? in
+            guard case .live(let h)? = states[alias] else { return nil }
+            return Pairing.displayName(for: alias, reportedName: h.name)
+        }
+        let firstStatus = hosts.compactMap { alias in states[alias]?.phoneText(for: alias) }.first
+        linked = !hosts.isEmpty && (viaApp || !live.isEmpty)
+        status = hosts.isEmpty ? "No computers linked yet"
             : viaApp ? "Synced by the ClipBubble app"
-            : !live.isEmpty ? live.joined(separator: ", ") : SyncEngine.shared.statuses.values.first?.phoneText ?? "Connecting…"
+            : !live.isEmpty ? live.joined(separator: ", ") : firstStatus ?? "Connecting…"
     }
 
     func tap(_ c: Clip) {

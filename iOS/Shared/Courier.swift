@@ -17,6 +17,8 @@ enum Courier {
             guard !Task.isCancelled else { return "Delivery stopped." }
             return hashes.isEmpty ? "Couldn't save that." : "Saved. Link a computer in ClipBubble to send it there."
         }
+        let discovery = SyncEngine.enabledHosts.contains(where: DirectPeers.isDirect) ? Pairing.browseNearby() : nil
+        defer { discovery?.stop() }
         engine.hold(true)
         defer { engine.hold(false) }
         engine.start()
@@ -35,13 +37,18 @@ enum Courier {
         }
         guard linked else {
             // Connecting or offline needs nothing from you; anything else (an untrusted host, a missing key) does.
-            switch engine.statuses.values.first(where: { !$0.ok }) {
-            case nil, .connecting?, .offline?: return "Saved. It goes to your computer next time ClipBubble connects."
-            case let s?: return "Saved. \(s.phoneText). It goes over once that's fixed."
+            if let (alias, state) = engine.statuses.first(where: { !$0.value.ok }) {
+                switch state {
+                case .connecting, .offline: break
+                default: return "Saved. \(state.phoneText(for: alias)). It goes over once that's fixed."
+                }
             }
+            return "Saved. It goes to your computer next time ClipBubble connects."
         }
-        let names = Array(Set(engine.statuses.values.compactMap { s -> String? in if case .live(let h) = s { return h.name }; return nil }))
-        status("Sending to \(names.joined(separator: ", "))…")
+        let peers = engine.linked
+        let names = Set(peers.map(\.name))
+        let destinations = Set(peers.map(Pairing.displayName(of:))).sorted().joined(separator: ", ")
+        status("Sending to \(destinations)…")
         // Each item and computer that confirmed it, so two of three photos arriving isn't reported as all of them.
         var got: Set<String> = []
         let (wasApplied, wasTransfers) = (engine.onApplied, engine.onTransfers)
@@ -63,10 +70,11 @@ enum Courier {
         _ = await until(seconds: timeout) { got.count >= names.count * hashes.count }
         guard !Task.isCancelled else { return "Delivery stopped." }
         // No answer yet doesn't mean it arrived: it's saved here and syncs again next time.
-        if got.isEmpty { return "Saved. Still waiting for \(names.joined(separator: ", ")) to confirm." }
-        let complete = names.filter { n in hashes.allSatisfy { got.contains($0 + "\n" + n) } }
-        if complete.count == names.count { return "On the clipboard of \(complete.sorted().joined(separator: ", "))." }
-        return "Saved. Some items are still on their way to \(names.joined(separator: ", "))."
+        if got.isEmpty { return "Saved. Still waiting for \(destinations) to confirm." }
+        if names.allSatisfy({ name in hashes.allSatisfy { got.contains($0 + "\n" + name) } }) {
+            return "On the clipboard of \(destinations)."
+        }
+        return "Saved. Some items are still on their way to \(destinations)."
     }
 
     private static func until(seconds: Double, _ cond: () -> Bool) async -> Bool {
@@ -87,6 +95,8 @@ enum Courier {
         guard !Task.isCancelled, !SyncEngine.paused else { return saved }
 
         let engine = SyncEngine.shared
+        let discovery = SyncEngine.enabledHosts.contains(where: DirectPeers.isDirect) ? Pairing.browseNearby() : nil
+        defer { discovery?.stop() }
         var applied: [String: Set<String>] = [:]
         let id = UUID()
         if receipts.isEmpty {
@@ -118,7 +128,8 @@ enum Courier {
             let names = Set(peers.map(\.name))
             if peers.count == names.count, !names.isEmpty,
                names.allSatisfy({ applied[$0] == hashes }) {
-                return "On the clipboard of \(names.sorted().joined(separator: ", "))."
+                let destinations = peers.map(Pairing.displayName(of:)).sorted().joined(separator: ", ")
+                return "On the clipboard of \(destinations)."
             }
             try? await Task.sleep(for: .milliseconds(100))
         }

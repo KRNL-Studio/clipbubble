@@ -6,12 +6,14 @@
   <key>CFBundleIdentifier</key><string>studio.krnl.clipbubble</string>
   <key>CFBundleExecutable</key><string>ClipBubble</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.7.0</string>
-  <key>CFBundleVersion</key><string>6</string>
+  <key>CFBundleShortVersionString</key><string>2.0.0</string>
+  <key>CFBundleVersion</key><string>7</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSUIElement</key><true/>
   <key>NSDownloadsFolderUsageDescription</key><string>ClipBubble adds new downloads to your clipboard history so they're one click away.</string>
   <key>NSDesktopFolderUsageDescription</key><string>ClipBubble watches your screenshots folder so new screenshots land on your clipboard.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>ClipBubble discovers and syncs with your nearby devices on this network.</string>
+  <key>NSBonjourServices</key><array><string>_clipbubble._tcp</string></array>
 </dict>
 </plist>

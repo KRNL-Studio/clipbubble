@@ -8,10 +8,11 @@ using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace ClipBubble;
 
-// Links this machine's history with ClipBubble elsewhere over SSH (docs/sync-protocol.md), like the Mac and Linux.
+// Links this machine's history using the same sync frames over Direct TLS and SSH.
 // Engine state is touched only on the engine thread, which runs posted actions in order. Each session has a reader
 // thread and a writer thread; writes put control frames ahead of file chunks.
 
@@ -94,7 +95,7 @@ sealed record LinkState(string Kind, string Arg = "", double At = 0)
 
 sealed class Engine
 {
-    public const string Version = "1.7.0";
+    public const string Version = "2.0.0";
     public static double Now => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
 
     /// Where files from other devices go: Downloads\ClipBubble\<device>. The app sets the real Downloads folder.
@@ -123,6 +124,8 @@ sealed class Engine
     public Action<Dictionary<string, Transfer>> Transfers = _ => { };
     public Dictionary<string, LinkState> Statuses { get; private set; } = new();
     public List<Hello> Linked { get; private set; } = new();
+    volatile DirectPairing? direct;
+    public DirectPairing? Direct => direct;
 
     public Engine(string? name = null)
     {
@@ -159,9 +162,57 @@ sealed class Engine
     public void Start()
     {
         Post(ServePipe);
+        Post(StartDirect);
         Post(ReconcileLinks);
         Post(WatchOtherWriters);
     }
+
+    void StartDirect()
+    {
+        if (Direct != null) return;
+        try
+        {
+            var service = new DirectPairing(Paths.Dir, Device, () => Name,
+                (peer, connection) => Post(() => Begin(DirectSession(peer, connection))),
+                peer => Post(() => EnableDirect(peer)));
+            service.Peers.Changed += () => Post(DirectTrustChanged);
+            direct = service;
+        }
+        catch (Exception e)
+        {
+            SyncLog.Write("Can't start Direct Sync: " + e.Message);
+        }
+    }
+
+    void EnableDirect(DirectPeer peer)
+    {
+        if (!Trusts(peer)) return;
+        var alias = peer.Alias();
+        if (!Hosts.Contains(alias)) Prefs.Set("sync.hosts", Hosts.Append(alias).ToArray());
+        ReconcileLinks();
+        if (links.TryGetValue(alias, out var link)) link.Redial();
+    }
+
+    void DirectTrustChanged()
+    {
+        foreach (var session in Sessions.Where(s => s.DirectPeer is { } peer && !Trusts(peer)).ToArray())
+            session.Close();
+        var hosts = Hosts;
+        if (Direct is { } direct)
+        {
+            var trusted = hosts.Where(h => !h.StartsWith(DirectPeers.Prefix, StringComparison.Ordinal) ||
+                direct.Peers.ById(h.Substring(DirectPeers.Prefix.Length)) != null).ToArray();
+            if (trusted.Length != hosts.Length) Prefs.Set("sync.hosts", trusted);
+        }
+        ReconcileLinks();
+    }
+
+    internal bool Trusts(DirectPeer peer) => Direct?.Peers.ById(peer.Id)?.Fingerprint == peer.Fingerprint;
+
+    internal Session DirectSession(DirectPeer peer, DirectConnection connection) => new(connection.Stream, connection.Stream, this)
+    {
+        DirectPeer = peer, Abort = connection.Abort, OnClose = connection.Dispose,
+    };
 
     /// Agents (ClipBubble.exe --mcp) write history from their own process. SQLite's data_version moves when another
     /// connection commits, so a once-a-second check costs nothing while nothing changes.
@@ -204,7 +255,11 @@ sealed class Engine
 
     internal void PublishStatus()
     {
-        Statuses = links.ToDictionary(p => p.Key, p => p.Value.State);
+        var statuses = links.ToDictionary(p => p.Key, p => p.Value.State);
+        foreach (var s in Sessions)
+            if (s.DirectPeer is { } peer && s.Peer is { } hello && statuses.ContainsKey(peer.Alias()))
+                statuses[peer.Alias()] = new LinkState("live", hello.Name);
+        Statuses = statuses;
         Linked = Sessions.Where(s => s.Peer != null).Select(s => s.Peer!).ToList();
         Status();
     }
@@ -303,9 +358,10 @@ sealed class Engine
 
     internal void Begin(Session s)
     {
-        if (Paused && s.Link == null) { s.Close(); return; }
+        if (Paused && s.Link == null || s.DirectPeer is { } peer && !Trusts(peer)) { s.Close(); return; }
         Sessions.Add(s);
-        s.Start(new Hello(SyncProto.Version, Device, Name, "windows", Version, Now), db.Stamps(includingWaiting: false));
+        var device = s.DirectPeer == null ? Device : Device.ToLowerInvariant();
+        s.Start(new Hello(SyncProto.Version, device, Name, "windows", Version, Now), db.Stamps(includingWaiting: false));
     }
 
     internal void Ended(Session s)
@@ -335,16 +391,17 @@ sealed class Engine
             s.Send(new Tombstone(st));
             return;
         }
-        if (db.ByHash(st.Hash) is not { } c || !db.Allowed(c.Kind.Name(), c.Source) || EntryFor(c) is not { } e) return;
+        if (db.ByHash(st.Hash) is not { } c || !db.Allowed(c.Kind.Name(), c.Source) || EntryFor(c, s) is not { } e) return;
         s.Known[st.Hash] = st;
         if (e.Blobs.Count > 0) s.Fetchable.Add(st.Hash);
         if (c.Origin.Length == 0 && Now - c.Time < 10) sentAt[st.Hash] = Now;
         s.Send(e);
     }
 
-    Entry? EntryFor(Clip c)
+    Entry? EntryFor(Clip c, Session s)
     {
         var origin = c.Origin.Length > 0 ? c.Origin : Device;
+        if (s.DirectPeer != null && origin == Device) origin = Device.ToLowerInvariant();
         var none = Array.Empty<Blob>();
         switch (c.Kind)
         {
@@ -377,6 +434,11 @@ sealed class Engine
 
     internal void Handle(Frame frame, Session s)
     {
+        if (s.DirectPeer is { } direct && (!Trusts(direct) || s.Peer == null && frame is not Hello))
+        {
+            s.Close();
+            return;
+        }
         switch (frame)
         {
             case Hello p:
@@ -387,12 +449,24 @@ sealed class Engine
                     s.Close();
                     return;
                 }
-                if (p.Device == Device) { s.Close(); return; }
-                if (Sessions.FirstOrDefault(o => o != s && o.Peer?.Device == p.Device) is { } old)
+                if (p.Device == Device || s.DirectPeer is { } pinned &&
+                    (!string.Equals(p.Device, pinned.Id, StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(p.Device, Device, StringComparison.OrdinalIgnoreCase)))
+                { s.Close(); return; }
+                if (Sessions.FirstOrDefault(o => o != s && o.Peer != null &&
+                    string.Equals(o.Peer.Device, p.Device, o.DirectPeer != null || s.DirectPeer != null
+                        ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal)) is { } old)
                 {
-                    // A device dialling in again has given up on its old link (an iPhone that slept): the new one replaces it.
-                    // Otherwise the two ends dialled each other, and the first link stays.
-                    if (old.Link != null || s.Link != null) { s.Close(); return; }
+                    if (old.DirectPeer != null && s.DirectPeer is { } paired)
+                    {
+                        // Both devices keep the connection dialled by the lower ID when dials cross.
+                        var preferOutgoing = string.CompareOrdinal(Device.ToLowerInvariant(), paired.Id) < 0;
+                        if ((old.Link != null) == preferOutgoing && (s.Link != null) != preferOutgoing ||
+                            old.Link != null && s.Link != null)
+                        { s.Close(); return; }
+                    }
+                    else if (old.Link != null || s.Link != null) { s.Close(); return; }
+                    // An incoming reconnect can replace a connection left behind by a sleeping peer.
                     old.Close();
                 }
                 s.Peer = p;
@@ -502,7 +576,8 @@ sealed class Engine
             default:
                 if (!db.Allowed(e.Kind, e.Source)) return;
                 var named = e.Kind == "file" ? e with { Text = string.Join("\n", e.Text.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries).Select(SafeFileName)) } : e;
-                db.Insert(named, e.Origin == Device ? "" : e.Origin);
+                var local = string.Equals(e.Origin, Device, s.DirectPeer == null ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase);
+                db.Insert(named, local ? "" : e.Origin);
                 isNew = true;
                 if (e.Kind == "text" && fresh && db.ByHash(e.Hash) is { } added) ApplyNow(added, s);
                 break;
@@ -671,6 +746,7 @@ sealed class HostLink(string alias, Engine engine)
 
     Process? proc;
     Session? session;
+    CancellationTokenSource? directDial;
     readonly StringBuilder stderr = new();
     double backoff = 1;
     Timer? timer;
@@ -688,7 +764,26 @@ sealed class HostLink(string alias, Engine engine)
 
     public void Connect()
     {
-        if (stopped || proc != null || alias.StartsWith("-")) return;
+        if (stopped || proc != null || session != null || directDial != null || alias.StartsWith("-")) return;
+        if (alias.StartsWith(DirectPeers.Prefix, StringComparison.Ordinal))
+        {
+            var id = alias.Substring(DirectPeers.Prefix.Length);
+            if (engine.Direct is not { } direct || direct.Peers.ById(id) is not { } peer)
+            {
+                Set(new LinkState("needs-key"));
+                return;
+            }
+            if (string.CompareOrdinal(engine.Device.ToLowerInvariant(), id) > 0 &&
+                engine.Sessions.Any(s => s.DirectPeer?.Id == id && s.Link == null && s.Peer != null))
+            {
+                Retry();
+                return;
+            }
+            Set(new LinkState("connecting"));
+            directDial = new CancellationTokenSource();
+            _ = ConnectDirect(direct, peer, directDial);
+            return;
+        }
         Set(new LinkState("connecting"));
         var args = new[] { "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2", "--", alias, IsWindows ? Windows : Posix };
         var info = new ProcessStartInfo(SshExe, string.Join(" ", args.Select(Quote)))
@@ -729,6 +824,33 @@ sealed class HostLink(string alias, Engine engine)
         engine.Begin(session);
     }
 
+    async Task ConnectDirect(DirectPairing direct, DirectPeer peer, CancellationTokenSource dial)
+    {
+        DirectConnection? connection = null;
+        LinkState? failure = null;
+        try { connection = await direct.Connect(peer, dial.Token).ConfigureAwait(false); }
+        catch (DirectException e) when (e.Kind != "offline") { failure = new LinkState(e.Kind); }
+        catch (Exception e) when (DirectWire.ConnectionError(e)) { }
+        engine.Post(() =>
+        {
+            directDial = null;
+            dial.Dispose();
+            if (stopped) { connection?.Dispose(); return; }
+            if (connection != null && engine.Trusts(peer))
+            {
+                session = engine.DirectSession(peer, connection);
+                session.Link = this;
+                engine.Begin(session);
+                return;
+            }
+            connection?.Dispose();
+            if (failure == null) failure = new LinkState("offline", At: Engine.Now + backoff);
+            if (!failure.Transient) backoff = Math.Max(backoff, 60);
+            Set(failure);
+            Retry();
+        });
+    }
+
     /// Windows command-line quoting, which ssh.exe parses back into the arguments above.
     static string Quote(string a)
     {
@@ -756,6 +878,13 @@ sealed class HostLink(string alias, Engine engine)
     {
         if (session != s) return;
         session = null;
+        if (s.DirectPeer != null)
+        {
+            if (stopped) return;
+            Set(Mismatch != null ? new LinkState("version", Mismatch) : new LinkState("offline", At: Engine.Now + backoff));
+            Retry();
+            return;
+        }
         Kill();
     }
 
@@ -802,7 +931,7 @@ sealed class HostLink(string alias, Engine engine)
 
     public void Redial()
     {
-        if (stopped || proc != null) return;
+        if (stopped || proc != null || session != null || directDial != null) return;
         timer?.Dispose();
         backoff = 1;
         Connect();
@@ -812,6 +941,7 @@ sealed class HostLink(string alias, Engine engine)
     {
         stopped = true;
         timer?.Dispose();
+        directDial?.Cancel();
         session?.Close();
         Kill();
     }
@@ -827,6 +957,7 @@ sealed class HostLink(string alias, Engine engine)
 sealed class Session(Stream input, Stream output, Engine engine)
 {
     internal HostLink? Link;
+    internal DirectPeer? DirectPeer;
     /// Wakes the reader on close: a pipe disconnects; an ssh pipe ends when its link stops ssh.
     internal Action? Abort;
     internal Action OnClose = () => { };

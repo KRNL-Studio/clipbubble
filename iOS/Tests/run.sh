@@ -4,8 +4,8 @@ root=${0:A:h:h:h}
 package="$root/iOS/.build/wave3-host"
 mkdir -p "$package/Sources"
 cp "$root/iOS/Tests/"*.swift "$package/Sources/"
-cp "$root/iOS/Shared/"{SSHChannelTransport,ShareOutbox,ShareSync,Courier}.swift "$package/Sources/"
-cp "$root/Sources/"{Link,Store,Sync}.swift "$package/Sources/"
+cp "$root/iOS/Shared/"{SSH,SSHChannelTransport,Pair,ShareOutbox,ShareSync,Courier}.swift "$package/Sources/"
+cp "$root/Sources/"{DirectPeers,Link,Store,Sync}.swift "$package/Sources/"
 # Keep dependency revisions aligned with the generated iOS project when available.
 resolved="$root/iOS/ClipBubble.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
 if [[ -f "$resolved" ]]; then cp "$resolved" "$package/Package.resolved"; fi

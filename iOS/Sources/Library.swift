@@ -24,12 +24,22 @@ enum Look: String, CaseIterable, Identifiable {
         }
     }
 
+    /// Behind the type's label, with `Brand.ink` text.
+    var pastel: Color {
+        switch self {
+        case .text: return Brand.cloud
+        case .link: return Brand.sky
+        case .image: return Brand.lavender
+        case .file: return Brand.peach
+        }
+    }
+
     var tint: Color {
         switch self {
-        case .text: return .gray
-        case .link: return .blue
-        case .image: return .purple
-        case .file: return .orange
+        case .text: return Color(hex: 0x7D8896)
+        case .link: return Brand.tint
+        case .image: return Color(hex: 0x8C70E8)
+        case .file: return Color(hex: 0xE38A52)
         }
     }
 }
@@ -91,10 +101,10 @@ struct LibraryView: View {
                             .clipMenu(c) { viewing = c }
                         }
                     } header: {
-                        Text(title(d.day)).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+                        Text(title(d.day)).font(.headline.weight(.bold)).fontDesign(.rounded)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.vertical, 6)
-                            .background(Color(.systemGroupedBackground))
+                            .padding(.vertical, 8)
+                            .background(Brand.background)
                     }
                 }
             }
@@ -103,7 +113,7 @@ struct LibraryView: View {
             .animation(.snappy, value: look)
             .animation(.snappy, value: from)
         }
-        .background(Color(.systemGroupedBackground))
+        .background(Brand.background)
         .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search everything")
         .navigationTitle("Library")
         .navigationBarTitleDisplayMode(.inline)
@@ -128,7 +138,7 @@ struct LibraryView: View {
             HStack(spacing: 8) {
                 chip("All", symbol: nil, count: all.count, on: look == nil) { withAnimation(.snappy) { look = nil } }
                 ForEach(Look.allCases) { l in
-                    chip(l.rawValue, symbol: l.symbol, count: all.filter { $0.look == l }.count, on: look == l) { withAnimation(.snappy) { look = look == l ? nil : l } }
+                    chip(l.rawValue, symbol: l.symbol, tint: l.tint, count: all.filter { $0.look == l }.count, on: look == l) { withAnimation(.snappy) { look = look == l ? nil : l } }
                 }
                 Menu {
                     Picker("From", selection: $from) {
@@ -138,10 +148,11 @@ struct LibraryView: View {
                     }
                 } label: {
                     Label(from.map { $0.isEmpty ? "This iPhone" : model.devices[$0] ?? "Device" } ?? "From", systemImage: "laptopcomputer.and.iphone")
-                        .font(.subheadline.weight(.medium))
-                        .padding(.horizontal, 12).padding(.vertical, 7)
-                        .background(from == nil ? Color(.secondarySystemGroupedBackground) : Color.accentColor, in: Capsule())
-                        .foregroundStyle(from == nil ? Color.primary : .white)
+                        .font(.subheadline.weight(.semibold))
+                        .padding(.horizontal, 13).padding(.vertical, 8)
+                        .background(from == nil ? AnyShapeStyle(Brand.card) : AnyShapeStyle(Brand.sky), in: Capsule())
+                        .overlay(Capsule().strokeBorder(Brand.hairline, lineWidth: from == nil ? 0.5 : 0))
+                        .foregroundStyle(from == nil ? Color.primary : Brand.ink)
                 }
             }
             .padding(.horizontal)
@@ -149,21 +160,21 @@ struct LibraryView: View {
         }
     }
 
-    private func chip(_ title: String, symbol: String?, count: Int, on: Bool, action: @escaping () -> Void) -> some View {
+    private func chip(_ title: String, symbol: String?, tint: Color = .primary, count: Int, on: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 5) {
-                if let symbol { Image(systemName: symbol) }
+                if let symbol { Image(systemName: symbol).foregroundStyle(on ? Brand.ink : tint) }
                 Text(title)
-                Text("\(count)").foregroundStyle(on ? .white.opacity(0.75) : .secondary)
+                Text("\(count)").foregroundStyle(on ? Brand.ink.opacity(0.6) : .secondary)
             }
-            .font(.subheadline.weight(.medium))
-            .padding(.horizontal, 12).padding(.vertical, 7)
+            .font(.subheadline.weight(.semibold))
+            .padding(.horizontal, 13).padding(.vertical, 8)
             .background {
                 // One highlight that slides to the chosen chip.
-                if on { Capsule().fill(Color.accentColor).matchedGeometryEffect(id: "chosen", in: chips) }
-                else { Capsule().fill(Color(.secondarySystemGroupedBackground)) }
+                if on { Capsule().fill(Brand.sky).matchedGeometryEffect(id: "chosen", in: chips) }
+                else { Capsule().fill(Brand.card).overlay(Capsule().strokeBorder(Brand.hairline, lineWidth: 0.5)) }
             }
-            .foregroundStyle(on ? .white : .primary)
+            .foregroundStyle(on ? Brand.ink : .primary)
         }
         .buttonStyle(Pressable())
     }
@@ -183,9 +194,10 @@ struct LibraryTile: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Color(.secondarySystemGroupedBackground).frame(height: 130)
+            Brand.card.frame(height: 140)
                 .overlay(alignment: .topLeading) { content }
-                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(Brand.hairline, lineWidth: 0.5))
             let footer = size.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 2)) : AnyLayout(HStackLayout(spacing: 4))
             footer {
                 HStack(spacing: 4) {
@@ -195,7 +207,8 @@ struct LibraryTile: View {
                 if !size.isAccessibilitySize { Spacer(minLength: 4) }
                 Text(clip.created, format: .dateTime.hour().minute())
             }
-            .font(.caption2).foregroundStyle(.secondary)
+            .font(.caption2.weight(.medium)).foregroundStyle(.secondary)
+            .padding(.horizontal, 4)
         }
         .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
@@ -215,9 +228,9 @@ struct LibraryTile: View {
             .padding(10).frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             Text(clip.text.trimmingCharacters(in: .whitespacesAndNewlines))
-                .font(.callout).lineLimit(6)
-                .foregroundStyle(clip.look == .link ? Color.blue : .primary)
-                .padding(10)
+                .font(.callout.weight(.medium)).lineLimit(6)
+                .foregroundStyle(clip.look == .link ? Brand.tint : .primary)
+                .padding(12)
         }
     }
 }

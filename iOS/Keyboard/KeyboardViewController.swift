@@ -137,7 +137,7 @@ final class KeyboardModel: ObservableObject {
         #if DEBUG
         if Platform.defaults.bool(forKey: "demo") || FileManager.default.fileExists(atPath: Paths.dir.appendingPathComponent(".demo").path) {
             linked = true
-            status = "MacBook Pro"
+            status = "MacBook Pro, Studio PC, Dev Workstation"
             return
         }
         #endif

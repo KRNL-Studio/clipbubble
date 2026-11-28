@@ -97,7 +97,7 @@ struct ClipDetail: View {
                                        description: Text("This item is no longer in your ClipBubble history."))
             }
         }
-        .background(Color(.systemGroupedBackground))
+        .background(Brand.background)
         .navigationTitle(item.look.name)
         .navigationBarTitleDisplayMode(.inline)
         .toast(model.line)
@@ -137,9 +137,9 @@ struct ClipDetail: View {
         .safeAreaInset(edge: .bottom) {
             Button { model.copy(clip) } label: {
                 Label(clip.remote ? "Get from \(device)" : "Copy", systemImage: clip.remote ? "icloud.and.arrow.down" : "doc.on.doc")
-                    .font(.body.weight(.semibold)).frame(maxWidth: .infinity, minHeight: 30)
+                    .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.borderedProminent).buttonBorderShape(.capsule).controlSize(.large)
+            .buttonStyle(GlowButton())
             .padding(.horizontal).padding(.bottom, 8)
         }
     }
@@ -322,7 +322,7 @@ struct TransferRow: View {
                     Text(transfer.fraction, format: .percent.precision(.fractionLength(0))).monospacedDigit().foregroundStyle(.secondary)
                 }
                 .font(.subheadline)
-                ProgressView(value: transfer.fraction)
+                ProgressView(value: transfer.fraction).tint(Brand.tint)
             }
             .accessibilityElement(children: .combine)
             Button("Cancel") { SyncEngine.shared.cancelTransfer(hash) }.buttonStyle(.borderless).font(.subheadline)
@@ -333,6 +333,7 @@ struct TransferRow: View {
 private extension View {
     func card(padding: CGFloat = 16) -> some View {
         self.padding(padding)
-            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .background(Brand.card, in: RoundedRectangle(cornerRadius: Brand.radius, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: Brand.radius, style: .continuous).strokeBorder(Brand.hairline, lineWidth: 0.5))
     }
 }

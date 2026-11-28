@@ -110,6 +110,19 @@ struct DiscoveredPeer: Equatable, Identifiable {
     }
 }
 
+#if DEBUG
+extension DiscoveredPeer {
+    /// App Store screenshots only: a computer listed under Nearby Computers that isn't on the network.
+    init(demo name: String, os: String) {
+        id = "demo-\(name.lowercased().replacingOccurrences(of: " ", with: "-"))"
+        self.name = name
+        self.os = os
+        fingerprintPrefix = String(repeating: "0", count: 16)
+        endpoint = .hostPort(host: "127.0.0.1", port: 9)
+    }
+}
+#endif
+
 final class DirectBrowser {
     static let serviceType = "_clipbubble._tcp"
     private static let lock = NSLock()

@@ -6,7 +6,7 @@ Paste these into App Store Connect.
 
 **Subtitle:** Clipboard history and sync
 
-**Promotional text:** Copy on your computer, paste on your iPhone, and back. Link a nearby computer with a matching code and sync directly, with no account, no cloud and no subscription.
+**Promotional text:** Copy on your Mac, Windows PC or Linux computer, paste on your iPhone, and back. Link with a matching code and sync directly. No account, no cloud, no subscription.
 
 **Keywords:** clipboard,history,copy,paste,sync,keyboard,snippets,mac,windows,linux,transfer,share,text,nearby,pc
 
@@ -46,7 +46,7 @@ Without a computer:
 
 1. Tap Not now on Welcome.
 2. Tap Add, then Text, and add a note. It appears in Recent and Library.
-3. Tap it to copy, or tap the info button in Recent to inspect it. Touch and hold for more actions.
+3. Tap it to copy, or tap its ••• button in Recent to inspect it. Touch and hold for more actions.
 4. In Safari, share a page to ClipBubble.
 5. In Settings, go to General, Keyboard, Keyboards, Add New Keyboard, ClipBubble. Turn on Allow Full Access for ClipBubble to see your history. In Notes, switch to ClipBubble and tap the saved note to type it.
 
@@ -57,4 +57,4 @@ Local Network is used to find nearby computers and sync with linked computers. F
 ## Still to make
 
 - A sync video recorded on a real iPhone and computer: linking, the Local Network prompt, a copy each way, Share and the keyboard.
-- All seven 6.9-inch screenshots (`1-mac-to-iphone.png` through `7-private.png`) are in `iOS/AppStore/screenshots/`. Edit `iOS/AppStore/design/index.html` and run `iOS/AppStore/design/render.sh` to regenerate them.
+- All seven 6.9-inch screenshots (`1-any-computer.png` through `7-private.png`) are in `iOS/AppStore/screenshots/`. Edit `iOS/AppStore/design/index.html` and run `iOS/AppStore/design/render.sh` to regenerate them.

@@ -21,7 +21,7 @@ final class ShareViewController: UIViewController {
         #if DEBUG
         if Platform.defaults.bool(forKey: "demo") || FileManager.default.fileExists(atPath: Paths.dir.appendingPathComponent(".demo").path) {
             state.saved = true
-            state.text = "On the clipboard of MacBook Pro."
+            state.text = "On the clipboard of Studio PC."
             state.done = true
             return
         }

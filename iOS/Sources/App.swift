@@ -10,9 +10,12 @@ struct ClipBubbleApp: App {
     @AppStorage("appearance") private var appearance = Appearance.system
     @Environment(\.scenePhase) private var phase
 
+    init() { Brand.styleBars() }
+
     var body: some Scene {
         WindowGroup {
             HistoryView().environmentObject(model)
+                .tint(Brand.tint)
                 .onOpenURL { model.open($0) }
                 // Set on the window, not with preferredColorScheme, which leaves sheets behind and doesn't switch back to System.
                 .onChange(of: appearance, initial: true) {
@@ -120,17 +123,25 @@ final class Model: ObservableObject {
     private var confirmingLink = false
     private var inForeground = false
     private var browser: DirectBrowser?
+    private var demo = false
     private let db = DB()
     private var toastTask: Task<Void, Never>?
     private var shareObserver: NSObjectProtocol?
 
     init() {
         #if DEBUG
-        // `-demo YES` (debug builds only): a linked MacBook Pro without a computer, for App Store screenshots.
+        // `-demo YES` (debug builds only): a linked Mac, Windows PC and Linux computer, and more nearby, without any
+        // computers, for App Store screenshots.
         if UserDefaults.standard.bool(forKey: "demo") {
-            let mac = "you@macbook-pro.local"
-            hosts = [mac]
-            statuses = [mac: .live(Hello(proto: 1, device: "demo-mac", name: "MacBook Pro", os: "macos", version: "1.6.2", clock: 0))]
+            let linked = [("you@macbook-pro.local", "MacBook Pro", "macos"), ("you@studio-pc", "Studio PC", "windows"),
+                          ("you@dev-workstation", "Dev Workstation", "linux")]
+            hosts = linked.map(\.0)
+            statuses = Dictionary(uniqueKeysWithValues: linked.map { alias, name, os in
+                (alias, LinkState.live(Hello(proto: 1, device: "demo-\(os)", name: name, os: os, version: "2.0.0", clock: 0)))
+            })
+            nearby = [DiscoveredPeer(demo: "Gaming PC", os: "windows"), DiscoveredPeer(demo: "MacBook Air", os: "macos"),
+                      DiscoveredPeer(demo: "Home Server", os: "linux")]
+            demo = true
             reload()
             return
         }
@@ -173,7 +184,7 @@ final class Model: ObservableObject {
     }
 
     private func updateDiscovery() {
-        if inForeground && (showingLinkSheet || !DirectPeers.all.isEmpty) {
+        if inForeground && !demo && (showingLinkSheet || !DirectPeers.all.isEmpty) {
             if browser == nil { browser = Pairing.browseNearby { [weak self] in self?.nearby = $0 } }
         } else {
             browser?.stop()
@@ -195,6 +206,13 @@ final class Model: ObservableObject {
         clips = db.clips(query: query.isEmpty ? nil : query, preview: true)
         devices = db.deviceNames()
         revision += 1
+    }
+
+    /// The operating system of the device an item came from: "ios" for this iPhone, nil when unknown.
+    func os(of origin: String) -> String? {
+        guard !origin.isEmpty else { return "ios" }
+        for case .live(let h) in statuses.values where h.device == origin || h.name == devices[origin] { return h.os }
+        return DirectPeers.peer(id: origin)?.os
     }
 
     /// Everything kept, for the Library.
@@ -488,56 +506,63 @@ struct HistoryView: View {
 
     private var recent: some View {
         List {
-            if model.hosts.isEmpty {
-                Section {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Image(systemName: "laptopcomputer.and.iphone").font(.title).foregroundStyle(.tint).accessibilityHidden(true)
-                        Text("Copy on your iPhone, paste on your computer, and back.").font(.headline)
-                        Text("Open ClipBubble on a nearby Mac, Windows or Linux computer, then select it to sync what you copy.")
-                            .font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                        Button { model.showingLinkSheet = true } label: { Text("Link a computer").font(.body.weight(.semibold)).padding(.horizontal, 6) }
-                            .buttonStyle(.borderedProminent).buttonBorderShape(.capsule).padding(.top, 4)
-                    }
-                    .padding(.vertical, 8)
+            Group {
+                if model.hosts.isEmpty {
+                    LinkHero { model.showingLinkSheet = true }
+                } else {
+                    Computers(hosts: model.hosts, statuses: model.statuses) { model.showingLinkSheet = true }
                 }
-            } else {
-                Section {
-                    ForEach(model.hosts, id: \.self) { h in HostRow(alias: h, state: model.statuses[h]) }
+                if !model.transfers.isEmpty {
+                    // A first link can queue hundreds, which would push the history off the screen.
+                    let moving = model.transfers.sorted { ($0.value.fraction, $0.key) > ($1.value.fraction, $1.key) }
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForEach(moving.prefix(3), id: \.key) { TransferRow(hash: $0.key, transfer: $0.value) }
+                        if moving.count > 3 {
+                            Text("and \(moving.count - 3) more").font(.subheadline).foregroundStyle(.secondary)
+                        }
+                    }
+                    .brandCard()
+                }
+                if !model.clips.isEmpty {
+                    Text("Recent").font(.title3.weight(.bold)).fontDesign(.rounded)
+                        .padding(.top, 6).padding(.leading, 4)
+                        .accessibilityAddTraits(.isHeader)
                 }
             }
-            if !model.transfers.isEmpty {
-                // A first link can queue hundreds, which would push the history off the screen.
-                let moving = model.transfers.sorted { ($0.value.fraction, $0.key) > ($1.value.fraction, $1.key) }
-                Section {
-                    ForEach(moving.prefix(3), id: \.key) { TransferRow(hash: $0.key, transfer: $0.value) }
-                    if moving.count > 3 {
-                        Text("and \(moving.count - 3) more").font(.subheadline).foregroundStyle(.secondary)
+            .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
+            ForEach(model.clips, id: \.hash) { c in
+                ZStack(alignment: .topTrailing) {
+                    Button { model.copy(c) } label: {
+                        ClipRow(clip: c, device: model.devices[c.origin], os: model.os(of: c.origin))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
                     }
-                }
-            }
-            Section {
-                ForEach(model.clips, id: \.hash) { c in
-                    HStack(spacing: 0) {
-                        Button { model.copy(c) } label: {
-                            ClipRow(clip: c, device: model.devices[c.origin])
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        Button { viewing = c } label: {
-                            Image(systemName: "info.circle").frame(width: 44, height: 44)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.borderless)
-                        .accessibilityLabel("Item details")
+                    .buttonStyle(.plain)
+                    Button { viewing = c } label: {
+                        Image(systemName: "ellipsis")
+                            .font(.footnote.weight(.bold)).foregroundStyle(.secondary)
+                            .frame(width: 30, height: 30).background(.thinMaterial, in: Circle())
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
                     }
-                    .swipeActions { Button("Delete", role: .destructive) { model.delete(c) } }
-                    .clipMenu(c) { viewing = c }
+                    .buttonStyle(.borderless)
+                    .padding(-7)
+                    .accessibilityLabel("Item details")
                 }
-            } header: {
-                if !model.clips.isEmpty { Text("Recent") }
+                .brandCard(padding: 14)
+                .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: Brand.radius, style: .continuous))
+                .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
+                .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
+                .swipeActions { Button("Delete", role: .destructive) { model.delete(c) } }
+                .clipMenu(c) { viewing = c }
             }
         }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .background(Brand.background)
         .animation(.snappy, value: model.clips.map(\.hash))
         .overlay {
             // Before anything is linked, the card above already says what to do.
@@ -557,10 +582,19 @@ struct HistoryView: View {
         .searchable(text: $model.query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search history")
         .refreshable { model.redialAll() }
         .navigationTitle("ClipBubble")
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                HStack(spacing: 6) {
+                    Mascot(size: 26)
+                    Text("ClipBubble").font(.system(.title3, design: .rounded).weight(.heavy))
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityAddTraits(.isHeader)
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 PasteButton(supportedContentTypes: [.image, .fileURL, .url, .plainText, .data]) { model.paste($0) }
-                    .labelStyle(.iconOnly).buttonBorderShape(.capsule).controlSize(.small)
+                    .labelStyle(.iconOnly).buttonBorderShape(.capsule).controlSize(.small).tint(Brand.tint)
                     .accessibilityLabel("Paste into ClipBubble")
             }
         }
@@ -576,40 +610,53 @@ struct Welcome: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 28) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Image(systemName: "laptopcomputer.and.iphone").font(.system(size: 44)).foregroundStyle(.tint).accessibilityHidden(true)
-                    Text("Welcome to ClipBubble").font(.largeTitle.bold())
-                    Text("Copy on your iPhone, paste on your computer, and back.").font(.title3).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 26) {
+                VStack(alignment: .leading, spacing: 14) {
+                    Mascot(size: 84)
+                    Text("Welcome to\nClipBubble").font(.system(.largeTitle, design: .rounded).weight(.heavy))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("Copy on your iPhone, paste on your computer, and back. Mac, Windows and Linux.")
+                        .font(.title3.weight(.medium)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                point("desktopcomputer", "Get ClipBubble for your computer",
-                      "It's free for Mac, Windows and Linux at clipbubble.krnl.studio, and keeps 7 days of what you copy.")
-                point("laptopcomputer.and.iphone", "Link a nearby computer",
-                      "Open ClipBubble on your computer, then select it on your iPhone and confirm the matching code.")
-                point("keyboard", "Reuse your history", "Save items from the share sheet, or use the ClipBubble keyboard to type text in supported fields and copy images and files for pasting.")
+                VStack(spacing: 12) {
+                    point("arrow.down.circle.fill", Brand.sky, "Get ClipBubble for your computer",
+                          "It's free for Mac, Windows and Linux at clipbubble.krnl.studio, and keeps 7 days of what you copy.")
+                    point("link.circle.fill", Brand.lavender, "Link a nearby computer",
+                          "Open ClipBubble on your computer, then select it on your iPhone and confirm the matching code.")
+                    point("keyboard.fill", Brand.peach, "Reuse your history", "Save items from the share sheet, or use the ClipBubble keyboard to type text in supported fields and copy images and files for pasting.")
+                }
             }
-            .padding(28).padding(.top, 20)
+            .padding(24).padding(.top, 24)
         }
+        .background(alignment: .top) {
+            Circle().fill(Brand.sky.opacity(0.35)).frame(width: 420).blur(radius: 90).offset(x: 140, y: -200)
+                .accessibilityHidden(true)
+        }
+        .background(Brand.background)
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 10) {
-                Button { link(); dismiss() } label: { Text("Link a computer").font(.body.weight(.semibold)).frame(maxWidth: .infinity, minHeight: 30) }
-                    .buttonStyle(.borderedProminent).buttonBorderShape(.capsule).controlSize(.large)
-                Button("Not now") { dismiss() }.font(.body.weight(.medium))
+                Button { link(); dismiss() } label: { Text("Link a computer").frame(maxWidth: .infinity) }
+                    .buttonStyle(GlowButton())
+                Button("Not now") { dismiss() }.font(.body.weight(.semibold)).foregroundStyle(.secondary)
+                    .frame(minHeight: 44)
             }
-            .padding(.horizontal, 28).padding(.bottom, 12)
-            .background(.background)
+            .padding(.horizontal, 24).padding(.top, 12).padding(.bottom, 4)
+            .background(Brand.background)
         }
         .interactiveDismissDisabled()
     }
 
-    private func point(_ symbol: String, _ title: String, _ detail: String) -> some View {
-        HStack(alignment: .top, spacing: 16) {
-            Image(systemName: symbol).font(.title2).foregroundStyle(.tint).frame(width: 36).accessibilityHidden(true)
+    private func point(_ symbol: String, _ color: Color, _ title: String, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            IconTile(symbol: symbol, color: color, size: 40, filled: true)
             VStack(alignment: .leading, spacing: 4) {
-                Text(title).font(.headline)
+                Text(title).font(.headline).fontDesign(.rounded)
                 Text(detail).font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
+            Spacer(minLength: 0)
         }
+        .brandCard()
         .accessibilityElement(children: .combine)
     }
 }
@@ -623,17 +670,17 @@ struct AddPanel: View {
 
     var body: some View {
         VStack(spacing: 18) {
-            Text("Add to ClipBubble").font(.headline)
+            Text("Add to ClipBubble").font(.headline).fontDesign(.rounded)
             // The system Paste button reads the clipboard without the "Allow Paste" prompt.
             PasteButton(supportedContentTypes: [.image, .fileURL, .url, .plainText, .data]) { p in
                 paste(p)
                 Task { @MainActor in dismiss() }
             }
-            .labelStyle(.titleAndIcon).buttonBorderShape(.capsule).controlSize(.extraLarge)
+            .labelStyle(.titleAndIcon).buttonBorderShape(.capsule).controlSize(.extraLarge).tint(Brand.tint)
             (size.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 12)) : AnyLayout(HStackLayout(spacing: 12))) {
-                option("Text", "text.cursor", .text)
-                option("Photos", "photo.on.rectangle", .photos)
-                option("Files", "folder", .files)
+                option("Text", "text.cursor", Brand.sky, .text)
+                option("Photos", "photo.on.rectangle", Brand.lavender, .photos)
+                option("Files", "folder.fill", Brand.peach, .files)
             }
         }
         .padding(.horizontal, 20)
@@ -641,16 +688,18 @@ struct AddPanel: View {
         .frame(maxHeight: .infinity, alignment: .top)
         .presentationDetents(size.isAccessibilitySize ? [.large] : [.height(270)])
         .presentationCornerRadius(32)
+        .presentationBackground(Brand.background)
     }
 
-    private func option(_ title: String, _ symbol: String, _ a: HistoryView.Adding) -> some View {
+    private func option(_ title: String, _ symbol: String, _ color: Color, _ a: HistoryView.Adding) -> some View {
         Button { pick(a) } label: {
-            VStack(spacing: 8) {
-                Image(systemName: symbol).font(.title2)
-                Text(title).font(.subheadline.weight(.medium))
+            VStack(spacing: 10) {
+                IconTile(symbol: symbol, color: color, size: 40, filled: true)
+                Text(title).font(.subheadline.weight(.semibold)).fontDesign(.rounded).foregroundStyle(.primary)
             }
-            .frame(maxWidth: .infinity, minHeight: 92)
-            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .frame(maxWidth: .infinity, minHeight: 100)
+            .background(Brand.card, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).strokeBorder(Brand.hairline, lineWidth: 0.5))
         }
         .buttonStyle(Pressable())
     }
@@ -675,15 +724,17 @@ extension View {
                     Text(line.text)
                 } icon: {
                     switch line.look {
-                    case .done: Image(systemName: "checkmark.circle.fill")
-                    case .failed: Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange)
-                    case .busy: ProgressView().controlSize(.small)
+                    case .done: Image(systemName: "checkmark.circle.fill").foregroundStyle(Brand.sky)
+                    case .failed: Image(systemName: "exclamationmark.circle.fill").foregroundStyle(Brand.peach)
+                    case .busy: ProgressView().controlSize(.small).tint(.white)
                     }
                 }
-                .font(.subheadline.weight(.medium))
-                    .padding(.horizontal, 16).padding(.vertical, 10)
-                    .background(.regularMaterial, in: Capsule())
-                    .shadow(color: .black.opacity(0.12), radius: 12, y: 4)
+                .font(.subheadline.weight(.semibold)).fontDesign(.rounded)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 18).padding(.vertical, 11)
+                    .background(Brand.ink.opacity(0.94), in: Capsule())
+                    .overlay(Capsule().strokeBorder(.white.opacity(0.08)))
+                    .shadow(color: .black.opacity(0.22), radius: 16, y: 6)
                     .padding(.bottom, 8)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
@@ -710,6 +761,8 @@ struct TextComposer: View {
             TextEditor(text: $text)
                 .focused($focused)
                 .padding(.horizontal, 12)
+                .scrollContentBackground(.hidden)
+                .background(Brand.background)
                 .navigationTitle("New text")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
@@ -752,13 +805,135 @@ struct PickedFile: Transferable {
     }
 }
 
+/// Before anything is linked: what ClipBubble does and the one thing to do next.
+struct LinkHero: View {
+    let link: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top) {
+                Mascot(size: 40)
+                    .frame(width: 58, height: 58)
+                    .background(.white.opacity(0.7), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                Spacer()
+                HStack(spacing: 6) {
+                    ForEach(["macos", "windows", "linux"], id: \.self) { os in
+                        Image(systemName: ComputerOS.symbol(os)).font(.footnote.weight(.semibold))
+                            .frame(width: 32, height: 32).background(.white.opacity(0.55), in: Circle())
+                    }
+                }
+                .foregroundStyle(Brand.ink).accessibilityHidden(true)
+            }
+            Text("Copy on any computer.\nPaste on your iPhone.").font(.title2.weight(.heavy)).fontDesign(.rounded)
+                .foregroundStyle(Brand.ink).fixedSize(horizontal: false, vertical: true)
+            Text("Open ClipBubble on a nearby Mac, Windows or Linux computer, then link it to sync what you copy, both ways.")
+                .font(.subheadline.weight(.medium)).foregroundStyle(Brand.ink.opacity(0.72))
+                .fixedSize(horizontal: false, vertical: true)
+            Button(action: link) {
+                Label("Link a computer", systemImage: "plus").font(.body.weight(.bold)).fontDesign(.rounded)
+                    .foregroundStyle(.white).padding(.horizontal, 20).padding(.vertical, 12)
+                    .background(Brand.ink, in: Capsule())
+            }
+            .buttonStyle(Pressable())
+            .padding(.top, 2)
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Brand.gradient, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .shadow(color: Brand.sky.opacity(0.35), radius: 20, y: 10)
+        .padding(.vertical, 4)
+    }
+}
+
+/// Linked computers as a row of cards you can scroll sideways, with a card to link another.
+struct Computers: View {
+    let hosts: [String]
+    let statuses: [String: LinkState]
+    let link: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Circle().fill(live > 0 ? Color.green : .orange).frame(width: 7, height: 7)
+                Text(live == hosts.count ? (live == 1 ? "Syncing with 1 computer" : "Syncing with \(live) computers")
+                     : "\(live) of \(hosts.count) computers online")
+                    .font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+            }
+            .padding(.leading, 4)
+            .accessibilityElement(children: .combine)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(hosts, id: \.self) { h in HostCard(row: HostRow(alias: h, state: statuses[h])) }
+                    Button(action: link) {
+                        VStack(spacing: 8) {
+                            Image(systemName: "plus").font(.title3.weight(.bold)).foregroundStyle(Brand.ink)
+                                .frame(width: 40, height: 40).background(Brand.sky, in: Circle())
+                            Text("Link").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                        }
+                        .frame(width: 78, height: 112)
+                        .background(Brand.card, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .strokeBorder(Brand.sky, style: StrokeStyle(lineWidth: 1.2, dash: [5, 4])))
+                    }
+                    .buttonStyle(Pressable())
+                    .accessibilityLabel("Link a computer")
+                }
+                .padding(.horizontal, 16).padding(.vertical, 2)
+            }
+            .padding(.horizontal, -16)
+        }
+    }
+
+    private var live: Int { hosts.filter { statuses[$0]?.ok == true }.count }
+}
+
+struct HostCard: View {
+    let row: HostRow
+
+    var body: some View {
+        let ok = row.state?.ok == true
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .top) {
+                Image(systemName: row.icon).font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(Brand.ink)
+                    .frame(width: 40, height: 40)
+                    .background(ok ? Brand.sky : Brand.butter, in: Circle())
+                Spacer()
+                Circle().fill(ok ? Color.green : .orange).frame(width: 8, height: 8)
+                    .overlay(Circle().stroke((ok ? Color.green : .orange).opacity(0.3), lineWidth: 4))
+                    .padding(6)
+            }
+            Spacer(minLength: 10)
+            Text(row.name).font(.subheadline.weight(.bold)).fontDesign(.rounded).lineLimit(1)
+            Group {
+                if row.stuck {
+                    Button("Retry") { SyncEngine.shared.redial(row.alias) }.font(.caption.weight(.semibold))
+                } else if case .offline? = row.state {
+                    TimelineView(.periodic(from: .now, by: 1)) { _ in Text(row.subtitle) }
+                } else {
+                    Text(row.subtitle)
+                }
+            }
+            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+        }
+        .padding(12)
+        .frame(width: 148, height: 112)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).strokeBorder(Brand.hairline, lineWidth: 0.5))
+        .accessibilityElement(children: .combine)
+        .onChange(of: row.state) {
+            if !DirectPeers.isDirect(row.alias), case .live(let h) = row.state { HostRow.remember(h.name, for: row.alias) }
+        }
+    }
+}
+
 struct HostRow: View {
     let alias: String
     let state: LinkState?
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: "laptopcomputer").font(.title3).foregroundStyle(.secondary).frame(minWidth: 32).accessibilityHidden(true)
+            IconTile(symbol: icon, color: state?.ok == true ? Brand.sky : Brand.butter, size: 36, filled: true)
             VStack(alignment: .leading, spacing: 2) {
                 Text(name).font(.subheadline.weight(.semibold))
                 Group {
@@ -781,19 +956,27 @@ struct HostRow: View {
         }
     }
 
-    private var subtitle: String {
+    /// A laptop for a Mac, a PC for Windows and a desktop for Linux, as in Nearby Computers.
+    var icon: String {
+        var os: String?
+        if case .live(let h) = state { os = h.os }
+        if os == nil, DirectPeers.isDirect(alias) { os = DirectPeers.deviceId(from: alias).flatMap { DirectPeers.peer(id: $0) }?.os }
+        return ComputerOS.symbol(os)
+    }
+
+    var subtitle: String {
         if case .live? = state { return "Linked" }
         return state?.phoneText(for: alias) ?? "Connecting…"
     }
 
-    private var stuck: Bool {
+    var stuck: Bool {
         switch state {
         case nil, .connecting?, .live?: return false
         default: return true
         }
     }
 
-    private var name: String {
+    var name: String {
         if case .live(let h) = state { return Pairing.displayName(for: alias, reportedName: h.name) }
         return Pairing.displayName(for: alias)
     }
@@ -805,37 +988,57 @@ struct HostRow: View {
 struct ClipRow: View {
     let clip: Clip
     let device: String?
+    var os: String?
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: icon)
-                .font(.system(size: 14, weight: .semibold)).foregroundStyle(color)
-                .frame(width: 30, height: 30).background(color.opacity(0.15), in: RoundedRectangle(cornerRadius: 8))
-            VStack(alignment: .leading, spacing: 6) {
-                if let p = clip.imagePath, !clip.remote {
-                    // The frame sets the size and the image fills it, so a wide screenshot can't push the row out.
-                    Color.clear.frame(height: 150).frame(maxWidth: .infinity)
-                        .overlay { Thumb(p, pixels: 900).scaledToFill() }
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
-                } else {
-                    Text(clip.kind == "file" ? clip.paths.map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
-                         : clip.kind == "image" ? "Image" : clip.text.trimmingCharacters(in: .whitespacesAndNewlines))
-                        .font(.body).lineLimit(3)
+        VStack(alignment: .leading, spacing: 10) {
+            if let p = clip.imagePath, !clip.remote {
+                // The frame sets the size and the image fills it, so a wide screenshot can't push the row out.
+                Color.clear.frame(height: 170).frame(maxWidth: .infinity)
+                    .overlay { Thumb(p, pixels: 900).scaledToFill() }
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            } else {
+                Text(clip.kind == "file" ? clip.paths.map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
+                     : clip.kind == "image" ? "Image" : clip.text.trimmingCharacters(in: .whitespacesAndNewlines))
+                    .font(clip.look == .text && looksLikeCode ? .callout.monospaced() : .body.weight(.medium))
+                    .foregroundStyle(clip.look == .link ? Brand.tint : .primary)
+                    .lineLimit(3)
+                    .padding(.trailing, 30)
+            }
+            HStack(spacing: 6) {
+                HStack(spacing: 4) {
+                    Image(systemName: icon)
+                    Text(clip.remote ? "On computer" : clip.look.name)
                 }
-                Text([device ?? clip.source, clip.created.formatted(.relative(presentation: .named, unitsStyle: .abbreviated))]
-                        .filter { !$0.isEmpty }.joined(separator: " · "))
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption.weight(.semibold)).foregroundStyle(Brand.ink)
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(pastel, in: Capsule())
+                if let from = device ?? (clip.source.isEmpty ? nil : clip.source) {
+                    HStack(spacing: 4) {
+                        if let os, os != "ios" { Image(systemName: ComputerOS.symbol(os)) }
+                        Text(from).lineLimit(1)
+                    }
+                    .font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 4)
+                Text(clip.created.formatted(.relative(presentation: .named, unitsStyle: .abbreviated)))
+                    .font(.caption).foregroundStyle(.tertiary).lineLimit(1)
             }
         }
-        .padding(.vertical, 4)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(clip.spoken)
         .accessibilityValue([device ?? clip.source, clip.created.formatted(.relative(presentation: .named))].filter { !$0.isEmpty }.joined(separator: ", "))
         .accessibilityHint(clip.remote ? "Gets it from the computer" : "Copies it")
     }
 
+    /// Commands and code read better in a fixed-width font.
+    private var looksLikeCode: Bool {
+        let t = clip.text.prefix(200)
+        return ["git ", "npm ", "cd ", "ssh ", "sudo ", "brew ", "$ ", "{", "func ", "let ", "const ", "import "].contains { t.hasPrefix($0) }
+    }
+
     private var icon: String { clip.remote ? "icloud.and.arrow.down" : clip.look.symbol }
-    private var color: Color { clip.remote ? .teal : clip.look.tint }
+    private var pastel: Color { clip.remote ? Brand.mint : clip.look.pastel }
 }
 
 struct SettingsView: View {
@@ -847,6 +1050,24 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    HStack(spacing: 14) {
+                        Mascot(size: 40)
+                            .frame(width: 60, height: 60)
+                            .background(.white.opacity(0.7), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("ClipBubble").font(.title3.weight(.heavy)).fontDesign(.rounded).foregroundStyle(Brand.ink)
+                            Text(model.hosts.isEmpty ? "No computers linked yet"
+                                 : model.hosts.count == 1 ? "Syncing with 1 computer" : "Syncing with \(model.hosts.count) computers")
+                                .font(.subheadline.weight(.medium)).foregroundStyle(Brand.ink.opacity(0.7))
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.vertical, 6)
+                    .accessibilityElement(children: .combine)
+                }
+                .listRowBackground(Brand.gradient)
+
                 // What's linked comes first: it's what you check most often.
                 if !model.hosts.isEmpty {
                     Section {
@@ -855,22 +1076,28 @@ struct SettingsView: View {
                     } header: { Text("Computers") } footer: {
                         Text("Swipe left on a computer to remove it.")
                     }
+                    .listRowBackground(Brand.card)
                 }
 
                 Section {
                     Button { model.showingLinkSheet = true } label: {
-                        Label("Link a computer", systemImage: "laptopcomputer.and.iphone")
+                        Label { Text("Link a computer").foregroundStyle(.primary) } icon: { IconTile(symbol: "plus", color: Brand.sky, filled: true) }
                     }
                 } footer: {
-                    Text("Link a nearby computer running ClipBubble. Get the free app at clipbubble.krnl.studio.")
+                    Text("Link a nearby Mac, Windows or Linux computer running ClipBubble. Get the free app at clipbubble.krnl.studio.")
                 }
+                .listRowBackground(Brand.card)
 
                 Section {
-                    Text("In the Settings app: General → Keyboard → Keyboards → Add New Keyboard → ClipBubble. Then turn on Allow Full Access so it can reach your computers.")
-                    Button("Open the Settings app") { UIApplication.shared.open(URL(string: UIApplication.openSettingsURLString)!) }
+                    Label { Text("In the Settings app: General → Keyboard → Keyboards → Add New Keyboard → ClipBubble. Then turn on Allow Full Access so it can reach your computers.") }
+                        icon: { IconTile(symbol: "keyboard.fill", color: Brand.peach, filled: true) }
+                    Button { UIApplication.shared.open(URL(string: UIApplication.openSettingsURLString)!) } label: {
+                        Label { Text("Open the Settings app").foregroundStyle(.primary) } icon: { IconTile(symbol: "gearshape.fill", color: Brand.cloud, filled: true) }
+                    }
                 } header: { Text("Clipboard keyboard") } footer: {
                     Text("Your history in any app: tap an item to type it. Full Access is what lets it reach your computers; ClipBubble never records what you type.")
                 }
+                .listRowBackground(Brand.card)
 
                 Section("Appearance") {
                     Picker("Appearance", selection: $appearance) {
@@ -878,20 +1105,30 @@ struct SettingsView: View {
                     }
                     .pickerStyle(.segmented)
                 }
+                .listRowBackground(Brand.card)
 
                 Section {
-                    Button("Clear history", role: .destructive) { confirmClear = true }
+                    Button(role: .destructive) { confirmClear = true } label: {
+                        Label { Text("Clear history") } icon: { IconTile(symbol: "trash.fill", color: Brand.rose, filled: true) }
+                    }
                 } footer: {
                     Text("Removes everything ClipBubble has kept, here and on your linked devices.")
                 }
+                .listRowBackground(Brand.card)
 
                 Section {
-                    Link(destination: URL(string: "https://clipbubble.krnl.studio/support")!) { Label("Help and support", systemImage: "questionmark.circle") }
-                    Link(destination: URL(string: "https://clipbubble.krnl.studio/privacy")!) { Label("Privacy policy", systemImage: "hand.raised") }
+                    Link(destination: URL(string: "https://clipbubble.krnl.studio/support")!) {
+                        Label { Text("Help and support").foregroundStyle(.primary) } icon: { IconTile(symbol: "questionmark", color: Brand.lavender, filled: true) }
+                    }
+                    Link(destination: URL(string: "https://clipbubble.krnl.studio/privacy")!) {
+                        Label { Text("Privacy policy").foregroundStyle(.primary) } icon: { IconTile(symbol: "hand.raised.fill", color: Brand.mint, filled: true) }
+                    }
                 } header: { Text("More") } footer: {
                     Text("ClipBubble \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""). History stays on your devices and is deleted after 7 days.")
                 }
+                .listRowBackground(Brand.card)
             }
+            .brandForm()
             .navigationTitle("Settings")
             .toast(model.line)
             .confirmationDialog("Clear your history here and on your linked devices?", isPresented: $confirmClear, titleVisibility: .visible) {
@@ -927,7 +1164,7 @@ struct LinkSheet: View {
                     } else {
                         let computers = model.nearby.filter { $0.os != "ios" }
                         if computers.isEmpty {
-                            Label { Text("Looking for nearby computers…") } icon: { ProgressView() }
+                            Searching()
                         }
                         ForEach(computers) { computer in
                             computerRow(computer)
@@ -937,22 +1174,24 @@ struct LinkSheet: View {
                     Text("Nearby Computers")
                 } footer: {
                     if !model.linking {
-                        Text("Open ClipBubble on your computer. Linking syncs new copies and the last 7 days of ClipBubble history between your devices.")
+                        Text("Open ClipBubble on your Mac, Windows or Linux computer. Linking syncs new copies and the last 7 days of ClipBubble history between your devices.")
                     }
                 }
+                .listRowBackground(Brand.card)
 
                 Section {
                     Button {
                         scanFailed = !DataScannerViewController.isSupported
                         scanning = !scanFailed
                     } label: {
-                        Label("Scan QR Code", systemImage: "qrcode.viewfinder")
+                        Label { Text("Scan QR Code").foregroundStyle(.primary) } icon: { IconTile(symbol: "qrcode.viewfinder", color: Brand.sky, filled: true) }
                     }
                     if scanFailed {
                         Text("Use the Camera app to scan the code, or allow camera access for ClipBubble in Settings.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                 }
+                .listRowBackground(Brand.card)
                 .disabled(model.linking)
 
                 Section {
@@ -962,8 +1201,10 @@ struct LinkSheet: View {
                         }
                     }
                 }
+                .listRowBackground(Brand.card)
                 .disabled(model.linking)
             }
+            .brandForm()
             .navigationTitle("Link a computer")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -981,34 +1222,32 @@ struct LinkSheet: View {
     private func computerRow(_ computer: DiscoveredPeer) -> some View {
         let alias = DirectPeers.alias(for: computer.id)
         let linked = model.statuses[alias]?.ok == true
-        let (icon, os): (String, String) = switch computer.os {
-        case "macos": ("laptopcomputer", "macOS")
-        case "windows": ("pc", "Windows")
-        default: ("desktopcomputer", "Linux")
-        }
         return HStack(spacing: 12) {
-            Image(systemName: icon)
-                .font(.title3).foregroundStyle(.tint)
-                .frame(width: 40, height: 40)
-                .background(.tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
+            Image(systemName: ComputerOS.symbol(computer.os))
+                .font(.system(size: 18, weight: .semibold)).foregroundStyle(Brand.ink)
+                .frame(width: 44, height: 44)
+                .background(Brand.sky, in: Circle())
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
-                Text(computer.name).font(.subheadline.weight(.semibold))
-                Text(os)
-                    .font(.caption2.weight(.medium)).foregroundStyle(.secondary)
-                    .padding(.horizontal, 6).padding(.vertical, 2)
-                    .background(.quaternary, in: Capsule())
+                Text(computer.name).font(.body.weight(.semibold)).fontDesign(.rounded)
+                Text(ComputerOS.name(computer.os))
+                    .font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                    .padding(.horizontal, 7).padding(.vertical, 2)
+                    .background(Brand.wash, in: Capsule())
             }
             Spacer()
             if linked {
-                Label("Linked", systemImage: "checkmark").font(.caption).foregroundStyle(.secondary)
+                Label("Linked", systemImage: "checkmark.circle.fill").font(.caption.weight(.semibold)).foregroundStyle(.green)
             } else {
                 Button("Link") { model.pairNearby(computer) }
-                    .buttonStyle(.borderedProminent).buttonBorderShape(.capsule)
+                    .font(.subheadline.weight(.bold)).fontDesign(.rounded).foregroundStyle(Brand.ink)
+                    .padding(.horizontal, 16).padding(.vertical, 8)
+                    .background(Brand.sky, in: Capsule())
+                    .buttonStyle(Pressable())
                     .accessibilityLabel("Link \(computer.name)")
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 6)
     }
 
     private func verificationCard(_ verification: Model.Verification) -> some View {
@@ -1016,7 +1255,8 @@ struct LinkSheet: View {
             if let code = verification.code {
                 Text("Confirm this code on \(verification.name)").font(.headline)
                 Text(code)
-                    .font(.largeTitle.monospaced().weight(.semibold))
+                    .font(.system(size: 44, weight: .heavy, design: .rounded).monospacedDigit())
+                    .foregroundStyle(Brand.tint)
                     .accessibilityLabel(code.filter(\.isNumber).map(String.init).joined(separator: " "))
                 Text("Tap Allow on your computer.").foregroundStyle(.secondary)
             } else {
@@ -1046,6 +1286,31 @@ struct LinkSheet: View {
                 .navigationTitle("Scan QR Code").navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { scanning = false } } }
         }
+    }
+}
+
+/// While nothing nearby has shown up: the mascot with rings rippling out from it.
+struct Searching: View {
+    @State private var on = false
+    @Environment(\.accessibilityReduceMotion) private var still
+
+    var body: some View {
+        VStack(spacing: 14) {
+            ZStack {
+                ForEach(0..<3) { i in
+                    Circle().stroke(Brand.sky, lineWidth: 1.5)
+                        .scaleEffect(on ? 2.2 : 0.7).opacity(on ? 0 : 0.9)
+                        .animation(still ? nil : .easeOut(duration: 2.4).repeatForever(autoreverses: false).delay(Double(i) * 0.8), value: on)
+                }
+                Mascot(size: 52, ring: false)
+            }
+            .frame(width: 52, height: 52).frame(height: 110)
+            Text("Looking for nearby computers…").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 6)
+        .onAppear { on = true }
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -1079,6 +1344,7 @@ struct ManualLink: View {
                 }
             } header: { Text("2. Enter its user and address") }
         }
+        .brandForm()
         .navigationTitle("Link by hand")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear { publicLine = Keys.publicLine }

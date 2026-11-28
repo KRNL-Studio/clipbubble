@@ -10,13 +10,30 @@ struct DirectIdentity {
 
     private init(deviceId: String, key: SecKey, der: Data) throws {
         guard let certificate = SecCertificateCreateWithData(nil, der as CFData),
-              let identity = SecIdentityCreate(nil, certificate, key) else {
+              let identity = Self.makeSecIdentity(certificate: certificate, key: key) else {
             throw IdentityError.invalidCertificate
         }
         self.deviceId = deviceId
         self.identity = identity
         self.der = der
         fingerprint = Self.fingerprint(of: der)
+    }
+
+    private static func makeSecIdentity(certificate: SecCertificate, key: SecKey) -> SecIdentity? {
+        #if os(macOS)
+        // SecIdentityCreate is exported by Security.framework on macOS 10.12+, but its header
+        // declaration only became public in the macOS 26 SDK (absent on Xcode 16 / macos-15).
+        typealias CreateFn = @convention(c) (CFAllocator?, SecCertificate, SecKey) -> Unmanaged<SecIdentity>?
+        guard let framework = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY) else {
+            return nil
+        }
+        defer { dlclose(framework) }
+        guard let sym = dlsym(framework, "SecIdentityCreate") else { return nil }
+        let create = unsafeBitCast(sym, to: CreateFn.self)
+        return create(nil, certificate, key)?.takeRetainedValue()
+        #else
+        return SecIdentityCreate(nil, certificate, key)
+        #endif
     }
 
     static func fingerprint(of der: Data) -> String {

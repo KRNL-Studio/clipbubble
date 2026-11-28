@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import uuid
+import zlib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
@@ -29,8 +30,9 @@ PREAMBLE_TIMEOUT = 15
 APPROVAL_TIMEOUT = 90
 QR_TTL = 600
 LINE_LIMIT = 4096
-# Older CPython builds omit the name even when their SSL library supports this X509 flag.
+# Older CPython builds omit these names even when their OpenSSL supports them.
 _PARTIAL_CHAIN = getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0x80000)
+_NO_RX_CERT_COMPRESSION = getattr(ssl, "OP_NO_RX_CERTIFICATE_COMPRESSION", 1 << 33)
 FINGERPRINT = re.compile(r"[0-9a-f]{64}")
 TOKEN = re.compile(r"[0-9a-f]{32}")
 RATE_ERROR = "Too many pairing requests. Wait a moment and try again."
@@ -139,7 +141,14 @@ class DirectIdentity:
         ctx.load_cert_chain(self.cert_path, self.key_path)
         if server:
             ctx.verify_mode = ssl.CERT_REQUIRED
-            ctx.verify_flags |= _PARTIAL_CHAIN
+            ctx.verify_flags = (ctx.verify_flags & ~getattr(ssl, "VERIFY_X509_STRICT", 0)) | _PARTIAL_CHAIN
+            # Disable TLS 1.3 RFC 8879 compressed client certificates when OpenSSL supports it
+            # so _trust_handshake_leaf always sees the raw Certificate handshake message.
+            if ssl.OPENSSL_VERSION_INFO >= (3, 2, 0):
+                try:
+                    ctx.options |= _NO_RX_CERT_COMPRESSION
+                except (OverflowError, ValueError):
+                    pass
             if not hasattr(ctx, "_msg_callback"):
                 raise OSError("Direct Sync requires CPython's TLS handshake message callback.")
             ctx._msg_callback = _trust_handshake_leaf
@@ -157,20 +166,45 @@ def _trust_handshake_leaf(sock, direction, version, content_type, message_type, 
     OpenSSL still requires the certificate and verifies CertificateVerify. Trust for pairing
     and sync uses only the post-handshake fingerprint.
     """
-    if direction != "read" or content_type != 22 or message_type != 11 or len(data) < 7:
+    if direction != "read" or content_type != 22 or message_type not in (11, 25) or len(data) < 7:
         return
-    start = 4
+    body = data[4:]
+    if message_type == 25:
+        # RFC 8879 CompressedCertificate: algorithm(2) + uncompressed_len(3) + compressed_len(3) + payload.
+        if len(body) < 8:
+            return
+        algo = int.from_bytes(body[0:2], "big")
+        uncompressed_len = int.from_bytes(body[2:5], "big")
+        compressed_len = int.from_bytes(body[5:8], "big")
+        if uncompressed_len > 65536 or 8 + compressed_len > len(body):
+            return
+        payload = body[8:8 + compressed_len]
+        try:
+            if algo == 1:
+                body = zlib.decompress(payload)
+            elif algo == 3:
+                from compression import zstd
+                body = zstd.decompress(payload)
+            else:
+                return
+        except Exception:
+            return
+    start = 0
     if version == ssl.TLSVersion.TLSv1_3:
-        start += 1 + data[4]  # certificate_request_context, including its length byte
-    end = start + 3 + int.from_bytes(data[start:start + 3], "big")
-    start += 3  # certificate_list length
-    if end > len(data) or start + 3 >= end:
+        if not body:
+            return
+        start += 1 + body[0]  # certificate_request_context, including its length byte
+    if start + 3 > len(body):
         return
-    size = int.from_bytes(data[start:start + 3], "big")
+    end = start + 3 + int.from_bytes(body[start:start + 3], "big")
+    start += 3  # certificate_list length
+    if end > len(body) or start + 3 >= end:
+        return
+    size = int.from_bytes(body[start:start + 3], "big")
     start += 3
     if 0 < size <= end - start:
         try:
-            sock.context.load_verify_locations(cadata=ssl.DER_cert_to_PEM_cert(data[start:start + size]))
+            sock.context.load_verify_locations(cadata=ssl.DER_cert_to_PEM_cert(body[start:start + size]))
         except ssl.SSLError:
             pass  # The TLS stack rejects an invalid certificate with the trust store still empty.
 

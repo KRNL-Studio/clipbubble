@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import PhotosUI
 import SwiftUI
 import UniformTypeIdentifiers
@@ -107,6 +108,10 @@ final class Model: ObservableObject {
     @Published var showingLinkSheet = false { didSet { updateDiscovery() } }
     @Published private(set) var nearby: [DiscoveredPeer] = []
     @Published private(set) var verification: Verification?
+    /// The upgrade screen, when something free ClipBubble doesn't do was asked for.
+    @Published var paywall: Pro.Reason?
+    /// Kept items older than free ClipBubble shows.
+    @Published private(set) var locked = 0
     @Published private var pairingTask: Task<Void, Never>?
     var linking: Bool { pairingTask != nil }
 
@@ -127,8 +132,10 @@ final class Model: ObservableObject {
     private let db = DB()
     private var toastTask: Task<Void, Never>?
     private var shareObserver: NSObjectProtocol?
+    private var proObserver: AnyCancellable?
 
     init() {
+        proObserver = Pro.shared.$unlocked.removeDuplicates().dropFirst().receive(on: RunLoop.main).sink { [weak self] _ in self?.reload() }
         #if DEBUG
         // `-demo YES` (debug builds only): a linked Mac, Windows PC and Linux computer, and more nearby, without any
         // computers, for App Store screenshots.
@@ -203,7 +210,9 @@ final class Model: ObservableObject {
     }
 
     func reload() {
-        clips = db.clips(query: query.isEmpty ? nil : query, preview: true)
+        let since = Tier.sinceHours
+        clips = db.clips(query: query.isEmpty ? nil : query, sinceHours: since, preview: true)
+        locked = since.map { db.count(olderThanHours: $0) } ?? 0
         devices = db.deviceNames()
         revision += 1
     }
@@ -217,7 +226,7 @@ final class Model: ObservableObject {
 
     /// Everything kept, for the Library.
     func library(query: String) -> [Clip] {
-        db.clips(limit: 5000, query: query.isEmpty ? nil : query, preview: true)
+        db.clips(limit: 5000, query: query.isEmpty ? nil : query, sinceHours: Tier.sinceHours, preview: true)
     }
 
     func clip(_ hash: String) -> Clip? { db.clip(hash: hash) }
@@ -247,6 +256,21 @@ final class Model: ObservableObject {
         // Left behind, the old host key would refuse this computer if it came back after a reinstall.
         guard let t = SSHTarget(alias), !hosts.contains(where: { SSHTarget($0)?.host == t.host && SSHTarget($0)?.port == t.port }) else { return }
         Platform.defaults.removeObject(forKey: t.hostKeyPreference)
+    }
+
+    /// Free ClipBubble links one computer.
+    var canLinkAnother: Bool { Pro.shared.unlocked || hosts.count < Tier.freeComputers }
+
+    /// Opens Link a computer, or the upgrade screen when another computer needs Pro.
+    func requestLink() {
+        if canLinkAnother { showingLinkSheet = true } else { paywall = .computers }
+    }
+
+    /// The upgrade screen, once Link a computer has gone: one sheet can't open over another.
+    func limitReached() {
+        guard showingLinkSheet else { paywall = .computers; return }
+        showingLinkSheet = false
+        Task { try? await Task.sleep(nanoseconds: 450_000_000); paywall = .computers }
     }
 
     func redialAll() { hosts.forEach { SyncEngine.shared.redial($0) } }
@@ -329,6 +353,7 @@ final class Model: ObservableObject {
     /// the computer you link gets everything you copy. Its address leads, since it can call itself anything.
     func open(_ url: URL) {
         guard let route = Pairing.QRRoute(url), !linking, !confirmingLink else { return }
+        guard canLinkAnother else { return limitReached() }
         switch route {
         case .direct:
             let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
@@ -364,6 +389,7 @@ final class Model: ObservableObject {
 
     func pairNearby(_ computer: DiscoveredPeer) {
         guard !linking, !confirmingLink else { return }
+        guard canLinkAnother || hosts.contains(DirectPeers.alias(for: computer.id)) else { return limitReached() }
         verification = Verification(name: computer.name)
         beginPairing { [weak self] in
             let engine = SyncEngine.shared
@@ -478,12 +504,13 @@ struct HistoryView: View {
                onDismiss: {
                    if linkAfterWelcome {
                        linkAfterWelcome = false
-                       model.showingLinkSheet = true
+                       model.requestLink()
                    }
                }) {
             Welcome { linkAfterWelcome = true; tab = .settings }
         }
         .sheet(isPresented: $model.showingLinkSheet) { LinkSheet() }
+        .sheet(item: $model.paywall) { Paywall(reason: $0).environmentObject(model) }
         .onChange(of: model.linking) { if model.linking { welcomed = true } }
         .photosPicker(isPresented: shows(.photos), selection: $photos, maxSelectionCount: 20,
                       matching: .any(of: [.images, .videos]), preferredItemEncoding: .current)
@@ -508,9 +535,9 @@ struct HistoryView: View {
         List {
             Group {
                 if model.hosts.isEmpty {
-                    LinkHero { model.showingLinkSheet = true }
+                    LinkHero { model.requestLink() }
                 } else {
-                    Computers(hosts: model.hosts, statuses: model.statuses) { model.showingLinkSheet = true }
+                    Computers(hosts: model.hosts, statuses: model.statuses) { model.requestLink() }
                 }
                 if !model.transfers.isEmpty {
                     // A first link can queue hundreds, which would push the history off the screen.
@@ -559,6 +586,12 @@ struct HistoryView: View {
                 .swipeActions { Button("Delete", role: .destructive) { model.delete(c) } }
                 .clipMenu(c) { viewing = c }
             }
+            if model.locked > 0 {
+                LockedHistory(count: model.locked) { model.paywall = .history }
+                    .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 16, trailing: 16))
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
+            }
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
@@ -566,7 +599,7 @@ struct HistoryView: View {
         .animation(.snappy, value: model.clips.map(\.hash))
         .overlay {
             // Before anything is linked, the card above already says what to do.
-            if model.clips.isEmpty && !(model.hosts.isEmpty && model.query.isEmpty) {
+            if model.clips.isEmpty && model.locked == 0 && !(model.hosts.isEmpty && model.query.isEmpty) {
                 ContentUnavailableView {
                     Label {
                         Text(model.query.isEmpty ? "Nothing copied yet" : "No matches")
@@ -1043,6 +1076,7 @@ struct ClipRow: View {
 
 struct SettingsView: View {
     @EnvironmentObject var model: Model
+    @ObservedObject private var pro = Pro.shared
     @State private var confirmClear = false
     @State private var removing: String?
     @AppStorage("appearance") private var appearance = Appearance.system
@@ -1068,6 +1102,27 @@ struct SettingsView: View {
                 }
                 .listRowBackground(Brand.gradient)
 
+                Section {
+                    if pro.unlocked {
+                        Label { VStack(alignment: .leading, spacing: 2) {
+                            Text("ClipBubble Pro")
+                            Text("Unlocked. Thank you!").font(.caption).foregroundStyle(.secondary)
+                        } } icon: { IconTile(symbol: "sparkles", color: Brand.butter, filled: true) }
+                    } else {
+                        Button { model.paywall = .settings } label: {
+                            HStack {
+                                Label { VStack(alignment: .leading, spacing: 2) {
+                                    Text("ClipBubble Pro").foregroundStyle(Color.primary)
+                                    Text("Every computer and all 7 days, \(pro.price) once").font(.caption).foregroundStyle(Color.secondary)
+                                } } icon: { IconTile(symbol: "sparkles", color: Brand.butter, filled: true) }
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
+                            }
+                        }
+                    }
+                }
+                .listRowBackground(Brand.card)
+
                 // What's linked comes first: it's what you check most often.
                 if !model.hosts.isEmpty {
                     Section {
@@ -1080,7 +1135,7 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Button { model.showingLinkSheet = true } label: {
+                    Button { model.requestLink() } label: {
                         Label { Text("Link a computer").foregroundStyle(.primary) } icon: { IconTile(symbol: "plus", color: Brand.sky, filled: true) }
                     }
                 } footer: {
@@ -1355,6 +1410,7 @@ struct ManualLink: View {
 
     private func add() {
         guard SSHTarget(trimmed) != nil else { return }
+        guard model.canLinkAnother else { return model.limitReached() }
         model.add(trimmed)
         SyncEngine.shared.redial(trimmed)
         model.say("Linking with \(trimmed)…")

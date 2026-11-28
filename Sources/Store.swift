@@ -117,6 +117,14 @@ final class DB {
         return sqlite3_step(s) == SQLITE_DONE
     }
 
+    /// How many items are kept from before the last `hours`, for the iPhone's free tier.
+    func count(olderThanHours hours: Double) -> Int {
+        let now = Date().timeIntervalSince1970
+        guard let s = prepare("SELECT COUNT(*) FROM clips WHERE created >= ? AND created < ?", [now - Self.retention, now - hours * 3600]) else { return 0 }
+        defer { sqlite3_finalize(s) }
+        return sqlite3_step(s) == SQLITE_ROW ? Int(sqlite3_column_int64(s, 0)) : 0
+    }
+
     private func select(_ tail: String, _ args: [Any?], preview: Bool = false) -> [Clip] {
         selectChecked(tail, args, preview: preview) ?? []
     }

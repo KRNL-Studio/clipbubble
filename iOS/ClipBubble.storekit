@@ -1,0 +1,29 @@
+{
+  "identifier" : "C1B0B1E5-0001-4C1B-9B0B-C11FB0BB1E50",
+  "nonRenewingSubscriptions" : [ ],
+  "products" : [
+    {
+      "displayPrice" : "4.99",
+      "familyShareable" : true,
+      "internalID" : "6840321651",
+      "localizations" : [
+        {
+          "description" : "Unlimited computers and your full history, once.",
+          "displayName" : "ClipBubble Pro",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "studio.krnl.clipbubble.pro",
+      "referenceName" : "ClipBubble Pro",
+      "type" : "NonConsumable"
+    }
+  ],
+  "settings" : {
+    "_applicationInternalID" : "6825506870",
+    "_developerTeamID" : "BHAM5T9649",
+    "_locale" : "en_US",
+    "_storefront" : "USA"
+  },
+  "subscriptionGroups" : [ ],
+  "version" : { "major" : 4, "minor" : 0 }
+}

@@ -388,7 +388,7 @@ func runDirectChild() -> Never {
                     }
                 }
                 // Keep the dial alive until it has created a session.
-                engine.queue.asyncAfter(deadline: .now() + 15) { withExtendedLifetime(tunnel) { exit(1) } }
+                engine.queue.asyncAfter(deadline: .now() + 15) { withExtendedLifetime(tunnel) {}; exit(1) }
             }
         } catch {
             FileHandle.standardError.write(Data(("Direct test child: " + error.localizedDescription + "\n").utf8))

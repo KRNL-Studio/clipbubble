@@ -42,7 +42,7 @@ struct SendToComputers: AppIntent {
 /// The other way: whatever you copied last on a computer, onto this iPhone's clipboard.
 struct CopyLatestFromComputers: AppIntent {
     static let title: LocalizedStringResource = "Copy Latest from Computers"
-    static let description = IntentDescription("Copies the newest item from a linked computer, or the newest item on this iPhone if none came from a computer. Returns text when available.")
+    static let description = IntentDescription("Copies the newest item from a linked computer, or the newest item on this device if none came from a computer. Returns text when available.")
 
     @MainActor
     func perform() async throws -> some IntentResult & ReturnsValue<String> & ProvidesDialog {

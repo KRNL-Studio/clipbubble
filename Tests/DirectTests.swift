@@ -365,7 +365,7 @@ func runDirectChild() -> Never {
     db.insertIfMissing(kind: "text", text: send, source: "DirectTests", hash: "t:" + sha(send),
                        created: Date().addingTimeInterval(-60))
     engine.apply = { _ in }
-    Task {
+    Task<Void, Never> {
         do {
             let identity = try DirectIdentity.ephemeral(deviceId: engine.device)
             let peer = try await DirectPairingClient.pairQR(url: qr, localIdentity: identity,

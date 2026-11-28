@@ -12,7 +12,7 @@ packages:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "2.0.0"
+    MARKETING_VERSION: "2.1.0"
     CURRENT_PROJECT_VERSION: "1"
     DEVELOPMENT_TEAM: BHAM5T9649
     CODE_SIGN_STYLE: Automatic
@@ -67,6 +67,9 @@ targets:
         CFBundleURLTypes:
           - CFBundleURLName: studio.krnl.clipbubble
             CFBundleURLSchemes: [clipbubble]
+    # Run from Xcode buys Pro from ClipBubble.storekit instead of the App Store.
+    scheme:
+      storeKitConfiguration: ClipBubble.storekit
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: studio.krnl.clipbubble

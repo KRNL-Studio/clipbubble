@@ -90,28 +90,11 @@ struct LibraryView: View {
                                                          : all.isEmpty ? "Copy something on a linked computer, or tap Add." : "Try another filter."))
                     .padding(.top, 60)
             }
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: size.isAccessibilitySize ? 300 : 160), spacing: 10)], spacing: 10, pinnedViews: [.sectionHeaders]) {
-                ForEach(days, id: \.day) { d in
-                    Section {
-                        ForEach(d.clips, id: \.hash) { c in
-                            Button { model.copy(c) } label: {
-                                LibraryTile(clip: c, device: c.origin.isEmpty ? nil : model.devices[c.origin])
-                            }
-                            .buttonStyle(Pressable())
-                            .clipMenu(c) { viewing = c }
-                        }
-                    } header: {
-                        Text(title(d.day)).font(.headline.weight(.bold)).fontDesign(.rounded)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.vertical, 8)
-                            .background(Brand.background)
-                    }
-                }
+            grid
+            if model.locked > 0 {
+                LockedHistory(count: model.locked) { model.paywall = .history }
+                    .padding(.horizontal).padding(.bottom, 24)
             }
-            .padding(.horizontal)
-            .padding(.bottom, 20)
-            .animation(.snappy, value: look)
-            .animation(.snappy, value: from)
         }
         .background(Brand.background)
         .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search everything")
@@ -125,6 +108,31 @@ struct LibraryView: View {
         .onChange(of: model.revision) { withAnimation(.snappy) { all = model.library(query: query) } }
         .navigationDestination(item: $viewing) { ClipDetail(clip: $0) }
         .toast(model.line)
+    }
+
+    private var grid: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: size.isAccessibilitySize ? 300 : 160), spacing: 10)], spacing: 10, pinnedViews: [.sectionHeaders]) {
+            ForEach(days, id: \.day) { d in
+                Section {
+                    ForEach(d.clips, id: \.hash) { c in
+                        Button { model.copy(c) } label: {
+                            LibraryTile(clip: c, device: c.origin.isEmpty ? nil : model.devices[c.origin])
+                        }
+                        .buttonStyle(Pressable())
+                        .clipMenu(c) { viewing = c }
+                    }
+                } header: {
+                    Text(title(d.day)).font(.headline.weight(.bold)).fontDesign(.rounded)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 8)
+                        .background(Brand.background)
+                }
+            }
+        }
+        .padding(.horizontal)
+        .padding(.bottom, 20)
+        .animation(.snappy, value: look)
+        .animation(.snappy, value: from)
     }
 
     /// Devices with something in the library. Names arrive for every device a computer knows, used or not.

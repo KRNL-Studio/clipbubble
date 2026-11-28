@@ -129,7 +129,7 @@ final class KeyboardModel: ObservableObject {
     }
 
     func reload() {
-        clips = db.clips(limit: 40, preview: true)
+        clips = db.clips(limit: 40, sinceHours: Tier.sinceHours, preview: true)
         if let h = fetching, let c = clips.first(where: { $0.hash == h && !$0.remote }) {
             fetching = nil
             copy(c)

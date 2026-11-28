@@ -3,64 +3,62 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@1&display=block" rel="stylesheet">
 <style>
+/* The app's pastel palette (iOS/Sources/Theme.swift): light blue first, then lavender, mint, peach and butter, with navy ink. */
 :root{
-  --ink:#0E0B0A; --cream:#FFF3EC; --pink:#FF7AB6; --hot:#FF3E9B; --peach:#FFB48F; --muted:rgba(255,236,228,.62);
+  --bg:#F3F7FC; --ink:#17212E; --muted:rgba(23,33,46,.6); --tint:#2F7FD8;
+  --sky:#A9D4FF; --bubble:#8EC5FF; --peri:#C4D3FF; --lav:#D6C9FF; --mint:#BDEBD6; --peach:#FFD8C2; --butter:#FFEDB3;
 }
 *{box-sizing:border-box;margin:0;padding:0}
-html,body{width:9240px;height:2868px;background:var(--ink);overflow:hidden}
-body{font-family:-apple-system,"SF Pro Display",system-ui,sans-serif;color:var(--cream);-webkit-font-smoothing:antialiased;position:relative}
+html,body{width:9240px;height:2868px;background:var(--bg);overflow:hidden}
+body{font-family:-apple-system,"SF Pro Display",system-ui,sans-serif;color:var(--ink);-webkit-font-smoothing:antialiased;position:relative}
 #bg{position:absolute;inset:0;overflow:hidden}
-.orb{position:absolute;border-radius:50%;filter:blur(140px)}
-#grain{position:absolute;inset:0;opacity:.11;mix-blend-mode:overlay;pointer-events:none;
-  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='300' height='300'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 1 0'/></filter><rect width='300' height='300' filter='url(%23n)'/></svg>")}
+.orb{position:absolute;border-radius:50%;filter:blur(150px)}
 .slide{position:absolute;top:0;width:1320px;height:2868px}
-.eyebrow{position:absolute;left:110px;top:200px;display:flex;align-items:center;gap:26px;font-size:46px;font-weight:650;letter-spacing:-.01em}
-.eyebrow img{width:104px;height:104px;border-radius:24px;box-shadow:0 10px 40px rgba(0,0,0,.5)}
-.pill{position:absolute;left:110px;top:214px;padding:16px 34px;border-radius:99px;font-size:34px;font-weight:700;letter-spacing:.12em;
-  color:var(--ink);background:linear-gradient(90deg,var(--pink),var(--peach));box-shadow:0 10px 50px rgba(255,90,170,.45)}
-h1{position:absolute;left:104px;top:340px;width:1140px;font-size:156px;line-height:.98;font-weight:800;letter-spacing:-.045em;word-spacing:.08em}
-h1 em{font-family:"Instrument Serif",serif;font-style:italic;font-weight:400;letter-spacing:-.02em;font-size:1.14em;line-height:.9;
-  background:linear-gradient(100deg,#FF8EC2 0%,var(--hot) 45%,var(--peach) 100%);-webkit-background-clip:text;color:transparent;padding-right:.08em}
-.sub{position:absolute;left:110px;width:1050px;font-size:50px;line-height:1.28;font-weight:500;color:var(--muted);letter-spacing:-.012em}
+.eyebrow{position:absolute;left:110px;top:200px;display:flex;align-items:center;gap:26px;font-size:46px;font-weight:700;letter-spacing:-.01em}
+.eyebrow img{width:104px;height:104px;border-radius:24px;box-shadow:0 10px 30px rgba(47,127,216,.25),0 0 0 1.5px rgba(23,33,46,.06)}
+.pill{position:absolute;left:110px;top:214px;padding:16px 34px;border-radius:99px;font-size:34px;font-weight:800;letter-spacing:.12em;
+  color:var(--ink);background:var(--sky);box-shadow:0 10px 30px rgba(142,197,255,.6)}
+h1{position:absolute;left:104px;top:340px;width:1160px;font-size:150px;line-height:.98;font-weight:800;letter-spacing:-.045em;word-spacing:.08em}
+h1 em{font-family:"Instrument Serif",serif;font-style:italic;font-weight:400;letter-spacing:-.02em;font-size:1.16em;line-height:.9;color:var(--tint);padding-right:.08em}
+.sub{position:absolute;left:110px;width:1080px;font-size:50px;line-height:1.28;font-weight:500;color:var(--muted);letter-spacing:-.012em}
 /* iPhone */
 .phone{position:absolute;border-radius:var(--r);padding:var(--b);
-  background:linear-gradient(150deg,#5d5853 0%,#1b1917 18%,#0a0908 50%,#24211f 78%,#6a645f 100%);
-  box-shadow:0 0 0 2px rgba(255,255,255,.08) inset,0 90px 160px rgba(0,0,0,.65),0 30px 60px rgba(0,0,0,.5),0 0 260px rgba(255,62,155,.18)}
-.phone::after{content:"";position:absolute;inset:calc(var(--b)*.32);border-radius:calc(var(--r) - var(--b)*.32);border:2px solid rgba(255,255,255,.07);pointer-events:none}
+  background:linear-gradient(150deg,#d9dde3 0%,#9aa1ab 14%,#3a3f46 40%,#22262b 62%,#8b929c 86%,#dfe3e8 100%);
+  box-shadow:0 0 0 2px rgba(255,255,255,.4) inset,0 80px 140px rgba(40,70,110,.28),0 24px 50px rgba(40,70,110,.18)}
+.phone::after{content:"";position:absolute;inset:calc(var(--b)*.32);border-radius:calc(var(--r) - var(--b)*.32);border:2px solid rgba(255,255,255,.12);pointer-events:none}
+.phone::before{content:"";position:absolute;inset:calc(var(--b)*.55);border-radius:calc(var(--r) - var(--b)*.55);background:#0b0c0e}
 .screen{position:relative;width:100%;height:100%;border-radius:var(--sr);overflow:hidden;background:#fff}
 .screen img{display:block;width:100%;height:100%}
 .island{position:absolute;background:#000;border-radius:999px}
-.glare{position:absolute;inset:0;border-radius:var(--sr);background:linear-gradient(115deg,rgba(255,255,255,.10) 0%,rgba(255,255,255,0) 28%);pointer-events:none}
+.glare{position:absolute;inset:0;border-radius:var(--sr);background:linear-gradient(115deg,rgba(255,255,255,.14) 0%,rgba(255,255,255,0) 26%);pointer-events:none}
 /* pop-outs */
-.pop{position:absolute;background-repeat:no-repeat;box-shadow:0 50px 100px rgba(0,0,0,.55),0 16px 34px rgba(0,0,0,.35),0 0 0 1.5px rgba(255,255,255,.12)}
-.chip{position:absolute;display:flex;align-items:center;gap:18px;padding:22px 34px;border-radius:99px;font-size:38px;font-weight:650;
-  background:rgba(40,32,30,.72);backdrop-filter:blur(30px);border:1.5px solid rgba(255,255,255,.12);box-shadow:0 30px 70px rgba(0,0,0,.45)}
-.dot{width:20px;height:20px;border-radius:50%;background:#34D27B;box-shadow:0 0 18px #34D27B}
-.key{position:absolute;width:150px;height:150px;border-radius:34px;display:grid;place-items:center;font-size:72px;font-weight:600;color:#2a2523;
-  background:linear-gradient(180deg,#fffaf7,#e9e1dc);box-shadow:0 10px 0 #b9aea8,0 34px 60px rgba(0,0,0,.5),0 0 0 1px rgba(0,0,0,.1) inset}
-.card{position:absolute;border-radius:44px;background:rgba(38,31,29,.62);backdrop-filter:blur(40px);border:1.5px solid rgba(255,255,255,.12);
-  box-shadow:0 40px 90px rgba(0,0,0,.5)}
+.pop{position:absolute;background-repeat:no-repeat;box-shadow:0 40px 90px rgba(40,70,110,.25),0 12px 28px rgba(40,70,110,.14),0 0 0 1.5px rgba(23,33,46,.06)}
+.chip{position:absolute;display:flex;align-items:center;gap:18px;padding:22px 34px;border-radius:99px;font-size:38px;font-weight:700;color:var(--ink);
+  background:rgba(255,255,255,.82);backdrop-filter:blur(30px);border:1.5px solid rgba(255,255,255,.9);box-shadow:0 24px 60px rgba(40,70,110,.18)}
+.dot{width:20px;height:20px;border-radius:50%;background:#34C76F;box-shadow:0 0 0 7px rgba(52,199,111,.18)}
+.os{width:76px;height:76px;border-radius:50%;display:grid;place-items:center;flex:none}
+kbd{font:700 32px -apple-system,system-ui;padding:8px 16px;border-radius:14px;background:#fff;border:1.5px solid rgba(23,33,46,.12);box-shadow:0 4px 0 rgba(23,33,46,.12);color:var(--ink)}
+.card{position:absolute;border-radius:44px;background:rgba(255,255,255,.8);backdrop-filter:blur(40px);border:1.5px solid rgba(255,255,255,.95);
+  box-shadow:0 30px 70px rgba(40,70,110,.16)}
 </style></head>
 <body>
 <div id="bg">
-  <svg width="9240" height="2868" style="position:absolute;inset:0;filter:blur(70px);opacity:.75">
-    <defs><linearGradient id="rib" x1="0" x2="1"><stop offset="0" stop-color="#FF3E9B"/><stop offset=".3" stop-color="#FF7AB6"/>
-      <stop offset=".55" stop-color="#FFB48F"/><stop offset=".8" stop-color="#FF3E9B"/><stop offset="1" stop-color="#C147FF"/></linearGradient></defs>
+  <svg width="9240" height="2868" style="position:absolute;inset:0;filter:blur(80px);opacity:.55">
+    <defs><linearGradient id="rib" x1="0" x2="1"><stop offset="0" stop-color="#A9D4FF"/><stop offset=".25" stop-color="#D6C9FF"/>
+      <stop offset=".5" stop-color="#BDEBD6"/><stop offset=".75" stop-color="#FFD8C2"/><stop offset="1" stop-color="#A9D4FF"/></linearGradient></defs>
     <path d="M -200 2300 C 600 1500, 1100 2700, 1900 2000 S 3300 1300, 4000 2100 S 5400 2700, 6100 1800 S 7600 1300, 8300 2200 S 9300 2500, 9600 1900"
-      fill="none" stroke="url(#rib)" stroke-width="300" stroke-linecap="round"/>
+      fill="none" stroke="url(#rib)" stroke-width="320" stroke-linecap="round"/>
   </svg>
 </div>
 <div id="slides"></div>
-<div id="grain"></div>
 <script>
 const W=1320,H=2868, S=document.getElementById('slides'), BG=document.getElementById('bg');
 const orb=(x,y,r,c,o)=>{const d=document.createElement('div');d.className='orb';Object.assign(d.style,{left:x-r+'px',top:y-r+'px',width:2*r+'px',height:2*r+'px',background:c,opacity:o});BG.prepend(d)};
 const el=(p,html)=>{const t=document.createElement('template');t.innerHTML=html.trim();const n=t.content.firstChild;p.appendChild(n);return n};
 function phone(p,src,x,y,w,{rot=0,z=2,fade=0}={}){
   const k=w/W,b=w*.034,sr=186*k,h=w*H/W;
-  const n=el(p,`<div class="phone" style="left:${x}px;top:${y}px;width:${w+2*b}px;height:${h+2*b}px;--b:${b}px;--r:${sr+b}px;--sr:${sr}px;transform:rotate(${rot}deg);z-index:${z};${fade?`-webkit-mask-image:linear-gradient(to bottom,transparent 0,transparent ${fade[0]}%,#000 ${fade[1]}%)`:''}">
+  return el(p,`<div class="phone" style="left:${x}px;top:${y}px;width:${w+2*b}px;height:${h+2*b}px;--b:${b}px;--r:${sr+b}px;--sr:${sr}px;transform:rotate(${rot}deg);z-index:${z};${fade?`-webkit-mask-image:linear-gradient(to bottom,transparent 0,transparent ${fade[0]}%,#000 ${fade[1]}%)`:''}">
     <div class="screen"><img src="img/${src}"><div class="island" style="left:${516*k}px;top:${43*k}px;width:${286*k}px;height:${110*k}px"></div><div class="glare"></div></div></div>`);
-  return n;
 }
 // crop (cx,cy,cw,ch) of a raw capture, drawn at scale k, at (x,y)
 function pop(p,src,[cx,cy,cw,ch],x,y,k,{r=48,rot=0,z=5}={}){
@@ -69,85 +67,82 @@ function pop(p,src,[cx,cy,cw,ch],x,y,k,{r=48,rot=0,z=5}={}){
 }
 function slide(i){return el(S,`<div class="slide" style="left:${i*W}px"></div>`)}
 const head=(s,html,subTop,sub)=>{el(s,`<h1>${html}</h1>`);el(s,`<div class="sub" style="top:${subTop}px">${sub}</div>`)};
+// SF-like outline glyphs for the three computers and the iPhone.
+const g=(d,size=44,c='#17212E')=>`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="${c}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
+const glyph={
+  mac:`<rect x="4" y="5" width="16" height="11" rx="1.6"/><path d="M2 19h20"/>`,
+  win:`<rect x="3" y="4" width="18" height="12" rx="1.6"/><path d="M9 20h6M12 16v4M7 8h3M7 11h5"/>`,
+  linux:`<rect x="3" y="4" width="18" height="12" rx="1.6"/><path d="M9 20h6M12 16v4M7 8l2 2-2 2"/>`,
+  phone:`<rect x="6.5" y="2.5" width="11" height="19" rx="2.6"/><path d="M10.5 5h3"/>`};
 
-// glow orbs across the panorama
-[[900,2500,700,'#FF3E9B',.55],[2500,700,520,'#FF7AB6',.22],[3600,2500,650,'#FFB48F',.35],[5200,600,500,'#C147FF',.2],
- [6000,2400,700,'#FF3E9B',.45],[7300,900,500,'#FF7AB6',.25],[8600,2300,700,'#FF7AB6',.45]].forEach(a=>orb(...a));
+// soft pastel light across the panorama
+[[700,2500,700,'#A9D4FF',.7],[2300,600,560,'#D6C9FF',.45],[3600,2500,650,'#BDEBD6',.6],[5200,500,520,'#FFD8C2',.5],
+ [6100,2450,700,'#A9D4FF',.6],[7400,800,520,'#D6C9FF',.45],[8700,2350,700,'#FFEDB3',.55]].forEach(a=>orb(...a));
 
-/* 1 — hero */
+/* 1 — hero: any computer to iPhone */
 let s=slide(0);
-el(s,`<div class="eyebrow"><img src="img/clipbubble-app-icon.png">ClipBubble</div>`);
-head(s,`Copy on Mac.<br>Paste on <em>iPhone.</em>`,720,`Your clipboard on every device you own. Mac, Windows and Linux.`);
-el(s,`<img src="img/panel.png" style="position:absolute;left:34px;top:1200px;width:720px;border-radius:34px;transform:rotate(-5deg);z-index:1;
-  box-shadow:0 60px 120px rgba(0,0,0,.6),0 0 0 1.5px rgba(255,255,255,.16),0 0 220px rgba(255,62,155,.4)">`);
-el(s,`<div class="key" style="left:58px;top:985px;transform:rotate(-10deg);z-index:3">⌘</div>`);
-el(s,`<div class="key" style="left:238px;top:955px;transform:rotate(6deg);z-index:3">C</div>`);
-phone(s,'raw-recent.png',500,1090,720,{rot:4});
-el(s,`<div class="chip" style="left:70px;top:2520px;z-index:6"><span class="dot"></span>Synced from MacBook Pro</div>`);
+el(s,`<div class="eyebrow"><img src="img/app-icon.png">ClipBubble</div>`);
+head(s,`Any computer.<br>Your <em>iPhone.</em>`,720,`Copy on Mac, Windows or Linux and paste on your iPhone. And back.`);
+phone(s,'raw-recent.png',500,1060,720,{rot:3});
+[['mac','#A9D4FF','Mac','⌘','C',1180],['win','#D6C9FF','Windows','Ctrl','C',1470],['linux','#BDEBD6','Linux','Ctrl','C',1760]].forEach(([k,c,l,a,b,y],i)=>
+  el(s,`<div class="chip" style="left:${60+i*14}px;top:${y}px;z-index:6;padding:16px 30px 16px 16px;gap:22px">
+    <span class="os" style="background:${c}">${g(glyph[k])}</span><span style="min-width:190px">${l}</span><kbd>${a}</kbd><kbd>${b}</kbd></div>`));
+el(s,`<div class="chip" style="left:70px;top:2520px;z-index:6"><span class="dot"></span>Synced from Studio PC</div>`);
 
 /* 2 — nearby linking */
 s=slide(1);
 el(s,`<div class="pill">NEW IN 2.0</div>`);
-head(s,`Link in<br><em>one tap.</em>`,720,`Pick your computer and match the code. No SSH, no account, no setup.`);
-phone(s,'raw-code.png',330,1000,860);
-el(s,`<img src="img/mac-alert-crop.png" style="position:absolute;left:40px;top:1700px;width:640px;border-radius:52px;z-index:6;transform:rotate(-4deg);
-  box-shadow:0 60px 120px rgba(0,0,0,.6),0 0 0 1.5px rgba(255,255,255,.2),0 0 160px rgba(255,62,155,.35)">`);
-el(s,`<div class="chip" style="left:96px;top:2470px;z-index:7">Same code on both screens</div>`);
+head(s,`Link in<br><em>one tap.</em>`,720,`Pick your Mac, Windows or Linux computer and match the code. No account, no setup.`);
+phone(s,'raw-link.png',330,1060,860);
+pop(s,'raw-link.png',[60,542,1198,812],70,1560,.98,{r:64,z:6,rot:-2});
 
 /* 3 — keyboard */
 s=slide(2);
-head(s,`Your clipboard,<br><em>in your keyboard.</em>`,720,`Tap a recent copy to type it, right where you're writing.`);
-phone(s,'raw-keyboard-dark.png',190,560,1000,{fade:[16,34]});
-pop(s,'raw-keyboard-dark.png',[23,1876,628,176],40,1860,1.42,{r:32,rot:-3,z:6});
-el(s,`<div style="position:absolute;left:930px;top:1975px;width:110px;height:110px;border-radius:50%;z-index:7;
-  background:radial-gradient(circle,rgba(255,122,182,.9) 0 30%,rgba(255,122,182,.25) 31% 60%,transparent 61%)"></div>`);
+head(s,`Your clipboard,<br><em>in your keyboard.</em>`,720,`Tap something you copied on any computer to type it, right where you're writing.`);
+phone(s,'raw-keyboard.png',230,960,860);
+pop(s,'raw-keyboard.png',[14,1790,1292,262],40,2070,.96,{r:40,rot:-2,z:6});
 
 /* 4 — library */
 s=slide(3);
-head(s,`Seven days of<br><em>everything.</em>`,720,`Text, links, photos and files from every device. All searchable.`);
+head(s,`Seven days of<br><em>everything.</em>`,720,`Text, links, photos and files from every computer. All searchable.`);
 phone(s,'raw-library.png',230,1000,860);
-pop(s,'raw-library.png',[44,536,1200,104],60,1560,1.0,{r:52,z:6});
+pop(s,'raw-library.png',[36,528,1232,120],50,1560,.98,{r:60,z:6});
 
 /* 5 — share */
 s=slide(4);
-head(s,`Save from<br><em>any app.</em>`,720,`Share a photo, link or file, and it's on your computer's clipboard.`);
-phone(s,'raw-sharesheet.png',230,960,840);
-pop(s,'raw-share.png',[56,2530,1208,184],40,2320,1.03,{r:92,z:6});
+head(s,`Save from<br><em>any app.</em>`,720,`Share a photo, link or file straight to the clipboard of your Mac, PC or Linux machine.`);
+phone(s,'raw-sharesheet.png',230,980,840);
+pop(s,'raw-share.png',[48,2528,1224,186],40,2330,1.02,{r:92,z:6});
 
 /* 6 — menu */
 s=slide(5);
 head(s,`Peek. Copy.<br><em>Share.</em>`,720,`Touch and hold anything in your history to open, copy or share it.`);
 phone(s,'raw-menu.png',230,1000,860);
-pop(s,'raw-menu.png',[300,1288,720,534],299,1754,1.08,{r:64,rot:0,z:6});
+pop(s,'raw-menu.png',[148,1518,756,572],230,1890,1.1,{r:70,z:6});
 
 /* 7 — privacy */
 s=slide(6);
 head(s,`No account.<br><em>No cloud.</em>`,720,`Your devices talk directly over an encrypted connection. ClipBubble collects nothing.`);
 el(s,`<svg style="position:absolute;left:0;top:1080px;z-index:1" width="1320" height="1600" viewBox="0 0 1320 1600">
-  <defs><radialGradient id="g" cx=".5" cy=".5" r=".5"><stop offset="0" stop-color="#FF7AB6" stop-opacity=".55"/><stop offset="1" stop-color="#FF7AB6" stop-opacity="0"/></radialGradient></defs>
+  <defs><radialGradient id="g" cx=".5" cy=".5" r=".5"><stop offset="0" stop-color="#A9D4FF" stop-opacity=".75"/><stop offset="1" stop-color="#A9D4FF" stop-opacity="0"/></radialGradient></defs>
   <circle cx="660" cy="760" r="560" fill="url(#g)"/>
-  <g stroke="#FF9FCB" stroke-width="5" stroke-dasharray="4 22" stroke-linecap="round" opacity=".9">
+  <g stroke="#6FAEEF" stroke-width="5" stroke-dasharray="4 22" stroke-linecap="round" opacity=".9">
     <line x1="660" y1="760" x2="250" y2="300"/><line x1="660" y1="760" x2="1070" y2="300"/>
     <line x1="660" y1="760" x2="250" y2="1220"/><line x1="660" y1="760" x2="1070" y2="1220"/></g>
-  <circle cx="660" cy="760" r="300" fill="none" stroke="rgba(255,255,255,.08)" stroke-width="2"/>
-  <circle cx="660" cy="760" r="440" fill="none" stroke="rgba(255,255,255,.05)" stroke-width="2"/>
+  <circle cx="660" cy="760" r="300" fill="none" stroke="rgba(47,127,216,.14)" stroke-width="2"/>
+  <circle cx="660" cy="760" r="440" fill="none" stroke="rgba(47,127,216,.08)" stroke-width="2"/>
 </svg>`);
-el(s,`<div style="position:absolute;left:460px;top:1640px;width:400px;height:400px;z-index:3;filter:drop-shadow(0 40px 80px rgba(255,62,155,.55))">
-  <svg viewBox="96 216 640 640" width="400" height="400"><circle cx="440" cy="584" r="268" fill="#FF7AB6"/>
-  <rect x="338" y="498" width="70" height="122" rx="35" fill="#1F1C19"/><rect x="472" y="498" width="70" height="122" rx="35" fill="#1F1C19"/>
-  <circle cx="360" cy="527" r="14" fill="#FF7AB6"/><circle cx="494" cy="527" r="14" fill="#FF7AB6"/>
-  <path d="M 380 690 Q 440 752 500 690" fill="none" stroke="#1F1C19" stroke-width="34" stroke-linecap="round"/></svg></div>`);
-const glyph={
- laptop:`<svg width="92" height="92" viewBox="0 0 24 24" fill="none" stroke="#FFF3EC" stroke-width="1.6" stroke-linejoin="round"><rect x="4" y="5" width="16" height="11" rx="1.6"/><path d="M2 19h20"/></svg>`,
- desktop:`<svg width="92" height="92" viewBox="0 0 24 24" fill="none" stroke="#FFF3EC" stroke-width="1.6" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="1.6"/><path d="M9 20h6M12 16v4"/></svg>`,
- term:`<svg width="92" height="92" viewBox="0 0 24 24" fill="none" stroke="#FFF3EC" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12 15h5"/></svg>`,
- phone:`<svg width="92" height="92" viewBox="0 0 24 24" fill="none" stroke="#FFF3EC" stroke-width="1.6" stroke-linejoin="round"><rect x="6.5" y="2.5" width="11" height="19" rx="2.6"/><path d="M10.5 5h3"/></svg>`};
-[['laptop','Mac',250,1380],['desktop','Windows',1070,1380],['term','Linux',250,2300],['phone','iPhone',1070,2300]].forEach(([g,l,cx,cy])=>{
-  el(s,`<div class="card" style="left:${cx-150}px;top:${cy-150}px;width:300px;height:300px;z-index:4;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px">
-    ${glyph[g]}<div style="font-size:40px;font-weight:650">${l}</div></div>`)});
+el(s,`<div style="position:absolute;left:460px;top:1640px;width:400px;height:400px;z-index:3;filter:drop-shadow(0 30px 60px rgba(47,127,216,.35))">
+  <svg viewBox="96 216 640 640" width="400" height="400"><circle cx="440" cy="584" r="268" fill="#8EC5FF"/>
+  <rect x="338" y="498" width="70" height="122" rx="35" fill="#17212E"/><rect x="472" y="498" width="70" height="122" rx="35" fill="#17212E"/>
+  <circle cx="360" cy="527" r="14" fill="#8EC5FF"/><circle cx="494" cy="527" r="14" fill="#8EC5FF"/>
+  <path d="M 380 690 Q 440 752 500 690" fill="none" stroke="#17212E" stroke-width="34" stroke-linecap="round"/></svg></div>`);
+[['mac','Mac','#A9D4FF',250,1380],['win','Windows','#D6C9FF',1070,1380],['linux','Linux','#BDEBD6',250,2300],['phone','iPhone','#FFD8C2',1070,2300]].forEach(([k,l,c,cx,cy])=>{
+  el(s,`<div class="card" style="left:${cx-150}px;top:${cy-150}px;width:300px;height:300px;z-index:4;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px">
+    <span class="os" style="width:120px;height:120px;background:${c}">${g(glyph[k],70)}</span><div style="font-size:40px;font-weight:700">${l}</div></div>`)});
 [[455,1610],[865,1610],[455,2070],[865,2070]].forEach(([x,y])=>el(s,`<div style="position:absolute;left:${x-40}px;top:${y-40}px;width:80px;height:80px;border-radius:50%;z-index:4;display:grid;place-items:center;
-   background:#1d1716;border:2px solid rgba(255,122,182,.6);box-shadow:0 0 40px rgba(255,62,155,.5)">
-   <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="#FF8EC2" stroke-width="2.2" stroke-linecap="round"><rect x="5" y="11" width="14" height="10" rx="2.2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></div>`));
+   background:#fff;border:2.5px solid #A9D4FF;box-shadow:0 10px 30px rgba(47,127,216,.25)">
+   ${g(`<rect x="5" y="11" width="14" height="10" rx="2.2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>`,38,'#2F7FD8')}</div>`));
 el(s,`<div style="position:absolute;left:110px;top:2600px;display:flex;gap:22px;z-index:5">
   ${['No sign-up','No servers','No tracking'].map(t=>`<div class="chip" style="position:static">${t}</div>`).join('')}</div>`);
 </script>

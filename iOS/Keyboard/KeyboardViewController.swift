@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 /// Lets keys play the system click, which follows the person's Keyboard Clicks setting. Only this keyboard's own
 /// process sees it.
@@ -181,7 +182,7 @@ final class KeyboardModel: ObservableObject {
         locked = since.map { db.count(olderThanHours: $0) } ?? 0
         if let h = fetching, let c = clips.first(where: { $0.hash == h && !$0.remote }) {
             fetching = nil
-            copy(c)
+            deliver(c)
         }
         #if DEBUG
         if Platform.defaults.bool(forKey: "demo") || FileManager.default.fileExists(atPath: Paths.dir.appendingPathComponent(".demo").path) {
@@ -225,8 +226,45 @@ final class KeyboardModel: ObservableObject {
                 self?.flash($0 ? "Getting it from your computer…" : "Your computer isn't connected", ok: $0)
             }
         } else {
-            copy(c)
+            deliver(c)
         }
+    }
+
+    /// A text file is typed as what's in it; anything else goes on the clipboard.
+    private func deliver(_ c: Clip) {
+        guard let text = Self.typeable(c) else { return copy(c) }
+        proxy?.insertText(text)
+        lastSpace = nil
+        flash("Typed \(Self.fileName(c))")
+    }
+
+    /// Small enough to type in one go without stalling the app being typed into.
+    private nonisolated static let typeLimit = 100_000
+
+    /// The contents of a text file (notes, code, JSON, CSV…), or nil when it isn't one or is too big to type.
+    nonisolated static func typeable(_ c: Clip) -> String? {
+        guard isTypeableFile(c), let path = c.paths.first, let data = FileManager.default.contents(atPath: path),
+              data.count <= typeLimit else { return nil }
+        guard var text = String(data: data, encoding: .utf8) else { return nil }
+        // Files end with a newline; typing it would leave the cursor on an empty line.
+        while text.last?.isNewline == true { text.removeLast() }
+        return text.isEmpty ? nil : text
+    }
+
+    /// One text file of a typeable size, from what it's called and its size alone.
+    nonisolated static func isTypeableFile(_ c: Clip) -> Bool {
+        guard c.kind == "file", c.paths.count == 1, let path = c.paths.first else { return false }
+        let ext = (path as NSString).pathExtension.lowercased()
+        // Rich text is markup, not something to type.
+        guard !["rtf", "rtfd", "doc", "docx", "pages"].contains(ext),
+              let type = UTType(filenameExtension: ext), type.conforms(to: .text) else { return false }
+        if c.remote { return true }
+        let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int) ?? nil
+        return (size ?? .max) <= typeLimit
+    }
+
+    private static func fileName(_ c: Clip) -> String {
+        c.paths.first.map { ($0 as NSString).lastPathComponent } ?? "file"
     }
 
     /// iOS lets a keyboard type text but not insert pictures or files, so those go on the clipboard to paste.
@@ -808,7 +846,7 @@ struct KeyboardChip: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(clip.kind == "text" ? String(clip.text.prefix(300)) : clip.remote ? "\(clip.look.name) on your computer" : clip.look.name)
         .accessibilityValue(clip.created.formatted(.relative(presentation: .named)))
-        .accessibilityHint(clip.kind == "text" ? "Types it" : "Copies it to paste")
+        .accessibilityHint(clip.kind == "text" || KeyboardModel.isTypeableFile(clip) ? "Types it" : "Copies it to paste")
     }
 
     private var title: String {
